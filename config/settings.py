@@ -18,6 +18,11 @@ load_dotenv()
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+TEMP_DIR = BASE_DIR / 'temp'
+PLAYGROUND_DIR = BASE_DIR / 'playground'
+
+TEMP_DIR.mkdir(exist_ok=True)
+PLAYGROUND_DIR.mkdir(exist_ok=True)
 
 
 # Quick-start development settings - unsuitable for production

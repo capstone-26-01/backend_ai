@@ -9,3 +9,7 @@ db.sqlite3
 private_docs/
 AGENTS.md
 *.md
+temp/*
+!temp/.gitkeep
+playground/*
+!playground/.gitkeep

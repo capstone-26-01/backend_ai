@@ -1,0 +1,9 @@
+{
+  "exclude": [
+    "playground",
+    "temp",
+    "private_docs",
+    "venv",
+    ".venv"
+  ]
+}
