@@ -15,12 +15,12 @@ class SelectiveQuestionAnsweringTests(TestCase):
         analysis = {
             'revision': 'abc123',
             'file_contents': {
-                'sample_pkg/model_builder.py': '# sample_pkg/model_builder.py\nprint("ok")\n',
-                'sample_pkg/eval_runner.py': '# sample_pkg/eval_runner.py\nprint("ok")\n',
+                'sample_pkg/factory.py': '# sample_pkg/factory.py\nprint("ok")\n',
+                'sample_pkg/runner.py': '# sample_pkg/runner.py\nprint("ok")\n',
             },
             'nodes': [
-                {'id': 'sample_pkg/model_builder.py::load_pretrained_model', 'label': 'load_pretrained_model', 'type': 'function', 'file': 'sample_pkg/model_builder.py'},
-                {'id': 'sample_pkg/eval_runner.py::eval_model', 'label': 'eval_model', 'type': 'function', 'file': 'sample_pkg/eval_runner.py'},
+                {'id': 'sample_pkg/factory.py::load_component', 'label': 'load_component', 'type': 'function', 'file': 'sample_pkg/factory.py'},
+                {'id': 'sample_pkg/runner.py::run_check', 'label': 'run_check', 'type': 'function', 'file': 'sample_pkg/runner.py'},
             ],
             'edges': [],
         }
@@ -30,12 +30,12 @@ class SelectiveQuestionAnsweringTests(TestCase):
             {'choices': [type('Choice', (), {'message': type('Message', (), {'content': 'builder.py에서 처리합니다.'})()})]},
         )()
 
-        response = answer_question('owner/repo', analysis, 'Where is load_pretrained_model defined?')
+        response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
 
-        self.assertEqual(response['citations'], ['sample_pkg/model_builder.py'])
+        self.assertEqual(response['citations'], ['sample_pkg/factory.py'])
         prompt = create_mock.call_args.kwargs['messages'][1]['content']
-        self.assertIn('sample_pkg/model_builder.py', prompt)
-        self.assertNotIn('sample_pkg/eval_runner.py', prompt)
+        self.assertIn('sample_pkg/factory.py', prompt)
+        self.assertNotIn('sample_pkg/runner.py', prompt)
         self.assertEqual(response['answer'], 'builder.py에서 처리합니다.')
 
     def test_build_context_reports_only_included_files(self):
@@ -72,7 +72,7 @@ class CachedQaSnapshotTests(TestCase):
         import subprocess
         subprocess.run(['git', 'init', '-b', 'main'], cwd=self.source_repo, check=True, capture_output=True, text=True)
         (self.source_repo / 'pkg').mkdir(parents=True, exist_ok=True)
-        (self.source_repo / 'pkg' / 'builder.py').write_text('def load_pretrained_model():\n    return "ok"\n', encoding='utf-8')
+        (self.source_repo / 'pkg' / 'builder.py').write_text('def load_component():\n    return "ok"\n', encoding='utf-8')
         subprocess.run(['git', 'add', '.'], cwd=self.source_repo, check=True, capture_output=True, text=True)
         subprocess.run(['git', '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'], cwd=self.source_repo, check=True, capture_output=True, text=True)
 
@@ -92,7 +92,7 @@ class CachedQaSnapshotTests(TestCase):
             {'choices': [type('Choice', (), {'message': type('Message', (), {'content': 'builder.py입니다.'})()})]},
         )()
 
-        response = answer_question('owner/repo', analysis, 'Where is load_pretrained_model defined?')
+        response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
 
         self.assertEqual(response['citations'], ['pkg/builder.py'])
         prompt = create_mock.call_args.kwargs['messages'][1]['content']
@@ -102,27 +102,27 @@ class CachedQaSnapshotTests(TestCase):
         analysis = {
             'revision': 'abc123',
             'nodes': [
-                {'id': 'sample_pkg/model_builder.py::load_pretrained_model', 'label': 'load_pretrained_model', 'type': 'function', 'file': 'sample_pkg/model_builder.py'},
+                {'id': 'sample_pkg/factory.py::load_component', 'label': 'load_component', 'type': 'function', 'file': 'sample_pkg/factory.py'},
                 {'id': 'sample_pkg/chat_model.py::forward', 'label': 'forward', 'type': 'function', 'file': 'sample_pkg/chat_model.py'},
             ],
         }
 
-        ranked_files = _rank_files(analysis, 'Where is load_pretrained_model defined?')
+        ranked_files = _rank_files(analysis, 'Where is load_component defined?')
 
-        self.assertEqual(ranked_files[0], 'sample_pkg/model_builder.py')
+        self.assertEqual(ranked_files[0], 'sample_pkg/factory.py')
 
     def test_rank_files_boosts_eval_entrypoint_candidates(self):
         analysis = {
             'revision': 'abc123',
             'nodes': [
-                {'id': 'sample_pkg/eval_runner.py::eval_model', 'label': 'eval_model', 'type': 'function', 'file': 'sample_pkg/eval_runner.py'},
-                {'id': 'sample_pkg/model_arch.py::build_vision_tower', 'label': 'build_vision_tower', 'type': 'function', 'file': 'sample_pkg/model_arch.py'},
+                {'id': 'sample_pkg/run_checks.py::main', 'label': 'main', 'type': 'function', 'file': 'sample_pkg/run_checks.py'},
+                {'id': 'sample_pkg/model_layout.py::build_graph', 'label': 'build_graph', 'type': 'function', 'file': 'sample_pkg/model_layout.py'},
             ],
         }
 
         ranked_files = _rank_files(analysis, 'What is the evaluation entry point?')
 
-        self.assertEqual(ranked_files[0], 'sample_pkg/eval_runner.py')
+        self.assertEqual(ranked_files[0], 'sample_pkg/run_checks.py')
 
     @patch('llm.services.client.chat.completions.create')
     def test_answer_question_returns_non_answer_when_no_python_context_exists(self, create_mock):

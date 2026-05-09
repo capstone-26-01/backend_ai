@@ -487,14 +487,14 @@ class AnalysisEndpointReuseTests(TestCase):
         }
         answer_question_mock.return_value = {
             'answer': 'builder.py에서 처리합니다.',
-            'citations': ['sample_pkg/model_builder.py'],
+            'citations': ['sample_pkg/factory.py'],
         }
 
         response = cast(
             HttpResponse,
             self.client.post(
                 '/api/qa/',
-                data={'repo_url': 'https://github.com/owner/repo', 'question': 'Where is load_pretrained_model defined?'},
+                data={'repo_url': 'https://github.com/owner/repo', 'question': 'Where is load_component defined?'},
                 content_type='application/json',
             ),
         )
@@ -502,7 +502,7 @@ class AnalysisEndpointReuseTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['answer'], 'builder.py에서 처리합니다.')
-        self.assertEqual(payload['citations'], ['sample_pkg/model_builder.py'])
+        self.assertEqual(payload['citations'], ['sample_pkg/factory.py'])
 
 
 @override_settings(

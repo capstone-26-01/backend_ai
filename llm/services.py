@@ -67,7 +67,7 @@ def _rank_files(analysis: dict[str, Any], question: str, max_files: int = 4) -> 
                 score += 5
 
         if {'entry', 'point'} & set(re.findall(r'[a-zA-Z0-9_./-]+', question.lower())):
-            if basename.startswith('run_') or label in {'main', 'eval_model'}:
+            if basename.startswith('run_') or label == 'main':
                 score += 25
             if any(hint in file_tokens for hint in ENTRYPOINT_HINTS):
                 score += 10
