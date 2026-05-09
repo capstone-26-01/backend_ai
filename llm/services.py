@@ -13,7 +13,7 @@ STOPWORDS = {
     'of', 'point', 'the', 'to', 'what', 'where', 'which',
 }
 
-ENTRYPOINT_HINTS = {'main', 'run', 'serve', 'cli', 'entry', 'app'}
+ENTRYPOINT_HINTS = {'main', 'run', 'cli', 'entry', 'app'}
 
 
 def _identifier_tokens(value: str) -> set[str]:
@@ -33,10 +33,6 @@ def _question_tokens(question: str) -> list[str]:
         expanded_tokens.append(token)
         if token == 'evaluation':
             expanded_tokens.append('eval')
-        if token == 'controller':
-            expanded_tokens.append('serve')
-        if token == 'worker':
-            expanded_tokens.append('serve')
     return expanded_tokens
 
 

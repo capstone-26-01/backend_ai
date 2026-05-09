@@ -124,6 +124,22 @@ class CachedQaSnapshotTests(TestCase):
 
         self.assertEqual(ranked_files[0], 'sample_pkg/run_checks.py')
 
+    def test_rank_files_does_not_translate_controller_or_worker_to_serve(self):
+        analysis = {
+            'revision': 'abc123',
+            'nodes': [
+                {'id': 'infra/controller.py::main', 'label': 'main', 'type': 'function', 'file': 'infra/controller.py'},
+                {'id': 'service/worker.py::main', 'label': 'main', 'type': 'function', 'file': 'service/worker.py'},
+                {'id': 'serve/api.py::main', 'label': 'main', 'type': 'function', 'file': 'serve/api.py'},
+            ],
+        }
+
+        ranked_files = _rank_files(analysis, 'How does controller connect to worker?')
+
+        self.assertIn('infra/controller.py', ranked_files)
+        self.assertIn('service/worker.py', ranked_files)
+        self.assertNotEqual(ranked_files[0], 'serve/api.py')
+
     @patch('llm.services.client.chat.completions.create')
     def test_answer_question_returns_non_answer_when_no_python_context_exists(self, create_mock):
         analysis = {
