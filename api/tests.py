@@ -487,7 +487,7 @@ class AnalysisEndpointReuseTests(TestCase):
         }
         answer_question_mock.return_value = {
             'answer': 'builder.py에서 처리합니다.',
-            'citations': ['llava/model/builder.py'],
+            'citations': ['sample_pkg/model_builder.py'],
         }
 
         response = cast(
@@ -502,7 +502,7 @@ class AnalysisEndpointReuseTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['answer'], 'builder.py에서 처리합니다.')
-        self.assertEqual(payload['citations'], ['llava/model/builder.py'])
+        self.assertEqual(payload['citations'], ['sample_pkg/model_builder.py'])
 
 
 @override_settings(

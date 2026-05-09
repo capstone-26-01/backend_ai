@@ -15,12 +15,12 @@ class SelectiveQuestionAnsweringTests(TestCase):
         analysis = {
             'revision': 'abc123',
             'file_contents': {
-                'llava/model/builder.py': '# llava/model/builder.py\nprint("ok")\n',
-                'llava/eval/run_llava.py': '# llava/eval/run_llava.py\nprint("ok")\n',
+                'sample_pkg/model_builder.py': '# sample_pkg/model_builder.py\nprint("ok")\n',
+                'sample_pkg/eval_runner.py': '# sample_pkg/eval_runner.py\nprint("ok")\n',
             },
             'nodes': [
-                {'id': 'llava/model/builder.py::load_pretrained_model', 'label': 'load_pretrained_model', 'type': 'function', 'file': 'llava/model/builder.py'},
-                {'id': 'llava/eval/run_llava.py::eval_model', 'label': 'eval_model', 'type': 'function', 'file': 'llava/eval/run_llava.py'},
+                {'id': 'sample_pkg/model_builder.py::load_pretrained_model', 'label': 'load_pretrained_model', 'type': 'function', 'file': 'sample_pkg/model_builder.py'},
+                {'id': 'sample_pkg/eval_runner.py::eval_model', 'label': 'eval_model', 'type': 'function', 'file': 'sample_pkg/eval_runner.py'},
             ],
             'edges': [],
         }
@@ -32,10 +32,10 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         response = answer_question('owner/repo', analysis, 'Where is load_pretrained_model defined?')
 
-        self.assertEqual(response['citations'], ['llava/model/builder.py'])
+        self.assertEqual(response['citations'], ['sample_pkg/model_builder.py'])
         prompt = create_mock.call_args.kwargs['messages'][1]['content']
-        self.assertIn('llava/model/builder.py', prompt)
-        self.assertNotIn('llava/eval/run_llava.py', prompt)
+        self.assertIn('sample_pkg/model_builder.py', prompt)
+        self.assertNotIn('sample_pkg/eval_runner.py', prompt)
         self.assertEqual(response['answer'], 'builder.py에서 처리합니다.')
 
     def test_build_context_reports_only_included_files(self):
@@ -102,27 +102,27 @@ class CachedQaSnapshotTests(TestCase):
         analysis = {
             'revision': 'abc123',
             'nodes': [
-                {'id': 'llava/model/builder.py::load_pretrained_model', 'label': 'load_pretrained_model', 'type': 'function', 'file': 'llava/model/builder.py'},
-                {'id': 'llava/model/language_model/llava_mistral.py::forward', 'label': 'forward', 'type': 'function', 'file': 'llava/model/language_model/llava_mistral.py'},
+                {'id': 'sample_pkg/model_builder.py::load_pretrained_model', 'label': 'load_pretrained_model', 'type': 'function', 'file': 'sample_pkg/model_builder.py'},
+                {'id': 'sample_pkg/chat_model.py::forward', 'label': 'forward', 'type': 'function', 'file': 'sample_pkg/chat_model.py'},
             ],
         }
 
         ranked_files = _rank_files(analysis, 'Where is load_pretrained_model defined?')
 
-        self.assertEqual(ranked_files[0], 'llava/model/builder.py')
+        self.assertEqual(ranked_files[0], 'sample_pkg/model_builder.py')
 
     def test_rank_files_boosts_eval_entrypoint_candidates(self):
         analysis = {
             'revision': 'abc123',
             'nodes': [
-                {'id': 'llava/eval/run_llava.py::eval_model', 'label': 'eval_model', 'type': 'function', 'file': 'llava/eval/run_llava.py'},
-                {'id': 'llava/model/llava_arch.py::build_vision_tower', 'label': 'build_vision_tower', 'type': 'function', 'file': 'llava/model/llava_arch.py'},
+                {'id': 'sample_pkg/eval_runner.py::eval_model', 'label': 'eval_model', 'type': 'function', 'file': 'sample_pkg/eval_runner.py'},
+                {'id': 'sample_pkg/model_arch.py::build_vision_tower', 'label': 'build_vision_tower', 'type': 'function', 'file': 'sample_pkg/model_arch.py'},
             ],
         }
 
         ranked_files = _rank_files(analysis, 'What is the evaluation entry point?')
 
-        self.assertEqual(ranked_files[0], 'llava/eval/run_llava.py')
+        self.assertEqual(ranked_files[0], 'sample_pkg/eval_runner.py')
 
     @patch('llm.services.client.chat.completions.create')
     def test_answer_question_returns_non_answer_when_no_python_context_exists(self, create_mock):
