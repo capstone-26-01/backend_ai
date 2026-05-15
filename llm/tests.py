@@ -1,17 +1,19 @@
-from django.test import TestCase
-from unittest.mock import patch
+import os
 import shutil
+from unittest.mock import Mock, patch
 
 from django.conf import settings
-from django.test import override_settings
+from django.test import TestCase, override_settings
+
+from typing import cast
 
 from api.services import get_repo_analysis
 from llm.services import answer_question, _build_context, _rank_files
 
 
 class SelectiveQuestionAnsweringTests(TestCase):
-    @patch('llm.services.client.chat.completions.create')
-    def test_answer_question_limits_context_to_ranked_files(self, create_mock):
+    @patch('llm.services._answer_with_openai')
+    def test_answer_question_limits_context_to_ranked_files(self, answer_with_openai):
         analysis = {
             'revision': 'abc123',
             'file_contents': {
@@ -24,18 +26,15 @@ class SelectiveQuestionAnsweringTests(TestCase):
             ],
             'edges': [],
         }
-        create_mock.return_value = type(
-            'Completion',
-            (),
-            {'choices': [type('Choice', (), {'message': type('Message', (), {'content': 'builder.py에서 처리합니다.'})()})]},
-        )()
+        answer_with_openai.return_value = 'builder.py에서 처리합니다.'
 
-        response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+            response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
 
         self.assertEqual(response['citations'], ['sample_pkg/factory.py'])
-        prompt = create_mock.call_args.kwargs['messages'][1]['content']
-        self.assertIn('sample_pkg/factory.py', prompt)
-        self.assertNotIn('sample_pkg/runner.py', prompt)
+        messages = answer_with_openai.call_args.args[0]
+        self.assertIn('sample_pkg/factory.py', messages[1]['content'])
+        self.assertNotIn('sample_pkg/runner.py', messages[1]['content'])
         self.assertEqual(response['answer'], 'builder.py에서 처리합니다.')
 
     def test_build_context_reports_only_included_files(self):
@@ -69,34 +68,40 @@ class CachedQaSnapshotTests(TestCase):
         settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
         settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
         self.source_repo.mkdir(parents=True, exist_ok=True)
+
         import subprocess
+
         subprocess.run(['git', 'init', '-b', 'main'], cwd=self.source_repo, check=True, capture_output=True, text=True)
         (self.source_repo / 'pkg').mkdir(parents=True, exist_ok=True)
         (self.source_repo / 'pkg' / 'builder.py').write_text('def load_component():\n    return "ok"\n', encoding='utf-8')
         subprocess.run(['git', 'add', '.'], cwd=self.source_repo, check=True, capture_output=True, text=True)
-        subprocess.run(['git', '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'], cwd=self.source_repo, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ['git', '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+            cwd=self.source_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def tearDown(self):
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
 
     @patch('github_repo.services._repo_clone_url')
-    @patch('llm.services.client.chat.completions.create')
-    def test_cached_analysis_supports_qa_after_playground_cleanup(self, create_mock, repo_clone_url):
+    @patch('llm.services._answer_with_openai')
+    def test_cached_analysis_supports_qa_after_playground_cleanup(self, answer_with_openai, repo_clone_url):
         repo_clone_url.return_value = str(self.source_repo)
         analysis = get_repo_analysis('owner/repo')
         self.assertIsNotNone(analysis)
+        analysis = cast(dict[str, object], analysis)
         shutil.rmtree(settings.PLAYGROUND_DIR, ignore_errors=True)
-        create_mock.return_value = type(
-            'Completion',
-            (),
-            {'choices': [type('Choice', (), {'message': type('Message', (), {'content': 'builder.py입니다.'})()})]},
-        )()
+        answer_with_openai.return_value = 'builder.py입니다.'
 
-        response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+            response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
 
         self.assertEqual(response['citations'], ['pkg/builder.py'])
-        prompt = create_mock.call_args.kwargs['messages'][1]['content']
-        self.assertIn('pkg/builder.py', prompt)
+        messages = answer_with_openai.call_args.args[0]
+        self.assertIn('pkg/builder.py', messages[1]['content'])
 
     def test_rank_files_prefers_exact_symbol_match(self):
         analysis = {
@@ -140,8 +145,7 @@ class CachedQaSnapshotTests(TestCase):
         self.assertIn('service/worker.py', ranked_files)
         self.assertNotEqual(ranked_files[0], 'serve/api.py')
 
-    @patch('llm.services.client.chat.completions.create')
-    def test_answer_question_returns_non_answer_when_no_python_context_exists(self, create_mock):
+    def test_answer_question_returns_non_answer_when_no_python_context_exists(self):
         analysis = {
             'revision': 'abc123',
             'file_contents': {},
@@ -153,4 +157,65 @@ class CachedQaSnapshotTests(TestCase):
 
         self.assertEqual(response['citations'], [])
         self.assertEqual(response['answer'], '분석 가능한 Python 코드 문맥을 찾지 못했습니다.')
-        create_mock.assert_not_called()
+
+    @patch('llm.services.requests.post')
+    @patch('llm.services._answer_with_openai')
+    def test_answer_question_falls_back_to_gemini_when_openai_call_fails(self, answer_with_openai, requests_post):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {
+                'sample_pkg/factory.py': 'def load_component():\n    return "ok"\n',
+            },
+            'nodes': [
+                {'id': 'sample_pkg/factory.py::load_component', 'label': 'load_component', 'type': 'function', 'file': 'sample_pkg/factory.py'},
+            ],
+            'edges': [],
+        }
+        answer_with_openai.side_effect = RuntimeError('401 not_authorized_invalid_project')
+        gemini_response = Mock()
+        gemini_response.json.return_value = {
+            'candidates': [
+                {'content': {'parts': [{'text': 'Gemini가 대신 답변했습니다.'}]}}
+            ]
+        }
+        gemini_response.raise_for_status.return_value = None
+        requests_post.return_value = gemini_response
+
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'bad-key', 'GEMINI_API_KEY': 'gemini-key'}, clear=False):
+            response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
+
+        self.assertEqual(response['answer'], 'Gemini가 대신 답변했습니다.')
+        self.assertEqual(response['citations'], ['sample_pkg/factory.py'])
+        requests_post.assert_called_once()
+        self.assertEqual(requests_post.call_args.kwargs['headers']['x-goog-api-key'], 'gemini-key')
+        payload = requests_post.call_args.kwargs['json']
+        self.assertIn('질문: Where is load_component defined?', payload['contents'][0]['parts'][0]['text'])
+
+    @patch('llm.services.requests.post')
+    @patch('llm.services._answer_with_openai')
+    def test_answer_question_uses_gemini_when_openai_key_is_missing(self, answer_with_openai, requests_post):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {
+                'sample_pkg/factory.py': 'def load_component():\n    return "ok"\n',
+            },
+            'nodes': [
+                {'id': 'sample_pkg/factory.py::load_component', 'label': 'load_component', 'type': 'function', 'file': 'sample_pkg/factory.py'},
+            ],
+            'edges': [],
+        }
+        gemini_response = Mock()
+        gemini_response.json.return_value = {
+            'candidates': [
+                {'content': {'parts': [{'text': 'Gemini direct response'}]}}
+            ]
+        }
+        gemini_response.raise_for_status.return_value = None
+        requests_post.return_value = gemini_response
+
+        with patch.dict(os.environ, {'GEMINI_API_KEY': 'gemini-key'}, clear=True):
+            response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
+
+        self.assertEqual(response['answer'], 'Gemini direct response')
+        answer_with_openai.assert_not_called()
+        requests_post.assert_called_once()

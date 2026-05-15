@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any, cast
 
+import requests
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+logger = logging.getLogger(__name__)
+
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
 
 STOPWORDS = {
     'a', 'an', 'and', 'are', 'at', 'defined', 'does', 'file', 'how', 'in', 'is',
@@ -104,6 +111,102 @@ def _build_context(analysis: dict[str, Any], files: list[str], max_chars: int = 
     return ''.join(sections), included_files
 
 
+def _build_messages(context: str, question: str) -> list[dict[str, str]]:
+    return [
+        {
+            'role': 'system',
+            'content': '너는 코드 분석 전문가야. 선택된 코드와 그래프 단서를 근거로만 답하고 한국어로 답변해.',
+        },
+        {
+            'role': 'user',
+            'content': f'다음 선택된 코드만 참고해서 질문에 답해줘:\n{context}\n\n질문: {question}',
+        },
+    ]
+
+
+def _get_openai_client() -> OpenAI | None:
+    api_key = os.getenv('OPENAI_API_KEY')
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def _extract_gemini_text(payload: dict[str, Any]) -> str:
+    for candidate in payload.get('candidates', []):
+        parts = candidate.get('content', {}).get('parts', [])
+        texts = [part.get('text', '') for part in parts if part.get('text')]
+        if texts:
+            return '\n'.join(texts)
+    raise RuntimeError('Gemini 응답에서 텍스트를 찾지 못했습니다.')
+
+
+def _answer_with_openai(messages: list[dict[str, str]]) -> str:
+    client = _get_openai_client()
+    if client is None:
+        raise RuntimeError('OPENAI_API_KEY가 설정되지 않았습니다.')
+
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=cast(list[ChatCompletionMessageParam], messages),
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError('OpenAI 응답이 비어 있습니다.')
+    return content
+
+
+def _answer_with_gemini(messages: list[dict[str, str]]) -> str:
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
+
+    system_prompt = '\n\n'.join(message['content'] for message in messages if message['role'] == 'system')
+    user_prompt = '\n\n'.join(message['content'] for message in messages if message['role'] == 'user')
+
+    payload: dict[str, Any] = {
+        'contents': [
+            {
+                'role': 'user',
+                'parts': [{'text': user_prompt}],
+            }
+        ]
+    }
+    if system_prompt:
+        payload['system_instruction'] = {
+            'parts': [{'text': system_prompt}],
+        }
+
+    response = requests.post(
+        GEMINI_API_URL.format(model=GEMINI_MODEL),
+        headers={
+            'x-goog-api-key': api_key,
+            'Content-Type': 'application/json',
+        },
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+    return _extract_gemini_text(cast(dict[str, Any], response.json()))
+
+
+def _generate_answer(messages: list[dict[str, str]]) -> str:
+    openai_key = os.getenv('OPENAI_API_KEY')
+    gemini_key = os.getenv('GEMINI_API_KEY')
+
+    if openai_key:
+        try:
+            return _answer_with_openai(messages)
+        except Exception:
+            if not gemini_key:
+                raise
+            logger.warning('OpenAI 호출 실패로 Gemini 폴백을 사용합니다.', exc_info=True)
+
+    if gemini_key:
+        return _answer_with_gemini(messages)
+
+    raise RuntimeError('사용 가능한 AI API 키가 없습니다.')
+
+
 def answer_question(repo_path: str, analysis: dict[str, Any], question: str) -> dict[str, object]:
     ranked_files = _rank_files(analysis, question)
     context, included_files = _build_context(analysis, ranked_files)
@@ -114,21 +217,10 @@ def answer_question(repo_path: str, analysis: dict[str, Any], question: str) -> 
             'citations': [],
         }
 
-    response = client.chat.completions.create(
-        model='gpt-4o-mini',
-        messages=[
-            {
-                'role': 'system',
-                'content': '너는 코드 분석 전문가야. 선택된 코드와 그래프 단서를 근거로만 답하고 한국어로 답변해.',
-            },
-            {
-                'role': 'user',
-                'content': f'다음 선택된 코드만 참고해서 질문에 답해줘:\n{context}\n\n질문: {question}',
-            },
-        ],
-    )
+    messages = _build_messages(context, question)
+    answer = _generate_answer(messages)
 
     return {
-        'answer': response.choices[0].message.content,
+        'answer': answer,
         'citations': included_files,
     }
