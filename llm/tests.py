@@ -8,6 +8,7 @@ from django.test import TestCase, override_settings
 from typing import cast
 
 from api.services import get_repo_analysis
+from api.test_utils import create_git_fixture_repo
 from llm.services import answer_question, _build_context, _rank_files
 
 
@@ -67,21 +68,7 @@ class CachedQaSnapshotTests(TestCase):
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
         settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
         settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
-        self.source_repo.mkdir(parents=True, exist_ok=True)
-
-        import subprocess
-
-        subprocess.run(['git', 'init', '-b', 'main'], cwd=self.source_repo, check=True, capture_output=True, text=True)
-        (self.source_repo / 'pkg').mkdir(parents=True, exist_ok=True)
-        (self.source_repo / 'pkg' / 'builder.py').write_text('def load_component():\n    return "ok"\n', encoding='utf-8')
-        subprocess.run(['git', 'add', '.'], cwd=self.source_repo, check=True, capture_output=True, text=True)
-        subprocess.run(
-            ['git', '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
-            cwd=self.source_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        create_git_fixture_repo(self.source_repo, {'pkg/builder.py': 'def load_component():\n    return "ok"\n'}, commit_message='init')
 
     def tearDown(self):
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
@@ -157,6 +144,20 @@ class CachedQaSnapshotTests(TestCase):
 
         self.assertEqual(response['citations'], [])
         self.assertEqual(response['answer'], '분석 가능한 Python 코드 문맥을 찾지 못했습니다.')
+
+    @patch('llm.services._generate_answer')
+    def test_answer_question_does_not_call_model_without_python_context(self, generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {},
+            'nodes': [{'id': 'docs/guide.md', 'label': 'guide.md', 'type': 'file', 'file': 'docs/guide.md'}],
+            'edges': [],
+        }
+
+        response = answer_question('owner/repo', analysis, '이 저장소는 무슨 일을 하나요?')
+
+        self.assertEqual(response['citations'], [])
+        generate_answer.assert_not_called()
 
     @patch('llm.services.requests.post')
     @patch('llm.services._answer_with_openai')
