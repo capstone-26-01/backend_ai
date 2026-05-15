@@ -263,6 +263,8 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
             revision=revision,
             graph=graph,
             file_contents=file_contents,
+            entrypoints=graph.get('entrypoints', []),
+            key_modules=graph.get('key_modules', []),
             warnings=graph.get('warnings', []),
         )
         _write_analysis_artifact(artifact_path, analysis)

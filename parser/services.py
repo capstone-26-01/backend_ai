@@ -171,33 +171,87 @@ def _make_module_node(module_id: str, label: str, file_path: str | None = None, 
     )
 
 
-def _make_edge(source: str, target: str, edge_type: str, file_path: str) -> dict[str, object]:
+def _make_edge(
+    source: str,
+    target: str,
+    edge_type: str,
+    file_path: str,
+    *,
+    confidence: float = 1.0,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
     return {
         'source': source,
         'target': target,
         'type': edge_type,
         'file': file_path,
+        'confidence': confidence,
+        'metadata': metadata or {},
     }
 
 
-def _extract_import_targets(import_text: str) -> list[str]:
+def _split_alias(value: str) -> tuple[str, str | None]:
+    if ' as ' not in value:
+        return value.strip(), None
+    name, alias = value.split(' as ', maxsplit=1)
+    return name.strip(), alias.strip()
+
+
+def _normalize_import_module(module_name: str, current_module: str) -> str:
+    if not module_name.startswith('.'):
+        return module_name
+
+    level = len(module_name) - len(module_name.lstrip('.'))
+    tail = module_name[level:]
+    current_package = current_module.split('.')[:-1]
+    base_length = max(len(current_package) - level + 1, 0)
+    parts = current_package[:base_length]
+    if tail:
+        parts.extend(part for part in tail.split('.') if part)
+    return '.'.join(parts)
+
+
+def _extract_import_details(import_text: str, current_module: str) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    module_targets: list[str] = []
+    call_aliases: dict[str, str] = {}
+    module_aliases: dict[str, str] = {}
+
     if import_text.startswith('import '):
-        names = []
         for part in import_text.removeprefix('import ').split(','):
-            module_name = part.split(' as ')[0].strip()
+            module_name, alias = _split_alias(part)
             if module_name:
-                names.append(module_name)
-        return names
+                module_targets.append(module_name)
+                alias_name = alias or module_name.split('.')[0]
+                module_aliases[alias_name] = module_name
+        return module_targets, call_aliases, module_aliases
 
     if import_text.startswith('from ') and ' import ' in import_text:
-        module_name = import_text.removeprefix('from ').split(' import ', maxsplit=1)[0].strip()
-        return [module_name] if module_name else []
+        module_name, imported_names = import_text.removeprefix('from ').split(' import ', maxsplit=1)
+        normalized_module = _normalize_import_module(module_name.strip(), current_module)
+        if normalized_module:
+            module_targets.append(normalized_module)
+        for part in imported_names.split(','):
+            imported_name, alias = _split_alias(part)
+            if not imported_name or imported_name == '*':
+                continue
+            call_aliases[alias or imported_name] = imported_name
+        return module_targets, call_aliases, module_aliases
 
-    return []
+    return module_targets, call_aliases, module_aliases
 
 
-def _extract_call_edges(function_node, source_bytes: bytes, caller_id: str, file_path: str) -> list[dict[str, object]]:
+def _extract_call_edges(
+    function_node,
+    source_bytes: bytes,
+    caller_id: str,
+    file_path: str,
+    *,
+    call_aliases: dict[str, str] | None = None,
+    module_aliases: dict[str, str] | None = None,
+) -> list[dict[str, object]]:
     call_edges: list[dict[str, object]] = []
+    call_aliases = call_aliases or {}
+    module_aliases = module_aliases or {}
 
     caller_class_id: str | None = None
     if caller_id.count('::') >= 2:
@@ -213,8 +267,14 @@ def _extract_call_edges(function_node, source_bytes: bytes, caller_id: str, file
             continue
 
         target_name: str | None = None
+        confidence = 0.8
+        metadata: dict[str, object] = {}
         if target_node.type == 'identifier':
-            target_name = _read_text(target_node, source_bytes)
+            identifier = _read_text(target_node, source_bytes)
+            target_name = call_aliases.get(identifier, identifier)
+            if identifier in call_aliases:
+                confidence = 0.9
+                metadata['import_alias'] = identifier
         elif target_node.type == 'attribute':
             attribute_node = target_node.child_by_field_name('attribute')
             object_node = target_node.child_by_field_name('object')
@@ -223,13 +283,23 @@ def _extract_call_edges(function_node, source_bytes: bytes, caller_id: str, file
             attribute_name = _read_text(attribute_node, source_bytes)
             if object_node is not None and _read_text(object_node, source_bytes) == 'self' and caller_class_id is not None:
                 target_name = f'{caller_class_id}::{attribute_name}'
+                confidence = 1.0
             else:
-                target_name = f'attribute::{attribute_name}'
+                object_name = _read_text(object_node, source_bytes) if object_node is not None else ''
+                if object_name in module_aliases:
+                    target_name = attribute_name
+                    confidence = 0.75
+                    metadata['module_alias'] = object_name
+                    metadata['module'] = module_aliases[object_name]
+                else:
+                    target_name = f'attribute::{attribute_name}'
+                    confidence = 0.4
+                    metadata['unresolved_attribute'] = object_name
 
         if target_name is None:
             continue
 
-        call_edges.append(_make_edge(caller_id, target_name, 'calls', file_path))
+        call_edges.append(_make_edge(caller_id, target_name, 'calls', file_path, confidence=confidence, metadata=metadata))
 
     return call_edges
 
@@ -257,7 +327,15 @@ def _symbol_metadata(decorators: list[str], docstring: str | None) -> dict[str, 
     return metadata
 
 
-def _parse_class_body(class_node, source_bytes: bytes, class_id: str, file_path: str) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+def _parse_class_body(
+    class_node,
+    source_bytes: bytes,
+    class_id: str,
+    file_path: str,
+    *,
+    call_aliases: dict[str, str],
+    module_aliases: dict[str, str],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     nodes: list[dict[str, object]] = []
     edges: list[dict[str, object]] = []
     tree_children: list[dict[str, object]] = []
@@ -290,7 +368,7 @@ def _parse_class_body(class_node, source_bytes: bytes, class_id: str, file_path:
             metadata=_symbol_metadata(decorators, _extract_docstring(child, source_bytes)),
         ))
         edges.append(_make_edge(class_id, func_id, 'contains', file_path))
-        edges.extend(_extract_call_edges(child, source_bytes, func_id, file_path))
+        edges.extend(_extract_call_edges(child, source_bytes, func_id, file_path, call_aliases=call_aliases, module_aliases=module_aliases))
         tree_children.append(_make_tree_node(func_id, 'method', func_name))
 
     return nodes, edges, tree_children
@@ -304,11 +382,18 @@ def parse_python_file(code: str, file_path: str):
 
     module_name = _module_name_from_path(file_path)
     module_id = f'module::{module_name}'
-    nodes: list[dict[str, object]] = [_make_module_node(module_id, module_name, file_path, file_path)]
+    module_node = _make_module_node(module_id, module_name, file_path, file_path)
+    if '__name__' in code and '__main__' in code:
+        cast_metadata = module_node['metadata']
+        if isinstance(cast_metadata, dict):
+            cast_metadata['has_main_guard'] = True
+    nodes: list[dict[str, object]] = [module_node]
     edges: list[dict[str, object]] = [_make_edge(file_path, module_id, 'contains', file_path)]
     module_children: list[dict[str, object]] = []
     import_nodes: dict[str, dict[str, object]] = {}
     warnings: list[dict[str, object]] = []
+    call_aliases: dict[str, str] = {}
+    module_aliases: dict[str, str] = {}
 
     if root.has_error:
         warnings.append({
@@ -322,7 +407,10 @@ def parse_python_file(code: str, file_path: str):
         node, decorators = _unwrap_definition_with_decorators(raw_node, source_bytes)
         if node.type in {'import_statement', 'import_from_statement'}:
             import_text = _read_text(node, source_bytes)
-            for imported_module in _extract_import_targets(import_text):
+            imported_modules, imported_call_aliases, imported_module_aliases = _extract_import_details(import_text, module_name)
+            call_aliases.update(imported_call_aliases)
+            module_aliases.update(imported_module_aliases)
+            for imported_module in imported_modules:
                 imported_module_id = f'module::{imported_module}'
                 import_nodes.setdefault(
                     imported_module_id,
@@ -338,7 +426,14 @@ def parse_python_file(code: str, file_path: str):
 
             class_id = f'{file_path}::{class_name}'
             start_line, end_line = _line_range(node)
-            method_nodes, method_edges, method_tree_children = _parse_class_body(node, source_bytes, class_id, file_path)
+            method_nodes, method_edges, method_tree_children = _parse_class_body(
+                node,
+                source_bytes,
+                class_id,
+                file_path,
+                call_aliases=call_aliases,
+                module_aliases=module_aliases,
+            )
 
             nodes.append(_make_graph_node(
                 class_id,
@@ -386,7 +481,7 @@ def parse_python_file(code: str, file_path: str):
                 metadata=_symbol_metadata(decorators, _extract_docstring(node, source_bytes)),
             ))
             edges.append(_make_edge(module_id, func_id, 'contains', file_path))
-            edges.extend(_extract_call_edges(node, source_bytes, func_id, file_path))
+            edges.extend(_extract_call_edges(node, source_bytes, func_id, file_path, call_aliases=call_aliases, module_aliases=module_aliases))
             module_children.append(_make_tree_node(func_id, 'function', func_name))
 
     module_tree_node = _make_tree_node(module_id, 'module', module_name, _sort_tree_children(module_children))
@@ -431,6 +526,8 @@ def resolve_edges(edges, nodes):
             'target': target,
             'type': edge['type'],
             'file': edge['file'],
+            'confidence': edge.get('confidence', 1.0),
+            'metadata': edge.get('metadata', {}),
         })
 
     sorted_edges = sorted(
@@ -479,6 +576,133 @@ def _deduplicate_nodes(nodes: list[dict[str, object]]) -> list[dict[str, object]
         if existing is None or (not existing.get('file') and node.get('file')):
             deduplicated[node_id] = node
     return list(deduplicated.values())
+
+
+def _external_label(external_id: str) -> str:
+    return external_id.split('::')[-1]
+
+
+def _attach_external_call_nodes(nodes: list[dict[str, object]], edges: list[dict[str, object]], warnings: list[dict[str, object]]) -> list[dict[str, object]]:
+    node_ids = {str(node['id']) for node in nodes}
+    external_nodes: dict[str, dict[str, object]] = {}
+
+    for edge in edges:
+        if edge['type'] != 'calls':
+            continue
+        target = str(edge['target'])
+        if target in node_ids:
+            continue
+
+        external_id = target if '::' in target else f'external::{target}'
+        edge['target'] = external_id
+        edge['confidence'] = min(float(edge.get('confidence', 1.0)), 0.4)
+        metadata = dict(edge.get('metadata', {}))
+        metadata['unresolved_target'] = target
+        edge['metadata'] = metadata
+
+        if external_id not in external_nodes:
+            external_nodes[external_id] = _make_graph_node(
+                external_id,
+                'external',
+                _external_label(external_id),
+                metadata={'original_target': target},
+            )
+            warnings.append({
+                'code': 'unresolved_call',
+                'message': 'Call target could not be resolved to a local symbol.',
+                'path': edge['file'],
+                'target': target,
+            })
+
+    return [*nodes, *external_nodes.values()]
+
+
+def _detect_entrypoints(nodes: list[dict[str, object]]) -> list[dict[str, object]]:
+    entrypoints: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def add(node: dict[str, object], kind: str, confidence: float, reason: str) -> None:
+        node_id = str(node['id'])
+        key = f'{node_id}:{kind}'
+        if key in seen:
+            return
+        seen.add(key)
+        entrypoints.append({
+            'id': node_id,
+            'kind': kind,
+            'label': node['label'],
+            'path': node.get('file') or node.get('path'),
+            'confidence': confidence,
+            'reason': reason,
+        })
+
+    for node in nodes:
+        node_type = node.get('type')
+        label = str(node.get('label', ''))
+        path = str(node.get('file') or node.get('path') or '')
+        metadata = node.get('metadata') if isinstance(node.get('metadata'), dict) else {}
+
+        if node_type == 'module' and metadata.get('has_main_guard'):
+            add(node, 'python_main_guard', 1.0, '__name__ == "__main__" guard')
+        if node_type in {'function', 'method'} and label == 'main':
+            add(node, 'main_function', 0.9, 'function named main')
+        if path.endswith('manage.py'):
+            add(node, 'django_manage', 0.95, 'manage.py convention')
+        if path.endswith(('asgi.py', 'wsgi.py')):
+            add(node, 'django_server_entry', 0.8, 'ASGI/WSGI convention')
+        decorators = metadata.get('decorators') if isinstance(metadata, dict) else None
+        if isinstance(decorators, list) and any(str(decorator).startswith(('app.get', 'app.post', 'app.put', 'app.delete', 'router.', 'app.route')) for decorator in decorators):
+            add(node, 'web_route', 0.85, 'route decorator')
+
+    return sorted(entrypoints, key=lambda entrypoint: (-float(entrypoint['confidence']), str(entrypoint['path']), str(entrypoint['id'])))
+
+
+def _score_key_modules(nodes: list[dict[str, object]], edges: list[dict[str, object]], entrypoints: list[dict[str, object]]) -> list[dict[str, object]]:
+    module_nodes = {str(node['id']): node for node in nodes if node.get('type') == 'module' and node.get('file')}
+    if not module_nodes:
+        return []
+
+    fan_in = defaultdict(int)
+    fan_out = defaultdict(int)
+    parent_by_id = {str(node['id']): str(node.get('parent', '')) for node in nodes}
+    entrypoint_paths = {str(entrypoint.get('path')) for entrypoint in entrypoints if entrypoint.get('path')}
+
+    for edge in edges:
+        source_module = str(edge['source']) if str(edge['source']) in module_nodes else parent_by_id.get(str(edge['source']), '')
+        target_module = str(edge['target']) if str(edge['target']) in module_nodes else parent_by_id.get(str(edge['target']), '')
+        if source_module in module_nodes:
+            fan_out[source_module] += 1
+        if target_module in module_nodes:
+            fan_in[target_module] += 1
+
+    hints = {'service', 'api', 'view', 'views', 'model', 'models', 'router', 'parser', 'config', 'settings', 'main', 'manage'}
+    scored: list[dict[str, object]] = []
+    for module_id, node in module_nodes.items():
+        path = str(node.get('file') or '')
+        path_tokens = set(path.removesuffix('.py').replace('/', '.').replace('_', '.').split('.'))
+        score = fan_in[module_id] * 2 + fan_out[module_id]
+        reasons = []
+        if fan_in[module_id]:
+            reasons.append('fan_in')
+        if fan_out[module_id]:
+            reasons.append('fan_out')
+        if path in entrypoint_paths:
+            score += 5
+            reasons.append('entrypoint')
+        if path_tokens & hints:
+            score += 2
+            reasons.append('name_hint')
+        if score <= 0:
+            continue
+        scored.append({
+            'id': module_id,
+            'label': node['label'],
+            'path': path,
+            'score': score,
+            'reasons': reasons,
+        })
+
+    return sorted(scored, key=lambda item: (-int(item['score']), str(item['path']), str(item['id'])))[:10]
 
 
 def parse_repo(repo_path, files, get_content_func):
@@ -549,10 +773,22 @@ def parse_repo(repo_path, files, get_content_func):
     deduplicated_nodes = _deduplicate_nodes(all_nodes)
     sorted_nodes = _sort_nodes(deduplicated_nodes)
     resolved_edges = resolve_edges(all_edges, sorted_nodes)
+    nodes_with_external = _sort_nodes(_attach_external_call_nodes(sorted_nodes, resolved_edges, warnings))
+    entrypoints = _detect_entrypoints(nodes_with_external)
+    key_modules = _score_key_modules(nodes_with_external, resolved_edges, entrypoints)
+
+    for entrypoint in entrypoints:
+        path = str(entrypoint.get('path') or '')
+        target = str(entrypoint['id'])
+        if path and path != target:
+            resolved_edges.append(_make_edge(path, target, 'entrypoint', path, confidence=float(entrypoint['confidence'])))
+    resolved_edges = resolve_edges(resolved_edges, nodes_with_external)
 
     return {
         'tree': _sort_tree_children(root_tree_children),
-        'nodes': sorted_nodes,
+        'nodes': nodes_with_external,
         'edges': resolved_edges,
+        'entrypoints': entrypoints,
+        'key_modules': key_modules,
         'warnings': warnings,
     }
