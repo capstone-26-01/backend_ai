@@ -257,12 +257,13 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
                 )
             file_contents[file_path] = content
 
-        graph = parse_repo(repo_path, python_files, lambda _repo_path, file_path: file_contents.get(file_path))
+        graph = parse_repo(repo_path, files, lambda _repo_path, file_path: file_contents.get(file_path))
         analysis = build_graph_artifact(
             repo_path=repo_path,
             revision=revision,
             graph=graph,
             file_contents=file_contents,
+            warnings=graph.get('warnings', []),
         )
         _write_analysis_artifact(artifact_path, analysis)
         return store_artifact(analysis_run, analysis)
