@@ -11,10 +11,12 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
-from dotenv import load_dotenv
 import os
 
+from dotenv import load_dotenv
+
 load_dotenv()
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,12 +30,32 @@ PLAYGROUND_DIR.mkdir(exist_ok=True)
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() == 'true'
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return [item.strip() for item in value.split(',') if item.strip()]
+
+
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ['SECRET_KEY']
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
+DEBUG = _env_bool('DEBUG', False)
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '.ngrok-free.app', '*']
+ALLOWED_HOSTS = _env_list('ALLOWED_HOSTS', ['localhost', '127.0.0.1'])
+CSRF_TRUSTED_ORIGINS = _env_list('CSRF_TRUSTED_ORIGINS', [])
+SECURE_SSL_REDIRECT = _env_bool('SECURE_SSL_REDIRECT', False)
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
 
 
 # Application definition
@@ -48,7 +70,6 @@ INSTALLED_APPS = [
     'rest_framework',
     'drf_spectacular',
     'api',
-    
 ]
 
 REST_FRAMEWORK = {
