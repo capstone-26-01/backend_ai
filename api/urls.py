@@ -8,6 +8,7 @@ urlpatterns = [
     path('analysis/<int:analysis_id>/', views.analysis_detail),
     path('diff/', views.graph_diff),
     path('share/', views.share),
+    path('share/<str:share_id>/graph.svg', views.share_graph_svg),
     path('share/<str:share_id>/', views.share_detail),
     path('embed/<str:share_id>/', views.embed),
     path('repo/', views.get_repo_file),

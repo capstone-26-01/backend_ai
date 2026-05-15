@@ -3,6 +3,8 @@ import importlib
 import json
 import logging
 from typing import Any, cast
+
+from django.conf import settings
 from django.http import HttpResponse
 from django.views.decorators.clickjacking import xframe_options_exempt
 from rest_framework.decorators import api_view
@@ -14,6 +16,19 @@ from rest_framework import serializers
 
 from github_repo.services import RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
+from .readme_svg import (
+    DEFAULT_NODE_LIMIT,
+    DEFAULT_SVG_HEIGHT,
+    DEFAULT_SVG_WIDTH,
+    MAX_NODE_LIMIT,
+    MAX_SVG_HEIGHT,
+    MAX_SVG_WIDTH,
+    MIN_NODE_LIMIT,
+    MIN_SVG_HEIGHT,
+    MIN_SVG_WIDTH,
+    normalize_svg_options,
+    render_share_graph_svg,
+)
 from .throttles import ShareCreateRateThrottle
 from .serializers import (
     AnalysisDiffRequestSerializer,
@@ -122,22 +137,45 @@ def _share_error_response(error: Exception) -> Response:
     raise error
 
 
+def _frontend_share_url(request, share_id: str) -> str:
+    base_url = getattr(settings, 'FRONTEND_BASE_URL', '').rstrip('/')
+    if base_url:
+        return f'{base_url}/share/{share_id}'
+    return request.build_absolute_uri(f'/share/{share_id}')
+
+
 def _share_payload_with_links(request, payload: dict[str, Any]) -> dict[str, Any]:
     response_payload = dict(payload)
     share_id = str(response_payload['share_id'])
     repo_name = html.escape(str(response_payload['repo']))
     share_url = request.build_absolute_uri(f'/api/share/{share_id}/')
     embed_url = request.build_absolute_uri(f'/api/embed/{share_id}/')
+    readme_svg_url = request.build_absolute_uri(f'/api/share/{share_id}/graph.svg')
+    frontend_share_url = _frontend_share_url(request, share_id)
     response_payload['urls'] = {
         'share': share_url,
         'embed': embed_url,
+        'readme_svg': readme_svg_url,
+        'frontend_share': frontend_share_url,
     }
     response_payload['snippets'] = {
-        'markdown_link': f'[{response_payload["repo"]} graph]({share_url})',
+        'markdown_link': f'[{response_payload["repo"]} graph]({frontend_share_url})',
+        'markdown_image_link': f'[![{response_payload["repo"]} code graph]({readme_svg_url})]({frontend_share_url})',
+        'html_image_link': f'<a href="{html.escape(frontend_share_url)}"><img src="{html.escape(readme_svg_url)}" alt="{repo_name} code graph" /></a>',
         'html_iframe': f'<iframe src="{embed_url}" width="100%" height="640" loading="lazy" title="{repo_name} graph"></iframe>',
-        'github_readme_note': 'GitHub README는 iframe을 렌더링하지 않으므로 markdown_link를 사용하세요.',
+        'github_readme_note': 'GitHub README는 iframe을 렌더링하지 않으므로 markdown_image_link를 사용하세요.',
     }
     return response_payload
+
+
+def _query_int(request, name: str) -> int | None:
+    value = request.GET.get(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 _ANALYSIS_REQUEST_SCHEMA = inline_serializer(
@@ -372,6 +410,48 @@ def share_detail(request, share_id: str):
     if response is None:
         return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
     return Response(_share_payload_with_links(request, response))
+
+
+@extend_schema(
+    operation_id='share_graph_svg',
+    parameters=[
+        OpenApiParameter(name='width', description=f'SVG width ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH})', required=False, type=int),
+        OpenApiParameter(name='height', description=f'SVG height ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT})', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'Max rendered graph nodes ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT})', required=False, type=int),
+        OpenApiParameter(name='theme', description='light 또는 dark', required=False, type=str),
+    ],
+    responses={200: OpenApiTypes.STR},
+)
+@api_view(['GET'])
+def share_graph_svg(request, share_id: str):
+    if not is_safe_share_id(share_id):
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+    try:
+        response = get_share_response(share_id)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    except Exception as error:
+        return _share_error_response(error)
+    if response is None:
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+
+    options = normalize_svg_options(
+        width=_query_int(request, 'width') or DEFAULT_SVG_WIDTH,
+        height=_query_int(request, 'height') or DEFAULT_SVG_HEIGHT,
+        node_limit=_query_int(request, 'limit') or DEFAULT_NODE_LIMIT,
+        theme=request.GET.get('theme'),
+    )
+    svg = render_share_graph_svg(
+        response,
+        width=cast(int, options['width']),
+        height=cast(int, options['height']),
+        node_limit=cast(int, options['node_limit']),
+        theme_name=cast(str, options['theme']),
+    )
+    response_obj = HttpResponse(svg, content_type='image/svg+xml; charset=utf-8')
+    response_obj['Cache-Control'] = 'public, max-age=300, stale-while-revalidate=3600'
+    response_obj['X-Content-Type-Options'] = 'nosniff'
+    return response_obj
 
 
 @extend_schema(

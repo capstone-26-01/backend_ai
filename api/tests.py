@@ -2085,8 +2085,17 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertEqual(payload['repo'], 'owner/repo')
         self.assertIn('nodes', graph)
         self.assertNotIn('file_contents', graph)
-        self.assertIn('markdown_link', cast(dict[str, object], payload['snippets']))
-        self.assertIn('/api/embed/', cast(dict[str, object], payload['urls'])['embed'])
+        snippets = cast(dict[str, object], payload['snippets'])
+        urls = cast(dict[str, object], payload['urls'])
+        self.assertIn('markdown_link', snippets)
+        self.assertIn('markdown_image_link', snippets)
+        self.assertIn('html_image_link', snippets)
+        self.assertIn('/api/embed/', urls['embed'])
+        self.assertIn('/api/share/', urls['readme_svg'])
+        self.assertIn('/graph.svg', urls['readme_svg'])
+        self.assertIn('/share/', urls['frontend_share'])
+        self.assertIn(cast(str, urls['readme_svg']), cast(str, snippets['markdown_image_link']))
+        self.assertIn(cast(str, urls['frontend_share']), cast(str, snippets['markdown_image_link']))
         self.assertEqual(ShareLink.objects.count(), 1)
 
     @patch('github_repo.services._repo_clone_url')
@@ -2175,6 +2184,27 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertNotIn('X-Frame-Options', response.headers)
 
     @patch('github_repo.services._repo_clone_url')
+    def test_graph_svg_endpoint_returns_readme_safe_svg(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        create_response = self._create_share()
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+
+        response = cast(
+            HttpResponse,
+            self.client.get(f'/api/share/{create_payload["share_id"]}/graph.svg', {'width': '960', 'height': '620', 'limit': '40', 'theme': 'dark'}),
+        )
+        svg_text = response.content.decode('utf-8')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('image/svg+xml', response.headers.get('Content-Type', ''))
+        self.assertIn('public, max-age=300', response.headers.get('Cache-Control', ''))
+        self.assertIn('<svg', svg_text)
+        self.assertIn('GitStarter dynamic codebase graph', svg_text)
+        self.assertIn('owner/repo', svg_text)
+        self.assertIn('greet', svg_text)
+        self.assertNotIn('return "v1"', svg_text)
+
+    @patch('github_repo.services._repo_clone_url')
     def test_share_id_is_not_sequential(self, repo_clone_url):
         repo_clone_url.return_value = self._clone_url()
 
@@ -2244,6 +2274,7 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('/api/diff/', schema_text)
         self.assertIn('/api/share/', schema_text)
         self.assertIn('/api/share/{share_id}/', schema_text)
+        self.assertIn('/api/share/{share_id}/graph.svg', schema_text)
         self.assertIn('/api/embed/{share_id}/', schema_text)
         self.assertIn('/api/tree/', schema_text)
         self.assertIn('/api/graph/', schema_text)
