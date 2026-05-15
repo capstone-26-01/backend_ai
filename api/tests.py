@@ -595,6 +595,120 @@ class ParserDirectorySymbolTests(TestCase):
         self.assertEqual(first['tree'], second['tree'])
 
 
+class ParserRelationshipEntrypointTests(TestCase):
+    def test_relative_import_alias_call_resolves_to_local_symbol(self):
+        files = ['pkg/app.py', 'pkg/utils.py']
+        file_contents = {
+            'pkg/app.py': (
+                'from .utils import helper as run_helper\n\n'
+                'def main():\n'
+                '    return run_helper()\n'
+            ),
+            'pkg/utils.py': (
+                'def helper():\n'
+                '    return "ok"\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('pkg/app.py', 'module::pkg.utils', 'imports'), edges)
+        self.assertIn(('pkg/app.py::main', 'pkg/utils.py::helper', 'calls'), edges)
+
+    def test_module_alias_attribute_call_resolves_to_local_symbol(self):
+        files = ['pkg/app.py', 'pkg/utils.py']
+        file_contents = {
+            'pkg/app.py': (
+                'import pkg.utils as utils\n\n'
+                'def run():\n'
+                '    return utils.helper()\n'
+            ),
+            'pkg/utils.py': (
+                'def helper():\n'
+                '    return "ok"\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('pkg/app.py', 'module::pkg.utils', 'imports'), edges)
+        self.assertIn(('pkg/app.py::run', 'pkg/utils.py::helper', 'calls'), edges)
+
+    def test_imported_base_class_inheritance_resolves_to_local_class(self):
+        files = ['pkg/base.py', 'pkg/child.py']
+        file_contents = {
+            'pkg/base.py': (
+                'class BaseTask:\n'
+                '    pass\n'
+            ),
+            'pkg/child.py': (
+                'from .base import BaseTask\n\n'
+                'class BuildTask(BaseTask):\n'
+                '    pass\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('pkg/child.py', 'module::pkg.base', 'imports'), edges)
+        self.assertIn(('pkg/child.py::BuildTask', 'pkg/base.py::BaseTask', 'inherits'), edges)
+
+    def test_unresolved_attribute_call_gets_external_node_warning_and_low_confidence(self):
+        files = ['worker.py']
+        file_contents = {
+            'worker.py': (
+                'def run(client):\n'
+                '    return client.execute()\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+        call_edges = [edge for edge in graph['edges'] if edge['type'] == 'calls']
+
+        self.assertEqual(nodes_by_id['attribute::execute']['type'], 'external')
+        self.assertEqual(call_edges[0]['target'], 'attribute::execute')
+        self.assertEqual(call_edges[0]['confidence'], 0.4)
+        self.assertEqual(graph['warnings'][0]['code'], 'unresolved_call')
+
+    def test_entrypoints_and_key_modules_are_reported(self):
+        files = ['manage.py', 'service/api.py', 'service/core.py']
+        file_contents = {
+            'manage.py': (
+                'from service.api import route\n\n'
+                'def main():\n'
+                '    route()\n\n'
+                'if __name__ == "__main__":\n'
+                '    main()\n'
+            ),
+            'service/api.py': (
+                'from service.core import build_payload\n\n'
+                '@app.get("/")\n'
+                'def route():\n'
+                '    return build_payload()\n'
+            ),
+            'service/core.py': (
+                'def build_payload():\n'
+                '    return {"ok": True}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        entrypoint_kinds = {entrypoint['kind'] for entrypoint in graph['entrypoints']}
+        key_module_ids = {module['id'] for module in graph['key_modules']}
+        entrypoint_edges = [edge for edge in graph['edges'] if edge['type'] == 'entrypoint']
+
+        self.assertIn('python_main_guard', entrypoint_kinds)
+        self.assertIn('main_function', entrypoint_kinds)
+        self.assertIn('django_manage', entrypoint_kinds)
+        self.assertIn('web_route', entrypoint_kinds)
+        self.assertIn('module::service.api', key_module_ids)
+        self.assertTrue(entrypoint_edges)
+
+
 @override_settings(
     TEMP_DIR=settings.BASE_DIR / 'temp' / 'foundation-fixture-tests',
 )
@@ -893,6 +1007,28 @@ class AnalysisArtifactServiceTests(TestCase):
         self.assertEqual(edge['type'], 'contains')
         self.assertEqual(edge['path'], 'pkg/app.py')
         self.assertEqual(edge['file'], 'pkg/app.py')
+
+    @patch('api.services.parse_repo')
+    @patch('api.services.get_repo_snapshot')
+    @patch('api.services.get_file_content_or_raise', return_value='def main():\n    pass\n')
+    def test_get_repo_analysis_preserves_entrypoints_and_key_modules(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
+        get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
+        parse_repo_mock.return_value = {
+            'tree': [],
+            'nodes': [{'id': 'module::pkg.app', 'type': 'module', 'label': 'pkg.app', 'file': 'pkg/app.py'}],
+            'edges': [],
+            'entrypoints': [{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}],
+            'key_modules': [{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 5}],
+            'warnings': [{'code': 'demo', 'path': 'pkg/app.py'}],
+        }
+
+        analysis = get_repo_analysis('owner/repo')
+
+        self.assertIsNotNone(analysis)
+        analysis_payload = cast(dict[str, object], analysis)
+        self.assertEqual(analysis_payload['entrypoints'], [{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}])
+        self.assertEqual(analysis_payload['key_modules'], [{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 5}])
+        self.assertEqual(analysis_payload['warnings'], [{'code': 'demo', 'path': 'pkg/app.py'}])
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
