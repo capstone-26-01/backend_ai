@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from html import escape
 from math import ceil
 from typing import Any, Mapping, cast
@@ -459,6 +459,67 @@ def _render_card(card: Mapping[str, Any], box: tuple[float, float, float, float]
     )
 
 
+def _render_relationship_pipeline(
+    columns: list[dict[str, Any]],
+    cards: list[dict[str, Any]],
+    visible_edges: list[dict[str, Any]],
+    theme: Mapping[str, str],
+    *,
+    x: float,
+    width: float,
+    y: float,
+) -> str:
+    columns_by_category = {str(column['category']): column for column in columns}
+    cards_by_id = {str(card['id']): card for card in cards}
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    kind_counts: Counter[str] = Counter()
+    for edge in visible_edges:
+        source_card = cards_by_id.get(str(edge['source']))
+        target_card = cards_by_id.get(str(edge['target']))
+        if source_card is None or target_card is None:
+            continue
+        count = int(edge['count'])
+        source_category = str(source_card['category'])
+        target_category = str(target_card['category'])
+        pair_counts[(source_category, target_category)] += count
+        kind_counts[str(edge['kind'])] += count
+
+    total_count = sum(kind_counts.values())
+
+    def center(category: str) -> tuple[float, float]:
+        column = columns_by_category[category]
+        return float(column['x']) + float(column['width']) / 2, y
+
+    def segment(source: str, target: str) -> str:
+        source_x, source_y = center(source)
+        target_x, target_y = center(target)
+        count = pair_counts[(source, target)] + pair_counts[(target, source)]
+        stroke = theme['relationship'] if count else theme['line']
+        opacity = '.82' if count else '.26'
+        return (
+            f'<path d="M {source_x + 78:.1f} {source_y:.1f} L {target_x - 78:.1f} {target_y:.1f}" '
+            f'stroke="{stroke}" stroke-width="4.5" stroke-linecap="round" opacity="{opacity}" marker-end="url(#arrow)"/>'
+        )
+
+    return f'''
+  <g>
+    <rect x="{x:.1f}" y="{y - 28:.1f}" width="{width:.1f}" height="58" rx="25" fill="{theme['panel']}" opacity=".55"/>
+    <text x="{x + width / 2:.1f}" y="{y - 11:.1f}" text-anchor="middle" class="pipeline-small">{total_count} cross-card relationships summarized</text>
+    {segment('entry', 'core')}
+    {segment('core', 'support')}
+    <circle cx="{center('entry')[0]:.1f}" cy="{y:.1f}" r="15" fill="#d05a2f"/>
+    <circle cx="{center('core')[0]:.1f}" cy="{y:.1f}" r="15" fill="#287c91"/>
+    <circle cx="{center('support')[0]:.1f}" cy="{y:.1f}" r="15" fill="#4e8b58"/>
+    <text x="{center('entry')[0]:.1f}" y="{y + 4:.1f}" text-anchor="middle" class="pipeline-number">1</text>
+    <text x="{center('core')[0]:.1f}" y="{y + 4:.1f}" text-anchor="middle" class="pipeline-number">2</text>
+    <text x="{center('support')[0]:.1f}" y="{y + 4:.1f}" text-anchor="middle" class="pipeline-number">3</text>
+    <text x="{center('entry')[0]:.1f}" y="{y + 29:.1f}" text-anchor="middle" class="pipeline-label">entrypoints</text>
+    <text x="{center('core')[0]:.1f}" y="{y + 29:.1f}" text-anchor="middle" class="pipeline-label">core modules</text>
+    <text x="{center('support')[0]:.1f}" y="{y + 29:.1f}" text-anchor="middle" class="pipeline-label">repo structure</text>
+  </g>
+'''
+
+
 def render_share_graph_svg(
     payload: Mapping[str, Any],
     *,
@@ -481,7 +542,7 @@ def render_share_graph_svg(
     key_modules = [cast(Mapping[str, Any], item) for item in graph.get('key_modules', []) if isinstance(item, Mapping)]
 
     graph_x = 344
-    graph_y = 126
+    graph_y = 154
     graph_width = width - graph_x - 36
     graph_height = height - graph_y - 50
     cards, _scores = _build_overview_cards(nodes_by_id, edges, entrypoints, key_modules, node_limit=node_limit)
@@ -520,8 +581,9 @@ def render_share_graph_svg(
     .card-title {{ font: 800 14px ui-sans-serif, system-ui, sans-serif; fill: #16221d; }}
     .card-subtitle {{ font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #5f6d64; }}
     .tiny {{ font: 700 9px ui-sans-serif, system-ui, sans-serif; fill: #69766e; }}
-    .edge {{ fill: none; stroke: {theme['line']}; stroke-linecap: round; opacity: .34; }}
-    .edge.strong {{ stroke: {theme['relationship']}; opacity: .64; marker-end: url(#arrow); }}
+    .pipeline-label {{ font: 800 10px ui-sans-serif, system-ui, sans-serif; fill: {theme['muted']}; letter-spacing: .04em; }}
+    .pipeline-small {{ font: 700 9px ui-sans-serif, system-ui, sans-serif; fill: {theme['muted']}; }}
+    .pipeline-number {{ font: 900 11px ui-sans-serif, system-ui, sans-serif; fill: #ffffff; }}
   </style>'''
 
     stat_y = 44
@@ -574,25 +636,15 @@ def render_share_graph_svg(
             f'<text x="{column["x"] + column["width"] - 22:.1f}" y="{column["y"] + 29:.1f}" text-anchor="end" class="small">{column["count"]} cards</text>'
         )
 
-    edge_svg = []
-    for edge in visible_edges:
-        source = str(edge['source'])
-        target = str(edge['target'])
-        sx, sy, sw, sh = card_positions[source]
-        tx, ty, _tw, th = card_positions[target]
-        start_x = sx + sw
-        start_y = sy + sh / 2
-        end_x = tx
-        end_y = ty + th / 2
-        if tx < sx:
-            start_x = sx
-            end_x = tx + _tw
-        curve = max(42, abs(end_x - start_x) * 0.42)
-        stroke_width = 1.5 + min(int(edge['count']), 10) * 0.16
-        class_name = 'edge strong' if int(edge['count']) >= 2 else 'edge'
-        edge_svg.append(
-            f'<path class="{class_name}" stroke-width="{stroke_width:.1f}" d="M {start_x:.1f} {start_y:.1f} C {start_x + curve:.1f} {start_y:.1f}, {end_x - curve:.1f} {end_y:.1f}, {end_x:.1f} {end_y:.1f}"/>'
-        )
+    relationship_pipeline = _render_relationship_pipeline(
+        columns,
+        visible_cards,
+        visible_edges,
+        theme,
+        x=graph_x,
+        width=graph_width,
+        y=118,
+    )
 
     card_svg = []
     for card in visible_cards:
@@ -608,8 +660,8 @@ def render_share_graph_svg(
 {styles}
 {header}
 {sidebar}
+{relationship_pipeline}
   <g>{''.join(column_svg)}</g>
-  <g>{''.join(edge_svg)}</g>
   <g>{''.join(card_svg)}</g>
 {legend}
 </svg>
