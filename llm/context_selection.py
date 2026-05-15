@@ -207,6 +207,35 @@ def _score_node(
     return score
 
 
+def _summary_text_scores(
+    analysis: Mapping[str, Any],
+    tokens: list[str],
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    if not tokens:
+        return {}
+    summary_scores: dict[str, int] = {}
+    summaries = analysis.get('summaries', {})
+    if not isinstance(summaries, Mapping):
+        return summary_scores
+
+    for summary in summaries.values():
+        if not isinstance(summary, Mapping):
+            continue
+        text = str(summary.get('text', '')).lower()
+        if not text or not any(token in text for token in tokens):
+            continue
+        source_nodes = [node_id for node_id in summary.get('source_nodes', []) if isinstance(node_id, str)]
+        source_files = {file_path for file_path in summary.get('source_files', []) if isinstance(file_path, str)}
+        for node_id in source_nodes:
+            if node_id in nodes_by_id:
+                summary_scores[node_id] = max(summary_scores.get(node_id, 0), 30)
+        for node_id, node in nodes_by_id.items():
+            if _node_file(node) in source_files:
+                summary_scores[node_id] = max(summary_scores.get(node_id, 0), 12)
+    return summary_scores
+
+
 def rank_nodes(
     analysis: Mapping[str, Any],
     question: str,
@@ -232,10 +261,11 @@ def rank_nodes(
     entrypoint_ids = _entrypoint_ids(analysis)
     key_module_ids, key_module_paths = _key_module_refs(analysis)
     is_entrypoint_question = bool(set(tokens) & ENTRYPOINT_QUESTION_TOKENS)
+    summary_scores = _summary_text_scores(analysis, tokens, nodes_by_id)
 
     scores: dict[str, int] = {}
     for node_id, node in nodes_by_id.items():
-        score = proximity.get(node_id, 0)
+        score = proximity.get(node_id, 0) + summary_scores.get(node_id, 0)
         if selected_file_path and _node_file(node) == selected_file_path:
             score += 80
         score += _score_node(

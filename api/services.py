@@ -13,6 +13,15 @@ from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, c
 from api.models import AnalysisArtifact, AnalysisRun, Repository
 from api.serializers import is_safe_revision, _is_safe_repo_segment
 from github_repo.services import RepoIngestionError, get_file_content_or_raise, get_repo_snapshot_or_raise as get_repo_snapshot
+from llm.summaries import (
+    SUMMARY_KIND_NODE,
+    SUMMARY_KIND_ONBOARDING,
+    SUMMARY_KIND_REPO_OVERVIEW,
+    SummaryInputError,
+    SummaryUnavailable,
+    generate_summary,
+    summary_cache_key,
+)
 from parser.services import parse_repo
 
 
@@ -244,6 +253,73 @@ def get_analysis_response_by_id(analysis_id: int) -> dict[str, Any] | None:
     except AnalysisArtifact.DoesNotExist:
         return None
     return build_analysis_response(artifact.payload, analysis_run)
+
+
+def _get_succeeded_artifact_record_by_id(analysis_id: int) -> tuple[AnalysisRun, AnalysisArtifact] | None:
+    analysis_run = (
+        AnalysisRun.objects
+        .select_related('repository')
+        .filter(id=analysis_id, status=AnalysisRun.STATUS_SUCCEEDED)
+        .first()
+    )
+    if analysis_run is None:
+        return None
+    try:
+        return analysis_run, analysis_run.artifact
+    except AnalysisArtifact.DoesNotExist:
+        return None
+
+
+def _summary_response(analysis_run: AnalysisRun, summary: dict[str, Any], *, cached: bool) -> dict[str, Any]:
+    return {
+        'analysis_id': analysis_run.id,
+        'repo': analysis_run.repository.full_name,
+        'revision': analysis_run.revision,
+        'summary': summary,
+        'cached': cached,
+    }
+
+
+def get_or_create_summary_response(analysis_id: int, kind: str = SUMMARY_KIND_REPO_OVERVIEW) -> dict[str, Any] | None:
+    if kind not in {SUMMARY_KIND_REPO_OVERVIEW, SUMMARY_KIND_ONBOARDING}:
+        raise SummaryInputError('unsupported summary kind')
+    record = _get_succeeded_artifact_record_by_id(analysis_id)
+    if record is None:
+        return None
+    analysis_run, artifact = record
+    payload = dict(artifact.payload)
+    summaries = dict(payload.get('summaries') or {})
+    cache_key = summary_cache_key(kind)
+    cached_summary = summaries.get(cache_key)
+    if isinstance(cached_summary, dict):
+        return _summary_response(analysis_run, cached_summary, cached=True)
+
+    summary = generate_summary(payload, kind)
+    summaries[cache_key] = summary
+    payload['summaries'] = summaries
+    artifact.payload = payload
+    artifact.save(update_fields=['payload'])
+    return _summary_response(analysis_run, summary, cached=False)
+
+
+def get_or_create_node_summary_response(analysis_id: int, node_id: str) -> dict[str, Any] | None:
+    record = _get_succeeded_artifact_record_by_id(analysis_id)
+    if record is None:
+        return None
+    analysis_run, artifact = record
+    payload = dict(artifact.payload)
+    summaries = dict(payload.get('summaries') or {})
+    cache_key = summary_cache_key(SUMMARY_KIND_NODE, node_id=node_id)
+    cached_summary = summaries.get(cache_key)
+    if isinstance(cached_summary, dict):
+        return _summary_response(analysis_run, cached_summary, cached=True)
+
+    summary = generate_summary(payload, SUMMARY_KIND_NODE, node_id=node_id)
+    summaries[cache_key] = summary
+    payload['summaries'] = summaries
+    artifact.payload = payload
+    artifact.save(update_fields=['payload'])
+    return _summary_response(analysis_run, summary, cached=False)
 
 
 def _persist_succeeded_artifact(repo_path: str, payload: dict[str, Any]) -> dict[str, Any]:

@@ -1539,6 +1539,133 @@ class AnalysisEndpointVerticalSliceTests(TestCase):
         self.assertEqual(payload['code'], 'too_large')
 
 
+class SummaryEndpointTests(TestCase):
+    def setUp(self):
+        repository = Repository.objects.create(
+            provider='github',
+            owner='owner',
+            name='repo',
+            full_name='owner/repo',
+            clone_url='https://github.com/owner/repo.git',
+        )
+        self.analysis_run = AnalysisRun.objects.create(
+            repository=repository,
+            revision='abc123',
+            status=AnalysisRun.STATUS_SUCCEEDED,
+        )
+        payload = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph={
+                'tree': [],
+                'nodes': [
+                    {'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'file': 'pkg/app.py'},
+                    {'id': 'module::pkg.app', 'type': 'module', 'label': 'pkg.app', 'file': 'pkg/app.py'},
+                    {'id': 'pkg/app.py::main', 'type': 'function', 'label': 'main', 'file': 'pkg/app.py', 'start_line': 1, 'end_line': 2},
+                ],
+                'edges': [
+                    {'id': 'e1', 'type': 'contains', 'source': 'module::pkg.app', 'target': 'pkg/app.py::main', 'file': 'pkg/app.py'},
+                ],
+            },
+            file_contents={'pkg/app.py': 'def main():\n    return "ok"\n'},
+            entrypoints=[{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}],
+            key_modules=[{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 10}],
+        )
+        AnalysisArtifact.objects.create(
+            analysis_run=self.analysis_run,
+            schema_version=GRAPH_ARTIFACT_SCHEMA_VERSION,
+            payload=payload,
+            node_count=len(payload['nodes']),
+            edge_count=len(payload['edges']),
+        )
+
+    @patch('llm.summaries._generate_answer')
+    def test_summary_endpoint_generates_and_caches_repo_summary(self, generate_answer):
+        generate_answer.return_value = '레포 요약입니다.'
+
+        first = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
+        second = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
+        first_payload = cast(dict[str, object], json.loads(first.content))
+        second_payload = cast(dict[str, object], json.loads(second.content))
+        summary = cast(dict[str, object], first_payload['summary'])
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(first_payload['cached'])
+        self.assertTrue(second_payload['cached'])
+        self.assertEqual(summary['text'], '레포 요약입니다.')
+        self.assertIn('pkg/app.py', summary['source_files'])
+        generate_answer.assert_called_once()
+
+    @patch('llm.summaries._generate_answer')
+    def test_summary_prompt_version_change_invalidates_cache(self, generate_answer):
+        generate_answer.side_effect = ['v1 summary', 'v2 summary']
+
+        first = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
+        with patch('llm.summaries.SUMMARY_PROMPT_VERSION', 'summary.v2'):
+            second = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
+        first_payload = cast(dict[str, object], json.loads(first.content))
+        second_payload = cast(dict[str, object], json.loads(second.content))
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(cast(dict[str, object], first_payload['summary'])['prompt_version'], 'summary.v1')
+        self.assertEqual(cast(dict[str, object], second_payload['summary'])['prompt_version'], 'summary.v2')
+        self.assertEqual(generate_answer.call_count, 2)
+        artifact = AnalysisArtifact.objects.get(analysis_run=self.analysis_run)
+        self.assertEqual(len(cast(dict[str, object], artifact.payload['summaries'])), 2)
+
+    @patch('llm.summaries._generate_answer', side_effect=RuntimeError('사용 가능한 AI API 키가 없습니다.'))
+    def test_summary_endpoint_returns_503_when_model_unavailable(self, generate_answer):
+        response = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload['code'], 'summary_unavailable')
+        self.assertEqual(AnalysisArtifact.objects.get(analysis_run=self.analysis_run).payload['summaries'], {})
+
+    @patch('llm.summaries._generate_answer')
+    def test_node_summary_endpoint_returns_source_citations(self, generate_answer):
+        generate_answer.return_value = 'main 함수 설명입니다.'
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/node-summary/',
+                {
+                    'analysis_id': self.analysis_run.id,
+                    'node_id': 'pkg/app.py::main',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        summary = cast(dict[str, object], payload['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(summary['kind'], 'node')
+        self.assertEqual(summary['target_id'], 'pkg/app.py::main')
+        self.assertIn('pkg/app.py::main', summary['source_nodes'])
+        self.assertIn('pkg/app.py', summary['source_files'])
+
+    @patch('llm.summaries._generate_answer')
+    def test_node_summary_missing_node_returns_400(self, generate_answer):
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/node-summary/',
+                {
+                    'analysis_id': self.analysis_run.id,
+                    'node_id': 'pkg/app.py::missing',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload['code'], 'summary_input_error')
+        generate_answer.assert_not_called()
+
+
 @override_settings(
     TEMP_DIR=settings.BASE_DIR / 'temp' / 'revision-api-tests',
     PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'revision-api-tests' / 'playground',
@@ -1637,6 +1764,8 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('/api/analysis/{analysis_id}/', schema_text)
         self.assertIn('/api/tree/', schema_text)
         self.assertIn('/api/graph/', schema_text)
+        self.assertIn('/api/summary/', schema_text)
+        self.assertIn('/api/node-summary/', schema_text)
         self.assertIn('/api/qa/', schema_text)
         self.assertIn('revision', schema_text)
         self.assertIn('analysis_id', schema_text)
