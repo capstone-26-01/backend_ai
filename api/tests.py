@@ -3,7 +3,6 @@ from pathlib import Path
 from unittest.mock import patch
 import importlib
 import json
-import subprocess
 import shutil
 
 from django.conf import settings
@@ -12,6 +11,15 @@ from django.test import TestCase, override_settings
 from github_repo.services import get_file_content, get_file_tree, get_repo_revision, _repo_lock, _repo_lock_path
 from api.serializers import extract_repo_path, is_safe_revision
 from api.services import get_repo_analysis
+from api.test_utils import (
+    EVAL_RUBRIC,
+    GOLDEN_FIXTURE_REPOS,
+    commit_all,
+    create_git_fixture_repo,
+    create_named_fixture_repo,
+    run_git,
+    write_files,
+)
 from parser.services import parse_repo
 import yaml
 
@@ -50,6 +58,12 @@ class WorkspaceSettingsTests(TestCase):
         self.assertEqual(settings.PLAYGROUND_DIR, settings.BASE_DIR / 'playground')
         self.assertTrue(settings.TEMP_DIR.is_dir())
         self.assertTrue(settings.PLAYGROUND_DIR.is_dir())
+
+    def test_test_runner_ignores_production_ssl_redirect_settings(self):
+        self.assertFalse(settings.SECURE_SSL_REDIRECT)
+        self.assertFalse(settings.SESSION_COOKIE_SECURE)
+        self.assertFalse(settings.CSRF_COOKIE_SECURE)
+        self.assertIn('testserver', settings.ALLOWED_HOSTS)
 
 
 class RepoUrlSerializerTests(TestCase):
@@ -116,32 +130,19 @@ class LocalRepoWorkspaceTests(TestCase):
     def setUp(self):
         self.source_repo = settings.TEMP_DIR / 'source-repo'
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
-        shutil.rmtree(self.source_repo, ignore_errors=True)
         shutil.rmtree(settings.PLAYGROUND_DIR, ignore_errors=True)
         settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        self.source_repo.mkdir(parents=True, exist_ok=True)
         settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
-        self._run_git('init', '-b', 'main', cwd=self.source_repo)
-        (self.source_repo / 'pkg').mkdir(parents=True, exist_ok=True)
-        (self.source_repo / 'pkg' / 'app.py').write_text('def greet():\n    return "hi"\n', encoding='utf-8')
-        (self.source_repo / 'README.md').write_text('# demo\n', encoding='utf-8')
-        self._commit_all('initial repo')
+        create_git_fixture_repo(
+            self.source_repo,
+            {
+                'pkg/app.py': 'def greet():\n    return "hi"\n',
+                'README.md': '# demo\n',
+            },
+        )
 
     def tearDown(self):
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
-
-    def _run_git(self, *args: str, cwd: Path) -> None:
-        subprocess.run(
-            ['git', *args],
-            cwd=cwd,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-    def _commit_all(self, message: str) -> None:
-        self._run_git('add', '.', cwd=self.source_repo)
-        self._run_git('-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', message, cwd=self.source_repo)
 
     @patch('github_repo.services._repo_clone_url')
     def test_get_file_tree_clones_repo_into_playground(self, repo_clone_url):
@@ -176,13 +177,7 @@ class LocalRepoWorkspaceTests(TestCase):
         get_file_tree('owner/repo')
 
         revision = get_repo_revision('owner/repo')
-        expected_revision = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=self.source_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        expected_revision = run_git(self.source_repo, 'rev-parse', 'HEAD')
 
         self.assertEqual(revision, expected_revision)
 
@@ -194,13 +189,7 @@ class LocalRepoWorkspaceTests(TestCase):
             (first_repo, 'first repo', 'def first():\n    return 1\n'),
             (second_repo, 'second repo', 'def second():\n    return 2\n'),
         ):
-            shutil.rmtree(repo_dir, ignore_errors=True)
-            repo_dir.mkdir(parents=True, exist_ok=True)
-            self._run_git('init', '-b', 'main', cwd=repo_dir)
-            (repo_dir / 'pkg').mkdir(parents=True, exist_ok=True)
-            (repo_dir / 'pkg' / 'app.py').write_text(content, encoding='utf-8')
-            self._run_git('add', '.', cwd=repo_dir)
-            self._run_git('-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', message, cwd=repo_dir)
+            create_git_fixture_repo(repo_dir, {'pkg/app.py': content}, commit_message=message)
 
         repo_clone_url.side_effect = lambda repo_path: {
             'owner/repo__x': str(first_repo),
@@ -338,6 +327,56 @@ class ParserGraphTests(TestCase):
         edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
 
         self.assertNotIn(('app.py::outer', 'app.py::helper', 'calls'), edges)
+
+
+@override_settings(
+    TEMP_DIR=settings.BASE_DIR / 'temp' / 'foundation-fixture-tests',
+)
+class FoundationEvalFixtureTests(TestCase):
+    def setUp(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+
+    def test_git_fixture_repo_helper_is_compatible_with_server_git_version(self):
+        fixture_repo = create_named_fixture_repo('plain_python_package', settings.TEMP_DIR / 'plain-package')
+
+        self.assertEqual(run_git(fixture_repo.path, 'branch', '--show-current'), 'main')
+        self.assertEqual(run_git(fixture_repo.path, 'rev-parse', 'HEAD'), fixture_repo.revision)
+        self.assertTrue((fixture_repo.path / 'sample_pkg' / 'main.py').is_file())
+
+    def test_golden_fixture_catalog_covers_planned_foundation_cases(self):
+        self.assertGreaterEqual(len(GOLDEN_FIXTURE_REPOS), 3)
+        self.assertIn('plain_python_package', GOLDEN_FIXTURE_REPOS)
+        self.assertIn('oop_inheritance_sample', GOLDEN_FIXTURE_REPOS)
+        self.assertIn('cross_file_import_call_sample', GOLDEN_FIXTURE_REPOS)
+        self.assertIn('django_like_mini_app', GOLDEN_FIXTURE_REPOS)
+        self.assertIn('fastapi_like_mini_app', GOLDEN_FIXTURE_REPOS)
+        self.assertIn('ambiguous_symbol_sample', GOLDEN_FIXTURE_REPOS)
+        self.assertIn('korean_readme_sample', GOLDEN_FIXTURE_REPOS)
+
+    def test_golden_fixture_expected_graph_fragments_parse(self):
+        for fixture in GOLDEN_FIXTURE_REPOS.values():
+            with self.subTest(fixture=fixture.name):
+                graph = parse_repo('owner/repo', list(fixture.files), lambda _repo, path: fixture.files[path])
+                node_ids = {node['id'] for node in graph['nodes']}
+                edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+                for expected_node in fixture.expected_nodes:
+                    self.assertIn(expected_node, node_ids)
+                for expected_edge in fixture.expected_edges:
+                    self.assertIn(expected_edge, edges)
+
+    def test_eval_rubric_has_graph_entrypoint_and_qa_dimensions(self):
+        self.assertEqual(
+            set(EVAL_RUBRIC),
+            {'graph_node_recall', 'edge_correctness', 'entrypoint_correctness', 'qa_citation_correctness'},
+        )
+        for fixture in GOLDEN_FIXTURE_REPOS.values():
+            self.assertTrue(set(fixture.rubric_tags).issubset(EVAL_RUBRIC))
+            self.assertTrue(fixture.rubric_tags)
 
 
 @override_settings(
@@ -517,12 +556,7 @@ class RevisionPinnedApiTests(TestCase):
         settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
         settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
         self.source_repo = settings.TEMP_DIR / 'source-repo'
-        self.source_repo.mkdir(parents=True, exist_ok=True)
-        subprocess.run(['git', 'init', '-b', 'main'], cwd=self.source_repo, check=True, capture_output=True, text=True)
-        (self.source_repo / 'pkg').mkdir(parents=True, exist_ok=True)
-        (self.source_repo / 'pkg' / 'app.py').write_text('def greet():\n    return "v1"\n', encoding='utf-8')
-        subprocess.run(['git', 'add', '.'], cwd=self.source_repo, check=True, capture_output=True, text=True)
-        subprocess.run(['git', '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'v1'], cwd=self.source_repo, check=True, capture_output=True, text=True)
+        create_git_fixture_repo(self.source_repo, {'pkg/app.py': 'def greet():\n    return "v1"\n'}, commit_message='v1')
 
     def tearDown(self):
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
@@ -535,9 +569,8 @@ class RevisionPinnedApiTests(TestCase):
         self.assertIsNotNone(analysis)
         revision = cast(dict[str, object], analysis)['revision']
 
-        (self.source_repo / 'pkg' / 'app.py').write_text('def greet():\n    return "v2"\n', encoding='utf-8')
-        subprocess.run(['git', 'add', '.'], cwd=self.source_repo, check=True, capture_output=True, text=True)
-        subprocess.run(['git', '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'v2'], cwd=self.source_repo, check=True, capture_output=True, text=True)
+        write_files(self.source_repo, {'pkg/app.py': 'def greet():\n    return "v2"\n'})
+        commit_all(self.source_repo, 'v2')
 
         answer_question_mock.return_value = {'answer': 'v1', 'citations': ['pkg/app.py']}
         response = cast(

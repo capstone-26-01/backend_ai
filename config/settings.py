@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 
 from pathlib import Path
 import os
+import sys
 
 from dotenv import load_dotenv
 
@@ -45,17 +46,25 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return [item.strip() for item in value.split(',') if item.strip()]
 
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ['SECRET_KEY']
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = _env_bool('DEBUG', False)
+IS_TESTING = 'test' in sys.argv
 
-ALLOWED_HOSTS = _env_list('ALLOWED_HOSTS', ['localhost', '127.0.0.1'])
-CSRF_TRUSTED_ORIGINS = _env_list('CSRF_TRUSTED_ORIGINS', [])
-SECURE_SSL_REDIRECT = _env_bool('SECURE_SSL_REDIRECT', False)
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    if IS_TESTING:
+        SECRET_KEY = 'django-test-secret-key'
+    else:
+        raise RuntimeError('SECRET_KEY environment variable is required')
+# SECURITY WARNING: don't run with debug turned on in production!
+DEBUG = True if IS_TESTING else _env_bool('DEBUG', False)
+
+ALLOWED_HOSTS = ['testserver', 'localhost', '127.0.0.1'] if IS_TESTING else _env_list('ALLOWED_HOSTS', ['localhost', '127.0.0.1'])
+CSRF_TRUSTED_ORIGINS = [] if IS_TESTING else _env_list('CSRF_TRUSTED_ORIGINS', [])
+SECURE_SSL_REDIRECT = False if IS_TESTING else _env_bool('SECURE_SSL_REDIRECT', False)
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-SESSION_COOKIE_SECURE = not DEBUG
-CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_SECURE = False if IS_TESTING else not DEBUG
+CSRF_COOKIE_SECURE = False if IS_TESTING else not DEBUG
 
 
 # Application definition
