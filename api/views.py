@@ -1,8 +1,13 @@
+import html
 import importlib
+import json
 import logging
 from typing import Any, cast
+from django.http import HttpResponse
+from django.views.decorators.clickjacking import xframe_options_exempt
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
 from rest_framework import serializers
 
@@ -15,7 +20,9 @@ from .serializers import (
     NodeSummaryRequestSerializer,
     RepoUrlSerializer,
     QASerializer,
+    ShareCreateSerializer,
     SummaryRequestSerializer,
+    is_safe_share_id,
     is_safe_revision,
 )
 
@@ -63,6 +70,14 @@ def get_diff_response_by_analysis_id(head_analysis_id: int, base_analysis_id: in
     return api_services.get_diff_response_by_analysis_id(head_analysis_id, base_analysis_id)
 
 
+def create_share_response(repo_path: str, **kwargs):
+    return api_services.create_share_response(repo_path, **kwargs)
+
+
+def get_share_response(share_id: str):
+    return api_services.get_share_response(share_id)
+
+
 def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
     status_by_code = {
         'invalid_repo_path': 400,
@@ -97,6 +112,30 @@ def _diff_error_response(error: Exception) -> Response:
     if isinstance(error, api_services.GraphDiffInputError):
         return Response({'error': str(error), 'code': 'diff_input_error'}, status=400)
     raise error
+
+
+def _share_error_response(error: Exception) -> Response:
+    if isinstance(error, api_services.ShareInputError):
+        return Response({'error': str(error), 'code': 'share_input_error'}, status=400)
+    raise error
+
+
+def _share_payload_with_links(request, payload: dict[str, Any]) -> dict[str, Any]:
+    response_payload = dict(payload)
+    share_id = str(response_payload['share_id'])
+    repo_name = html.escape(str(response_payload['repo']))
+    share_url = request.build_absolute_uri(f'/api/share/{share_id}/')
+    embed_url = request.build_absolute_uri(f'/api/embed/{share_id}/')
+    response_payload['urls'] = {
+        'share': share_url,
+        'embed': embed_url,
+    }
+    response_payload['snippets'] = {
+        'markdown_link': f'[{response_payload["repo"]} graph]({share_url})',
+        'html_iframe': f'<iframe src="{embed_url}" width="100%" height="640" loading="lazy" title="{repo_name} graph"></iframe>',
+        'github_readme_note': 'GitHub README는 iframe을 렌더링하지 않으므로 markdown_link를 사용하세요.',
+    }
+    return response_payload
 
 
 _ANALYSIS_REQUEST_SCHEMA = inline_serializer(
@@ -137,6 +176,36 @@ _DIFF_RESPONSE_SCHEMA = inline_serializer(
         'head': serializers.JSONField(),
         'diff': serializers.JSONField(),
         'warnings': serializers.JSONField(),
+    },
+)
+_SHARE_CREATE_SCHEMA = inline_serializer(
+    name='ShareCreateRequest',
+    fields={
+        'repo_url': serializers.CharField(),
+        'mode': serializers.ChoiceField(choices=('fixed', 'latest'), required=False),
+        'revision': serializers.CharField(required=False),
+        'title': serializers.CharField(required=False, allow_blank=True),
+        'expires_at': serializers.DateTimeField(required=False, allow_null=True),
+    },
+)
+_SHARE_RESPONSE_SCHEMA = inline_serializer(
+    name='ShareResponse',
+    fields={
+        'share_id': serializers.CharField(),
+        'mode': serializers.CharField(),
+        'title': serializers.CharField(allow_blank=True),
+        'repo': serializers.CharField(),
+        'repository': serializers.JSONField(),
+        'ref': serializers.CharField(),
+        'revision': serializers.CharField(),
+        'analysis_id': serializers.IntegerField(),
+        'graph': serializers.JSONField(),
+        'is_active': serializers.BooleanField(),
+        'created_at': serializers.CharField(),
+        'expires_at': serializers.CharField(allow_null=True),
+        'warnings': serializers.JSONField(),
+        'urls': serializers.JSONField(),
+        'snippets': serializers.JSONField(),
     },
 )
 
@@ -251,6 +320,105 @@ def graph_diff(request):
     if response is None:
         return Response({'error': '비교할 분석 결과를 찾을 수 없습니다'}, status=404)
     return Response(response)
+
+
+@extend_schema(
+    methods=['POST'],
+    operation_id='share_create',
+    request=_SHARE_CREATE_SCHEMA,
+    responses={201: _SHARE_RESPONSE_SCHEMA},
+)
+@api_view(['POST'])
+def share(request):
+    serializer = ShareCreateSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, Any], serializer.validated_data)
+    try:
+        response = create_share_response(
+            str(validated_data['repo_url']),
+            mode=str(validated_data.get('mode', 'fixed')),
+            revision=validated_data.get('revision'),
+            title=str(validated_data.get('title') or ''),
+            expires_at=validated_data.get('expires_at'),
+        )
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    except Exception as error:
+        return _share_error_response(error)
+    if response is None:
+        return Response({'error': '공유할 분석 결과를 만들 수 없습니다'}, status=404)
+    return Response(_share_payload_with_links(request, response), status=201)
+
+
+@extend_schema(
+    operation_id='share_retrieve',
+    responses=_SHARE_RESPONSE_SCHEMA,
+)
+@api_view(['GET'])
+def share_detail(request, share_id: str):
+    if not is_safe_share_id(share_id):
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+    try:
+        response = get_share_response(share_id)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    except Exception as error:
+        return _share_error_response(error)
+    if response is None:
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+    return Response(_share_payload_with_links(request, response))
+
+
+@extend_schema(
+    operation_id='share_embed',
+    responses={200: OpenApiTypes.STR},
+)
+@xframe_options_exempt
+@api_view(['GET'])
+def embed(request, share_id: str):
+    if not is_safe_share_id(share_id):
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+    try:
+        response = get_share_response(share_id)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    except Exception as error:
+        return _share_error_response(error)
+    if response is None:
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+
+    payload = _share_payload_with_links(request, response)
+    graph_json = json.dumps(payload['graph'], ensure_ascii=False)
+    escaped_title = html.escape(str(payload.get('title') or payload['repo']))
+    escaped_repo = html.escape(str(payload['repo']))
+    body = f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escaped_title}</title>
+  <style>
+    body {{ margin: 0; font-family: sans-serif; color: #172026; background: #f7f4ed; }}
+    main {{ padding: 16px; }}
+    h1 {{ margin: 0 0 8px; font-size: 18px; }}
+    p {{ margin: 0 0 12px; }}
+    pre {{ overflow: auto; padding: 12px; background: #ffffff; border: 1px solid #ddd6c8; border-radius: 8px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escaped_repo}</h1>
+    <p>Revision: {html.escape(str(payload['revision']))}</p>
+    <pre id="graph-data">{html.escape(graph_json)}</pre>
+  </main>
+</body>
+</html>
+"""
+    response_obj = HttpResponse(body, content_type='text/html; charset=utf-8')
+    response_obj['Cache-Control'] = 'no-store'
+    return response_obj
 
 
 @extend_schema(

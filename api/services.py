@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import tempfile
 from typing import Any
 
@@ -11,7 +12,7 @@ from django.utils import timezone
 
 from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
 from api.diff import GraphDiffInputError, compare_graph_artifacts
-from api.models import AnalysisArtifact, AnalysisRun, Repository
+from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import is_safe_revision, _is_safe_repo_segment
 from github_repo.services import (
     RepoIngestionError,
@@ -29,6 +30,10 @@ from llm.summaries import (
     summary_cache_key,
 )
 from parser.services import parse_repo
+
+
+class ShareInputError(ValueError):
+    pass
 
 
 def _analysis_parts(repo_path: str) -> tuple[str, str]:
@@ -534,3 +539,115 @@ def get_diff_response_by_analysis_id(head_analysis_id: int, base_analysis_id: in
     if base_run.repository_id != head_run.repository_id:
         raise GraphDiffInputError('diff analyses must belong to the same repo')
     return _build_diff_response(base_run, head_run)
+
+
+def _generate_share_token() -> str:
+    for _attempt in range(10):
+        token = secrets.token_urlsafe(24)
+        if not ShareLink.objects.filter(token=token).exists():
+            return token
+    raise ShareInputError('share token을 생성할 수 없습니다')
+
+
+def _share_is_expired(share_link: ShareLink) -> bool:
+    return share_link.expires_at is not None and share_link.expires_at <= timezone.now()
+
+
+def _repository_payload(repository: Repository) -> dict[str, Any]:
+    return {
+        'provider': repository.provider,
+        'owner': repository.owner,
+        'name': repository.name,
+        'full_name': repository.full_name,
+        'default_branch': repository.default_branch,
+    }
+
+
+def _build_share_response(share_link: ShareLink, analysis_run: AnalysisRun) -> dict[str, Any]:
+    try:
+        artifact = analysis_run.artifact
+    except AnalysisArtifact.DoesNotExist:
+        raise ShareInputError('share에 연결된 분석 artifact가 없습니다')
+
+    graph = build_graph_response(artifact.payload, analysis_run)
+    return {
+        'share_id': share_link.token,
+        'mode': share_link.mode,
+        'title': share_link.title,
+        'repo': analysis_run.repository.full_name,
+        'repository': _repository_payload(analysis_run.repository),
+        'ref': share_link.ref,
+        'revision': analysis_run.revision,
+        'analysis_id': analysis_run.id,
+        'graph': graph,
+        'is_active': share_link.is_active,
+        'created_at': share_link.created_at.isoformat(),
+        'expires_at': share_link.expires_at.isoformat() if share_link.expires_at else None,
+        'warnings': graph.get('warnings', []),
+    }
+
+
+def create_share_response(
+    repo_path: str,
+    *,
+    mode: str = ShareLink.MODE_FIXED,
+    revision: str | None = None,
+    title: str = '',
+    expires_at=None,
+) -> dict[str, Any] | None:
+    if mode not in {ShareLink.MODE_FIXED, ShareLink.MODE_LATEST}:
+        raise ShareInputError('unsupported share mode')
+    if mode == ShareLink.MODE_LATEST and revision is not None:
+        raise ShareInputError('latest share에는 revision을 지정할 수 없습니다')
+
+    analysis = get_repo_analysis(repo_path, revision if mode == ShareLink.MODE_FIXED else None)
+    if analysis is None:
+        return None
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    if analysis_run is None:
+        return None
+
+    share_link = ShareLink.objects.create(
+        token=_generate_share_token(),
+        repository=analysis_run.repository,
+        analysis_run=analysis_run,
+        mode=mode,
+        ref='HEAD' if mode == ShareLink.MODE_LATEST else str(revision or analysis_run.revision),
+        title=title,
+        expires_at=expires_at,
+    )
+    return _build_share_response(share_link, analysis_run)
+
+
+def _resolve_share_analysis_run(share_link: ShareLink) -> AnalysisRun | None:
+    if not share_link.is_active or _share_is_expired(share_link):
+        return None
+
+    if share_link.mode == ShareLink.MODE_FIXED:
+        return share_link.analysis_run
+
+    analysis = get_repo_analysis(share_link.repository.full_name)
+    if analysis is None:
+        return share_link.analysis_run
+    analysis_run = get_analysis_run_by_revision(share_link.repository.full_name, str(analysis['revision']))
+    if analysis_run is None:
+        return share_link.analysis_run
+    if share_link.analysis_run_id != analysis_run.id:
+        share_link.analysis_run = analysis_run
+        share_link.save(update_fields=['analysis_run', 'updated_at'])
+    return analysis_run
+
+
+def get_share_response(share_id: str) -> dict[str, Any] | None:
+    share_link = (
+        ShareLink.objects
+        .select_related('repository', 'analysis_run', 'analysis_run__repository')
+        .filter(token=share_id)
+        .first()
+    )
+    if share_link is None:
+        return None
+    analysis_run = _resolve_share_analysis_run(share_link)
+    if analysis_run is None:
+        return None
+    return _build_share_response(share_link, analysis_run)
