@@ -1,6 +1,6 @@
 import importlib
 import logging
-from typing import cast
+from typing import Any, cast
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
@@ -279,6 +279,10 @@ def get_repo_graph(request):
             'repo_url': serializers.CharField(),
             'question': serializers.CharField(),
             'revision': serializers.CharField(required=False),
+            'analysis_id': serializers.IntegerField(required=False, min_value=1),
+            'selected_node_id': serializers.CharField(required=False),
+            'selected_file_path': serializers.CharField(required=False),
+            'max_context_files': serializers.IntegerField(required=False, min_value=1, max_value=10),
         }
     ),
     responses=inline_serializer(
@@ -286,6 +290,10 @@ def get_repo_graph(request):
         fields={
             'answer': serializers.CharField(),
             'citations': serializers.ListField(child=serializers.CharField()),
+            'selected_nodes': serializers.ListField(child=serializers.CharField()),
+            'context_files': serializers.ListField(child=serializers.CharField()),
+            'context_summary': serializers.JSONField(),
+            'warnings': serializers.JSONField(),
         },
     ),
 )
@@ -296,22 +304,49 @@ def qa(request):
         logger.warning(f"잘못된 QA 요청: {request.data}")
         return Response(serializer.errors, status=400)
 
-    validated_data = cast(dict[str, str], serializer.validated_data)
-    repo_path = validated_data['repo_url']
+    validated_data = cast(dict[str, Any], serializer.validated_data)
     question = validated_data['question']
+    analysis_id = validated_data.get('analysis_id')
     revision = validated_data.get('revision')
+    selected_node_id = validated_data.get('selected_node_id')
+    selected_file_path = validated_data.get('selected_file_path')
+    max_context_files = int(validated_data.get('max_context_files', 4))
+    repo_path = str(validated_data.get('repo_url') or '')
+
+    if analysis_id is not None:
+        analysis_response = get_analysis_response_by_id(int(analysis_id))
+        if analysis_response is None:
+            return Response({'error': '분석 결과를 찾을 수 없습니다'}, status=404)
+        artifact = analysis_response.get('artifact')
+        if artifact is None:
+            return Response(
+                {
+                    'error': 'QA에 사용할 분석 artifact가 없습니다',
+                    'detail': analysis_response.get('error'),
+                },
+                status=409,
+            )
+        analysis = cast(dict[str, Any], artifact)
+        repo_path = str(analysis_response['repo'])
+    else:
+        try:
+            analysis = get_repo_analysis(repo_path, revision)
+        except RepoIngestionError as error:
+            return _repo_ingestion_error_response(error)
+
+        if analysis is None:
+            logger.error(f"레포 찾기 실패: {repo_path}")
+            return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
+
     logger.info(f"QA 요청: {repo_path} / 질문: {question}")
-
-    try:
-        analysis = get_repo_analysis(repo_path, revision)
-    except RepoIngestionError as error:
-        return _repo_ingestion_error_response(error)
-
-    if analysis is None:
-        logger.error(f"레포 찾기 실패: {repo_path}")
-        return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
-
-    answer = answer_question(repo_path, analysis, question)
+    answer = answer_question(
+        repo_path,
+        cast(dict[str, Any], analysis),
+        question,
+        selected_node_id=selected_node_id,
+        selected_file_path=selected_file_path,
+        max_context_files=max_context_files,
+    )
     logger.info(f"QA 완료: {repo_path}")
 
     return Response(answer)

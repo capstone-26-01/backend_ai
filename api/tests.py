@@ -28,7 +28,7 @@ from api.artifacts import (
     validate_graph_artifact,
 )
 from api.models import AnalysisArtifact, AnalysisRun, Repository
-from api.serializers import extract_repo_path, is_safe_ref, is_safe_revision
+from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision
 from api.services import get_artifact_by_revision, get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
@@ -131,6 +131,19 @@ class RepoUrlSerializerTests(TestCase):
         self.assertFalse(is_safe_ref('feature branch'))
         self.assertFalse(is_safe_ref('refs/heads/main.lock'))
         self.assertFalse(is_safe_ref('main@{1}'))
+
+    def test_graph_id_validator_allows_symbol_ids_but_rejects_path_escape(self):
+        self.assertTrue(is_safe_graph_id('pkg/app.py::Worker::run'))
+        self.assertTrue(is_safe_graph_id('module::pkg.app'))
+        self.assertFalse(is_safe_graph_id('../pkg/app.py::run'))
+        self.assertFalse(is_safe_graph_id('pkg/app.py::bad id'))
+
+    def test_repo_file_path_validator_rejects_unsafe_paths(self):
+        self.assertTrue(is_safe_repo_file_path('pkg/app.py'))
+        self.assertTrue(is_safe_repo_file_path('한글/모듈.py'))
+        self.assertFalse(is_safe_repo_file_path('../pkg/app.py'))
+        self.assertFalse(is_safe_repo_file_path('/pkg/app.py'))
+        self.assertFalse(is_safe_repo_file_path('pkg\\app.py'))
 
 
 class ServicePathValidationTests(TestCase):
@@ -1240,6 +1253,89 @@ class AnalysisEndpointReuseTests(TestCase):
         self.assertEqual(payload['answer'], 'builder.py에서 처리합니다.')
         self.assertEqual(payload['citations'], ['sample_pkg/factory.py'])
 
+    @patch('api.views.answer_question')
+    @patch('api.views.get_analysis_response_by_id')
+    def test_qa_endpoint_accepts_analysis_id_and_context_options(self, get_analysis_response_by_id_mock, answer_question_mock):
+        get_analysis_response_by_id_mock.return_value = {
+            'analysis_id': 7,
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'status': AnalysisRun.STATUS_SUCCEEDED,
+            'artifact': {
+                'repo': 'owner/repo',
+                'revision': 'abc123',
+                'tree': [],
+                'nodes': [{'id': 'pkg/app.py::main', 'path': 'pkg/app.py', 'label': 'main'}],
+                'edges': [],
+                'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            },
+            'warnings': [],
+        }
+        answer_question_mock.return_value = {
+            'answer': 'main입니다.',
+            'citations': ['pkg/app.py'],
+            'selected_nodes': ['pkg/app.py::main'],
+            'context_files': ['pkg/app.py'],
+            'context_summary': {'strategy': 'selected_node'},
+            'warnings': [],
+        }
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={
+                    'analysis_id': 7,
+                    'question': 'main은 어디인가요?',
+                    'selected_node_id': 'pkg/app.py::main',
+                    'selected_file_path': 'pkg/app.py',
+                    'max_context_files': 2,
+                },
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['selected_nodes'], ['pkg/app.py::main'])
+        answer_question_mock.assert_called_once()
+        self.assertEqual(answer_question_mock.call_args.args[0], 'owner/repo')
+        self.assertEqual(answer_question_mock.call_args.kwargs['selected_node_id'], 'pkg/app.py::main')
+        self.assertEqual(answer_question_mock.call_args.kwargs['selected_file_path'], 'pkg/app.py')
+        self.assertEqual(answer_question_mock.call_args.kwargs['max_context_files'], 2)
+
+    def test_qa_endpoint_requires_repo_url_or_analysis_id(self):
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={'question': '무엇을 하나요?'},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('repo_url', payload)
+
+    def test_qa_endpoint_rejects_unsafe_selected_file_path(self):
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={
+                    'repo_url': 'https://github.com/owner/repo',
+                    'question': '무엇을 하나요?',
+                    'selected_file_path': '../settings.py',
+                },
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('selected_file_path', payload)
+
 
 @override_settings(
     TEMP_DIR=settings.BASE_DIR / 'temp' / 'analysis-endpoint-tests',
@@ -1543,3 +1639,6 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('/api/graph/', schema_text)
         self.assertIn('/api/qa/', schema_text)
         self.assertIn('revision', schema_text)
+        self.assertIn('analysis_id', schema_text)
+        self.assertIn('selected_node_id', schema_text)
+        self.assertIn('context_summary', schema_text)

@@ -9,7 +9,7 @@ from typing import cast
 
 from api.services import get_repo_analysis
 from api.test_utils import create_git_fixture_repo
-from llm.services import answer_question, _build_context, _rank_files
+from llm.services import answer_question, _build_context, _question_tokens, _rank_files
 
 
 class SelectiveQuestionAnsweringTests(TestCase):
@@ -56,6 +56,84 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         self.assertTrue(context)
         self.assertEqual(included_files, ['a.py'])
+
+    def test_question_tokens_preserve_korean_terms(self):
+        tokens = _question_tokens('이 저장소의 시작 지점은 어디인가요?')
+
+        self.assertIn('저장소의', tokens)
+        self.assertIn('시작', tokens)
+        self.assertIn('지점은', tokens)
+
+    @patch('llm.services._generate_answer')
+    def test_selected_node_context_prioritizes_neighbors(self, generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {
+                'service/api.py': (
+                    'from service.core import build_payload\n\n'
+                    '@app.get("/")\n'
+                    'def route():\n'
+                    '    return build_payload()\n'
+                ),
+                'service/core.py': (
+                    'def build_payload():\n'
+                    '    return {"ok": True}\n'
+                ),
+                'service/unused.py': 'def unused():\n    return None\n',
+            },
+            'nodes': [
+                {'id': 'service/api.py::route', 'kind': 'function', 'label': 'route', 'path': 'service/api.py', 'start_line': 4, 'end_line': 5},
+                {'id': 'service/core.py::build_payload', 'kind': 'function', 'label': 'build_payload', 'path': 'service/core.py', 'start_line': 1, 'end_line': 2},
+                {'id': 'service/unused.py::unused', 'kind': 'function', 'label': 'unused', 'path': 'service/unused.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [
+                {'id': 'e1', 'kind': 'calls', 'source': 'service/api.py::route', 'target': 'service/core.py::build_payload', 'path': 'service/api.py'},
+            ],
+            'entrypoints': [{'id': 'service/api.py::route', 'kind': 'web_route', 'path': 'service/api.py'}],
+            'key_modules': [],
+        }
+        generate_answer.return_value = 'route가 build_payload를 호출합니다.'
+
+        response = answer_question(
+            'owner/repo',
+            analysis,
+            '이 route는 무엇을 호출하나요?',
+            selected_node_id='service/api.py::route',
+            max_context_files=2,
+        )
+
+        self.assertEqual(response['citations'], ['service/api.py', 'service/core.py'])
+        self.assertIn('service/api.py::route', response['selected_nodes'])
+        self.assertIn('service/core.py::build_payload', response['selected_nodes'])
+        self.assertEqual(response['context_files'], ['service/api.py', 'service/core.py'])
+        messages = generate_answer.call_args.args[0]
+        self.assertIn('service/api.py::route', messages[1]['content'])
+        self.assertIn('service/core.py::build_payload', messages[1]['content'])
+        self.assertNotIn('service/unused.py', messages[1]['content'])
+
+    @patch('llm.services._generate_answer')
+    def test_invalid_selected_node_returns_warning_and_ranked_context(self, generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {
+                'pkg/factory.py': 'def load_component():\n    return "ok"\n',
+            },
+            'nodes': [
+                {'id': 'pkg/factory.py::load_component', 'kind': 'function', 'label': 'load_component', 'path': 'pkg/factory.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [],
+        }
+        generate_answer.return_value = 'factory입니다.'
+
+        response = answer_question(
+            'owner/repo',
+            analysis,
+            'Where is load_component defined?',
+            selected_node_id='missing.py::missing',
+        )
+
+        self.assertEqual(response['citations'], ['pkg/factory.py'])
+        self.assertEqual(response['warnings'][0]['code'], 'invalid_selected_node')
 
 
 @override_settings(
