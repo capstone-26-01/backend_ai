@@ -7,6 +7,7 @@ from typing import Any
 
 from django.conf import settings
 
+from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
 from api.serializers import is_safe_revision, _is_safe_repo_segment
 from github_repo.services import get_file_content, get_repo_snapshot
 from parser.services import parse_repo
@@ -35,6 +36,21 @@ def _analysis_path(repo_path: str, revision: str):
     return analysis_dir / 'graph.json'
 
 
+def _write_analysis_artifact(artifact_path, analysis: dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=artifact_path.parent, prefix='graph.', suffix='.tmp', delete=False) as temporary_file:
+        temporary_file.write(json.dumps(analysis, ensure_ascii=False, indent=2))
+        temporary_path = temporary_file.name
+    os.replace(temporary_path, artifact_path)
+
+
+def _read_analysis_artifact(artifact_path) -> dict[str, Any]:
+    payload = json.loads(artifact_path.read_text(encoding='utf-8'))
+    analysis = coerce_graph_artifact(payload)
+    if payload.get('schema_version') != GRAPH_ARTIFACT_SCHEMA_VERSION:
+        _write_analysis_artifact(artifact_path, analysis)
+    return analysis
+
+
 def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
     try:
         _analysis_parts(repo_path)
@@ -46,7 +62,7 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
             return None
         artifact_path = _analysis_path(repo_path, revision)
         if artifact_path.exists():
-            return json.loads(artifact_path.read_text(encoding='utf-8'))
+            return _read_analysis_artifact(artifact_path)
         return None
 
     snapshot = get_repo_snapshot(repo_path)
@@ -58,7 +74,7 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
 
     artifact_path = _analysis_path(repo_path, revision)
     if artifact_path.exists():
-        return json.loads(artifact_path.read_text(encoding='utf-8'))
+        return _read_analysis_artifact(artifact_path)
 
     python_files = [file_path for file_path in files if file_path.endswith('.py')]
     file_contents = {
@@ -68,16 +84,11 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
     }
 
     graph = parse_repo(repo_path, python_files, lambda _repo_path, file_path: file_contents.get(file_path))
-    analysis = {
-        'repo': repo_path,
-        'revision': revision,
-        'file_contents': file_contents,
-        'tree': graph['tree'],
-        'nodes': graph['nodes'],
-        'edges': graph['edges'],
-    }
-    with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=artifact_path.parent, prefix='graph.', suffix='.tmp', delete=False) as temporary_file:
-        temporary_file.write(json.dumps(analysis, ensure_ascii=False, indent=2))
-        temporary_path = temporary_file.name
-    os.replace(temporary_path, artifact_path)
+    analysis = build_graph_artifact(
+        repo_path=repo_path,
+        revision=revision,
+        graph=graph,
+        file_contents=file_contents,
+    )
+    _write_analysis_artifact(artifact_path, analysis)
     return analysis

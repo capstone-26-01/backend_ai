@@ -9,6 +9,13 @@ from django.conf import settings
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
 from github_repo.services import get_file_content, get_file_tree, get_repo_revision, _repo_lock, _repo_lock_path
+from api.artifacts import (
+    GRAPH_ARTIFACT_SCHEMA_VERSION,
+    ArtifactValidationError,
+    build_graph_artifact,
+    coerce_graph_artifact,
+    validate_graph_artifact,
+)
 from api.serializers import extract_repo_path, is_safe_revision
 from api.services import get_repo_analysis
 from api.test_utils import (
@@ -379,6 +386,190 @@ class FoundationEvalFixtureTests(TestCase):
             self.assertTrue(fixture.rubric_tags)
 
 
+class GraphArtifactContractTests(TestCase):
+    def _legacy_graph(self):
+        return {
+            'tree': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'children': []}],
+            'nodes': [
+                {'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'file': 'pkg/app.py'},
+                {'id': 'pkg/app.py::Worker', 'type': 'class', 'label': 'Worker', 'file': 'pkg/app.py', 'parent': 'pkg/app.py'},
+                {'id': 'pkg/app.py::Worker::run', 'type': 'function', 'label': 'run', 'file': 'pkg/app.py', 'parent': 'pkg/app.py::Worker'},
+            ],
+            'edges': [
+                {'id': 'e1', 'source': 'pkg/app.py', 'target': 'pkg/app.py::Worker', 'type': 'contains', 'file': 'pkg/app.py'},
+                {'id': 'e2', 'source': 'pkg/app.py::Worker', 'target': 'pkg/app.py::Worker::run', 'type': 'contains', 'file': 'pkg/app.py'},
+            ],
+        }
+
+    def test_build_graph_artifact_adds_v1_contract_and_compatibility_aliases(self):
+        artifact = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph=self._legacy_graph(),
+            file_contents={'pkg/app.py': 'class Worker:\n    def run(self):\n        pass\n'},
+            generated_at='2026-01-01T00:00:00Z',
+        )
+
+        validate_graph_artifact(artifact)
+        self.assertEqual(artifact['schema_version'], GRAPH_ARTIFACT_SCHEMA_VERSION)
+        self.assertEqual(artifact['provider'], 'github')
+        self.assertEqual(artifact['owner'], 'owner')
+        self.assertEqual(artifact['name'], 'repo')
+        self.assertEqual(artifact['ref'], 'HEAD')
+        self.assertEqual(artifact['status'], 'succeeded')
+        self.assertEqual(artifact['entrypoints'], [])
+        self.assertEqual(artifact['key_modules'], [])
+        self.assertEqual(artifact['summaries'], {})
+        self.assertEqual(artifact['warnings'], [])
+        self.assertIn('max_python_files', artifact['limits'])
+
+        nodes_by_id = {node['id']: node for node in artifact['nodes']}
+        self.assertEqual(nodes_by_id['pkg/app.py::Worker::run']['kind'], 'method')
+        self.assertEqual(nodes_by_id['pkg/app.py::Worker::run']['type'], 'function')
+        self.assertEqual(nodes_by_id['pkg/app.py::Worker::run']['path'], 'pkg/app.py')
+        self.assertEqual(nodes_by_id['pkg/app.py::Worker::run']['file'], 'pkg/app.py')
+        self.assertEqual(nodes_by_id['pkg/app.py::Worker::run']['parent_id'], 'pkg/app.py::Worker')
+
+        self.assertEqual(artifact['edges'][0]['kind'], 'contains')
+        self.assertEqual(artifact['edges'][0]['type'], 'contains')
+        self.assertEqual(artifact['edges'][0]['path'], 'pkg/app.py')
+        self.assertEqual(artifact['edges'][0]['confidence'], 1.0)
+
+    def test_graph_artifact_schema_field_sets_are_snapshotted(self):
+        artifact = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph=self._legacy_graph(),
+            generated_at='2026-01-01T00:00:00Z',
+        )
+        method_node = next(node for node in artifact['nodes'] if node['id'] == 'pkg/app.py::Worker::run')
+
+        self.assertEqual(
+            set(artifact),
+            {
+                'schema_version',
+                'repo',
+                'provider',
+                'owner',
+                'name',
+                'ref',
+                'revision',
+                'default_branch',
+                'generated_at',
+                'status',
+                'limits',
+                'file_contents',
+                'tree',
+                'nodes',
+                'edges',
+                'entrypoints',
+                'key_modules',
+                'summaries',
+                'warnings',
+            },
+        )
+        self.assertEqual(
+            set(method_node),
+            {
+                'id',
+                'kind',
+                'label',
+                'path',
+                'parent_id',
+                'symbol',
+                'language',
+                'start_line',
+                'end_line',
+                'metadata',
+                'type',
+                'file',
+                'parent',
+            },
+        )
+        self.assertEqual(
+            set(artifact['edges'][0]),
+            {'id', 'kind', 'source', 'target', 'path', 'confidence', 'metadata', 'type', 'file'},
+        )
+
+    def test_validate_graph_artifact_rejects_unknown_kinds(self):
+        artifact = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph=self._legacy_graph(),
+            generated_at='2026-01-01T00:00:00Z',
+        )
+
+        bad_node_artifact = json.loads(json.dumps(artifact))
+        bad_node_artifact['nodes'][0]['kind'] = 'unknown'
+        with self.assertRaisesRegex(ArtifactValidationError, 'unknown node kind'):
+            validate_graph_artifact(bad_node_artifact)
+
+        bad_edge_artifact = json.loads(json.dumps(artifact))
+        bad_edge_artifact['edges'][0]['kind'] = 'unknown'
+        with self.assertRaisesRegex(ArtifactValidationError, 'unknown edge kind'):
+            validate_graph_artifact(bad_edge_artifact)
+
+    def test_validate_graph_artifact_requires_node_and_edge_fields(self):
+        artifact = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph=self._legacy_graph(),
+            generated_at='2026-01-01T00:00:00Z',
+        )
+
+        missing_node_field = json.loads(json.dumps(artifact))
+        del missing_node_field['nodes'][0]['metadata']
+        with self.assertRaisesRegex(ArtifactValidationError, 'node missing required fields'):
+            validate_graph_artifact(missing_node_field)
+
+        missing_edge_field = json.loads(json.dumps(artifact))
+        del missing_edge_field['edges'][0]['confidence']
+        with self.assertRaisesRegex(ArtifactValidationError, 'edge missing required fields'):
+            validate_graph_artifact(missing_edge_field)
+
+    def test_artifact_ids_are_deterministic_for_same_fixture(self):
+        fixture = GOLDEN_FIXTURE_REPOS['cross_file_import_call_sample']
+        graph_one = parse_repo('owner/repo', list(fixture.files), lambda _repo, path: fixture.files[path])
+        graph_two = parse_repo('owner/repo', list(reversed(fixture.files)), lambda _repo, path: fixture.files[path])
+
+        artifact_one = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph=graph_one,
+            generated_at='2026-01-01T00:00:00Z',
+        )
+        artifact_two = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph=graph_two,
+            generated_at='2026-01-01T00:00:00Z',
+        )
+
+        self.assertEqual(
+            [(node['id'], node['kind']) for node in artifact_one['nodes']],
+            [(node['id'], node['kind']) for node in artifact_two['nodes']],
+        )
+        self.assertEqual(
+            [(edge['id'], edge['kind'], edge['source'], edge['target']) for edge in artifact_one['edges']],
+            [(edge['id'], edge['kind'], edge['source'], edge['target']) for edge in artifact_two['edges']],
+        )
+
+    def test_coerce_graph_artifact_upgrades_legacy_cache_payload(self):
+        legacy_payload = {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    pass\n'},
+            **self._legacy_graph(),
+        }
+
+        artifact = coerce_graph_artifact(legacy_payload)
+
+        self.assertEqual(artifact['schema_version'], GRAPH_ARTIFACT_SCHEMA_VERSION)
+        self.assertEqual(artifact['repo'], 'owner/repo')
+        self.assertEqual(artifact['revision'], 'abc123')
+        self.assertEqual(artifact['nodes'][0]['kind'], 'file')
+
+
 @override_settings(
     TEMP_DIR=settings.TEMP_DIR / 'analysis-service-tests',
 )
@@ -407,6 +598,32 @@ class AnalysisArtifactServiceTests(TestCase):
         self.assertTrue(artifact_path.is_file())
         self.assertEqual(first, second)
         parse_repo_mock.assert_called_once()
+
+    @patch('api.services.parse_repo')
+    @patch('api.services.get_repo_snapshot')
+    def test_get_repo_analysis_returns_v1_artifact_without_breaking_graph_aliases(self, get_repo_snapshot_mock, parse_repo_mock):
+        get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
+        parse_repo_mock.return_value = {
+            'tree': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'children': []}],
+            'nodes': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'file': 'pkg/app.py'}],
+            'edges': [{'id': 'e1', 'source': 'pkg/app.py', 'target': 'pkg/app.py::main', 'type': 'contains', 'file': 'pkg/app.py'}],
+        }
+
+        analysis = get_repo_analysis('owner/repo')
+
+        self.assertIsNotNone(analysis)
+        analysis_payload = cast(dict[str, object], analysis)
+        self.assertEqual(analysis_payload['schema_version'], GRAPH_ARTIFACT_SCHEMA_VERSION)
+        node = cast(list[dict[str, object]], analysis_payload['nodes'])[0]
+        edge = cast(list[dict[str, object]], analysis_payload['edges'])[0]
+        self.assertEqual(node['kind'], 'file')
+        self.assertEqual(node['type'], 'file')
+        self.assertEqual(node['path'], 'pkg/app.py')
+        self.assertEqual(node['file'], 'pkg/app.py')
+        self.assertEqual(edge['kind'], 'contains')
+        self.assertEqual(edge['type'], 'contains')
+        self.assertEqual(edge['path'], 'pkg/app.py')
+        self.assertEqual(edge['file'], 'pkg/app.py')
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
@@ -466,6 +683,8 @@ class AnalysisArtifactServiceTests(TestCase):
 
         self.assertIsNotNone(analysis)
         get_repo_snapshot_mock.assert_not_called()
+        cached_payload = json.loads(artifact_path.read_text(encoding='utf-8'))
+        self.assertEqual(cached_payload['schema_version'], GRAPH_ARTIFACT_SCHEMA_VERSION)
 
     def test_get_repo_analysis_rejects_unsafe_cached_revision(self):
         self.assertIsNone(get_repo_analysis('owner/repo', '../../escaped'))
