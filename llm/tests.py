@@ -10,6 +10,7 @@ from typing import cast
 from api.services import get_repo_analysis
 from api.test_utils import create_git_fixture_repo
 from llm.services import answer_question, _build_context, _question_tokens, _rank_files
+from llm.summaries import SUMMARY_KIND_ONBOARDING, SummaryUnavailable, generate_summary
 
 
 class SelectiveQuestionAnsweringTests(TestCase):
@@ -134,6 +135,71 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         self.assertEqual(response['citations'], ['pkg/factory.py'])
         self.assertEqual(response['warnings'][0]['code'], 'invalid_selected_node')
+
+    def test_rank_files_can_use_cached_summary_text_hook(self):
+        analysis = {
+            'revision': 'abc123',
+            'summaries': {
+                'repo_overview:summary.v1': {
+                    'text': '인증 처리는 auth.py의 AuthService가 담당합니다.',
+                    'source_nodes': ['pkg/auth.py::AuthService'],
+                    'source_files': ['pkg/auth.py'],
+                },
+            },
+            'nodes': [
+                {'id': 'pkg/auth.py::AuthService', 'kind': 'class', 'label': 'AuthService', 'path': 'pkg/auth.py'},
+                {'id': 'pkg/billing.py::BillingService', 'kind': 'class', 'label': 'BillingService', 'path': 'pkg/billing.py'},
+            ],
+        }
+
+        ranked_files = _rank_files(analysis, '인증 처리는 어디에서 하나요?')
+
+        self.assertEqual(ranked_files[0], 'pkg/auth.py')
+
+    @patch('llm.summaries._generate_answer')
+    def test_generate_onboarding_summary_uses_entrypoints_and_key_modules(self, generate_answer):
+        analysis = {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'file_contents': {
+                'service/api.py': 'def route():\n    return "ok"\n',
+                'service/core.py': 'def build_payload():\n    return {"ok": True}\n',
+            },
+            'nodes': [
+                {'id': 'service/api.py::route', 'kind': 'function', 'label': 'route', 'path': 'service/api.py', 'start_line': 1, 'end_line': 2},
+                {'id': 'module::service.core', 'kind': 'module', 'label': 'service.core', 'path': 'service/core.py'},
+            ],
+            'edges': [],
+            'entrypoints': [{'id': 'service/api.py::route', 'kind': 'web_route', 'path': 'service/api.py'}],
+            'key_modules': [{'id': 'module::service.core', 'path': 'service/core.py', 'score': 10}],
+            'warnings': [],
+        }
+        generate_answer.return_value = 'API에서 시작해 core를 읽으세요.'
+
+        summary = generate_summary(analysis, SUMMARY_KIND_ONBOARDING)
+
+        self.assertEqual(summary['text'], 'API에서 시작해 core를 읽으세요.')
+        self.assertIn('service/api.py::route', summary['source_nodes'])
+        self.assertIn('module::service.core', summary['source_nodes'])
+        messages = generate_answer.call_args.args[0]
+        self.assertIn('entrypoints', messages[1]['content'])
+        self.assertIn('key_modules', messages[1]['content'])
+
+    @patch('llm.summaries._generate_answer', side_effect=RuntimeError('사용 가능한 AI API 키가 없습니다.'))
+    def test_generate_summary_maps_model_unavailable(self, generate_answer):
+        analysis = {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'file_contents': {},
+            'nodes': [],
+            'edges': [],
+            'entrypoints': [],
+            'key_modules': [],
+            'warnings': [],
+        }
+
+        with self.assertRaises(SummaryUnavailable):
+            generate_summary(analysis, SUMMARY_KIND_ONBOARDING)
 
 
 @override_settings(

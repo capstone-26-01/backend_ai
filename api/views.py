@@ -8,7 +8,7 @@ from rest_framework import serializers
 
 from github_repo.services import RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
-from .serializers import AnalysisRequestSerializer, RepoUrlSerializer, QASerializer, is_safe_revision
+from .serializers import AnalysisRequestSerializer, NodeSummaryRequestSerializer, RepoUrlSerializer, QASerializer, SummaryRequestSerializer, is_safe_revision
 
 logger = logging.getLogger(__name__)
 api_services = importlib.import_module('api.services')
@@ -38,6 +38,14 @@ def build_graph_response(payload, analysis_run=None):
     return api_services.build_graph_response(payload, analysis_run)
 
 
+def get_or_create_summary_response(analysis_id: int, kind: str):
+    return api_services.get_or_create_summary_response(analysis_id, kind)
+
+
+def get_or_create_node_summary_response(analysis_id: int, node_id: str):
+    return api_services.get_or_create_node_summary_response(analysis_id, node_id)
+
+
 def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
     status_by_code = {
         'invalid_repo_path': 400,
@@ -57,6 +65,14 @@ def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
         },
         status=status_by_code.get(error.code, 502),
     )
+
+
+def _summary_error_response(error: Exception) -> Response:
+    if isinstance(error, api_services.SummaryInputError):
+        return Response({'error': str(error), 'code': 'summary_input_error'}, status=400)
+    if isinstance(error, api_services.SummaryUnavailable):
+        return Response({'error': '요약을 생성할 수 없습니다', 'code': 'summary_unavailable', 'detail': str(error)}, status=503)
+    raise error
 
 
 _ANALYSIS_REQUEST_SCHEMA = inline_serializer(
@@ -270,6 +286,64 @@ def get_repo_graph(request):
 
     analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
     return Response(build_graph_response(analysis, analysis_run))
+
+
+_SUMMARY_RESPONSE_SCHEMA = inline_serializer(
+    name='SummaryResponse',
+    fields={
+        'analysis_id': serializers.IntegerField(),
+        'repo': serializers.CharField(),
+        'revision': serializers.CharField(),
+        'summary': serializers.JSONField(),
+        'cached': serializers.BooleanField(),
+    },
+)
+
+
+@extend_schema(
+    parameters=[
+        OpenApiParameter(name='analysis_id', description='분석 run ID', required=True, type=int),
+        OpenApiParameter(name='kind', description='repo_overview 또는 onboarding_guide', required=False, type=str),
+    ],
+    responses=_SUMMARY_RESPONSE_SCHEMA,
+)
+@api_view(['GET'])
+def summary(request):
+    serializer = SummaryRequestSerializer(data=request.GET)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, Any], serializer.validated_data)
+    try:
+        response = get_or_create_summary_response(int(validated_data['analysis_id']), str(validated_data['kind']))
+    except Exception as error:
+        return _summary_error_response(error)
+    if response is None:
+        return Response({'error': '분석 결과를 찾을 수 없습니다'}, status=404)
+    return Response(response)
+
+
+@extend_schema(
+    parameters=[
+        OpenApiParameter(name='analysis_id', description='분석 run ID', required=True, type=int),
+        OpenApiParameter(name='node_id', description='요약할 graph node ID', required=True, type=str),
+    ],
+    responses=_SUMMARY_RESPONSE_SCHEMA,
+)
+@api_view(['GET'])
+def node_summary(request):
+    serializer = NodeSummaryRequestSerializer(data=request.GET)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, Any], serializer.validated_data)
+    try:
+        response = get_or_create_node_summary_response(int(validated_data['analysis_id']), str(validated_data['node_id']))
+    except Exception as error:
+        return _summary_error_response(error)
+    if response is None:
+        return Response({'error': '분석 결과를 찾을 수 없습니다'}, status=404)
+    return Response(response)
 
 
 @extend_schema(

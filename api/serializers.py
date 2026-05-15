@@ -116,3 +116,22 @@ class QASerializer(serializers.Serializer):
         if not attrs.get('repo_url') and not attrs.get('analysis_id'):
             raise serializers.ValidationError({'repo_url': ['repo_url 또는 analysis_id가 필요합니다']})
         return attrs
+
+
+class SummaryRequestSerializer(serializers.Serializer):
+    analysis_id = serializers.IntegerField(min_value=1)
+    kind = serializers.ChoiceField(
+        choices=('repo_overview', 'onboarding_guide'),
+        required=False,
+        default='repo_overview',
+    )
+
+
+class NodeSummaryRequestSerializer(serializers.Serializer):
+    analysis_id = serializers.IntegerField(min_value=1)
+    node_id = serializers.CharField()
+
+    def validate_node_id(self, value):
+        if not is_safe_graph_id(value):
+            raise serializers.ValidationError('올바른 node_id가 아닙니다')
+        return value
