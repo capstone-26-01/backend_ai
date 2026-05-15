@@ -10,9 +10,15 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
+from api.diff import GraphDiffInputError, compare_graph_artifacts
 from api.models import AnalysisArtifact, AnalysisRun, Repository
 from api.serializers import is_safe_revision, _is_safe_repo_segment
-from github_repo.services import RepoIngestionError, get_file_content_or_raise, get_repo_snapshot_or_raise as get_repo_snapshot
+from github_repo.services import (
+    RepoIngestionError,
+    get_file_content_or_raise,
+    get_repo_snapshot_at_revision_or_raise as get_repo_snapshot_at_revision,
+    get_repo_snapshot_or_raise as get_repo_snapshot,
+)
 from llm.summaries import (
     SUMMARY_KIND_NODE,
     SUMMARY_KIND_ONBOARDING,
@@ -364,37 +370,7 @@ def _max_total_analyzed_bytes() -> int:
     return int(getattr(settings, 'GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES', 5_000_000))
 
 
-def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
-    try:
-        _analysis_parts(repo_path)
-    except ValueError:
-        return None
-
-    if revision is not None:
-        if not is_safe_revision(revision):
-            return None
-        artifact = get_artifact_by_revision(repo_path, revision)
-        if artifact is not None:
-            return artifact
-        artifact_path = _analysis_path(repo_path, revision)
-        if artifact_path.exists():
-            return _persist_succeeded_artifact(repo_path, _read_analysis_artifact(artifact_path))
-        return None
-
-    repository = get_or_create_repository(repo_path)
-    try:
-        snapshot = get_repo_snapshot(repo_path)
-    except Exception as error:
-        failed_run = start_analysis_run(repository, revision='')
-        store_failed_run(failed_run, error)
-        raise
-
-    if snapshot is None:
-        return None
-    revision, files = snapshot
-    if not files:
-        return None
-
+def _analysis_from_cache(repo_path: str, revision: str) -> dict[str, Any] | None:
     artifact = get_artifact_by_revision(repo_path, revision)
     if artifact is not None:
         return artifact
@@ -402,8 +378,23 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
     artifact_path = _analysis_path(repo_path, revision)
     if artifact_path.exists():
         return _persist_succeeded_artifact(repo_path, _read_analysis_artifact(artifact_path))
+    return None
 
-    analysis_run = start_analysis_run(repository, revision=revision)
+
+def _build_and_store_analysis(
+    repo_path: str,
+    repository: Repository,
+    revision: str,
+    files: list[str],
+    *,
+    ref: str = 'HEAD',
+) -> dict[str, Any]:
+    cached_analysis = _analysis_from_cache(repo_path, revision)
+    if cached_analysis is not None:
+        return cached_analysis
+
+    artifact_path = _analysis_path(repo_path, revision)
+    analysis_run = start_analysis_run(repository, ref=ref, revision=revision)
     try:
         python_files = [file_path for file_path in files if file_path.endswith('.py')]
         file_contents = {}
@@ -432,6 +423,7 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
             revision=revision,
             graph=graph,
             file_contents=file_contents,
+            ref=ref,
             entrypoints=graph.get('entrypoints', []),
             key_modules=graph.get('key_modules', []),
             warnings=graph.get('warnings', []),
@@ -441,3 +433,104 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
     except Exception as error:
         store_failed_run(analysis_run, error)
         raise
+
+
+def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
+    try:
+        _analysis_parts(repo_path)
+    except ValueError:
+        return None
+
+    repository = get_or_create_repository(repo_path)
+
+    if revision is not None:
+        if not is_safe_revision(revision):
+            return None
+        cached_analysis = _analysis_from_cache(repo_path, revision)
+        if cached_analysis is not None:
+            return cached_analysis
+
+        try:
+            snapshot = get_repo_snapshot_at_revision(repo_path, revision)
+        except Exception as error:
+            failed_run = start_analysis_run(repository, ref=revision, revision=revision)
+            store_failed_run(failed_run, error)
+            raise
+
+        if snapshot is None:
+            return None
+        target_revision, files = snapshot
+        if not files:
+            return None
+        return _build_and_store_analysis(repo_path, repository, target_revision, files, ref=revision)
+
+    try:
+        snapshot = get_repo_snapshot(repo_path)
+    except Exception as error:
+        failed_run = start_analysis_run(repository, revision='')
+        store_failed_run(failed_run, error)
+        raise
+
+    if snapshot is None:
+        return None
+    target_revision, files = snapshot
+    if not files:
+        return None
+
+    return _build_and_store_analysis(repo_path, repository, target_revision, files)
+
+
+def _analysis_ref(run: AnalysisRun) -> dict[str, Any]:
+    return {
+        'analysis_id': run.id,
+        'revision': run.revision,
+        'ref': run.ref,
+    }
+
+
+def _build_diff_response(base_run: AnalysisRun, head_run: AnalysisRun) -> dict[str, Any]:
+    base_artifact = base_run.artifact.payload
+    head_artifact = head_run.artifact.payload
+    diff = compare_graph_artifacts(base_artifact, head_artifact)
+    return {
+        'repo': head_run.repository.full_name,
+        'base': _analysis_ref(base_run),
+        'head': _analysis_ref(head_run),
+        'diff': diff,
+        'warnings': diff.get('warnings', []),
+    }
+
+
+def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None) -> dict[str, Any] | None:
+    try:
+        _analysis_parts(repo_path)
+    except ValueError:
+        return None
+    if not is_safe_revision(base_revision):
+        return None
+    if head_revision is not None and not is_safe_revision(head_revision):
+        return None
+
+    base_payload = get_repo_analysis(repo_path, base_revision)
+    head_payload = get_repo_analysis(repo_path, head_revision) if head_revision is not None else get_repo_analysis(repo_path)
+    if base_payload is None or head_payload is None:
+        return None
+
+    base_run = get_analysis_run_by_revision(repo_path, str(base_payload['revision']))
+    head_run = get_analysis_run_by_revision(repo_path, str(head_payload['revision']))
+    if base_run is None or head_run is None:
+        return None
+    return _build_diff_response(base_run, head_run)
+
+
+def get_diff_response_by_analysis_id(head_analysis_id: int, base_analysis_id: int) -> dict[str, Any] | None:
+    head_record = _get_succeeded_artifact_record_by_id(head_analysis_id)
+    base_record = _get_succeeded_artifact_record_by_id(base_analysis_id)
+    if head_record is None or base_record is None:
+        return None
+
+    base_run, _base_artifact = base_record
+    head_run, _head_artifact = head_record
+    if base_run.repository_id != head_run.repository_id:
+        raise GraphDiffInputError('diff analyses must belong to the same repo')
+    return _build_diff_response(base_run, head_run)

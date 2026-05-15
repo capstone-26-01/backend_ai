@@ -8,7 +8,16 @@ from rest_framework import serializers
 
 from github_repo.services import RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
-from .serializers import AnalysisRequestSerializer, NodeSummaryRequestSerializer, RepoUrlSerializer, QASerializer, SummaryRequestSerializer, is_safe_revision
+from .serializers import (
+    AnalysisDiffRequestSerializer,
+    AnalysisRequestSerializer,
+    DiffRequestSerializer,
+    NodeSummaryRequestSerializer,
+    RepoUrlSerializer,
+    QASerializer,
+    SummaryRequestSerializer,
+    is_safe_revision,
+)
 
 logger = logging.getLogger(__name__)
 api_services = importlib.import_module('api.services')
@@ -46,6 +55,14 @@ def get_or_create_node_summary_response(analysis_id: int, node_id: str):
     return api_services.get_or_create_node_summary_response(analysis_id, node_id)
 
 
+def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None):
+    return api_services.get_diff_response(repo_path, base_revision, head_revision)
+
+
+def get_diff_response_by_analysis_id(head_analysis_id: int, base_analysis_id: int):
+    return api_services.get_diff_response_by_analysis_id(head_analysis_id, base_analysis_id)
+
+
 def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
     status_by_code = {
         'invalid_repo_path': 400,
@@ -54,6 +71,7 @@ def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
         'private_repo': 404,
         'timeout': 504,
         'too_large': 413,
+        'revision_not_found': 404,
         'git_error': 502,
     }
     logger.warning('Repo ingestion failed: %s', error.as_dict())
@@ -72,6 +90,12 @@ def _summary_error_response(error: Exception) -> Response:
         return Response({'error': str(error), 'code': 'summary_input_error'}, status=400)
     if isinstance(error, api_services.SummaryUnavailable):
         return Response({'error': '요약을 생성할 수 없습니다', 'code': 'summary_unavailable', 'detail': str(error)}, status=503)
+    raise error
+
+
+def _diff_error_response(error: Exception) -> Response:
+    if isinstance(error, api_services.GraphDiffInputError):
+        return Response({'error': str(error), 'code': 'diff_input_error'}, status=400)
     raise error
 
 
@@ -103,6 +127,16 @@ _ANALYSIS_DETAIL_RESPONSE_SCHEMA = inline_serializer(
         'artifact': serializers.JSONField(allow_null=True),
         'warnings': serializers.JSONField(),
         'error': serializers.JSONField(required=False, allow_null=True),
+    },
+)
+_DIFF_RESPONSE_SCHEMA = inline_serializer(
+    name='GraphDiffResponse',
+    fields={
+        'repo': serializers.CharField(),
+        'base': serializers.JSONField(),
+        'head': serializers.JSONField(),
+        'diff': serializers.JSONField(),
+        'warnings': serializers.JSONField(),
     },
 )
 
@@ -156,6 +190,66 @@ def analysis_detail(request, analysis_id: int):
     response = get_analysis_response_by_id(analysis_id)
     if response is None:
         return Response({'error': '분석 결과를 찾을 수 없습니다'}, status=404)
+    return Response(response)
+
+
+@extend_schema(
+    operation_id='analysis_diff_by_id',
+    parameters=[
+        OpenApiParameter(name='base', description='비교 기준 분석 run ID', required=True, type=int),
+    ],
+    responses=_DIFF_RESPONSE_SCHEMA,
+)
+@api_view(['GET'])
+def analysis_diff(request, analysis_id: int):
+    serializer = AnalysisDiffRequestSerializer(data=request.GET)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, Any], serializer.validated_data)
+    try:
+        response = get_diff_response_by_analysis_id(analysis_id, int(validated_data['base']))
+    except Exception as error:
+        return _diff_error_response(error)
+    if response is None:
+        return Response({'error': '비교할 분석 결과를 찾을 수 없습니다'}, status=404)
+    return Response(response)
+
+
+@extend_schema(
+    operation_id='analysis_diff_by_revision',
+    parameters=[
+        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
+        OpenApiParameter(name='base', description='기준 revision', required=True, type=str),
+        OpenApiParameter(name='head', description='대상 revision. 생략하면 latest HEAD', required=False, type=str),
+    ],
+    responses=_DIFF_RESPONSE_SCHEMA,
+)
+@api_view(['GET'])
+def graph_diff(request):
+    request_data = {
+        'repo_url': request.GET.get('url'),
+        'base': request.GET.get('base'),
+    }
+    if request.GET.get('head') is not None:
+        request_data['head'] = request.GET.get('head')
+    serializer = DiffRequestSerializer(data=request_data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, str], serializer.validated_data)
+    try:
+        response = get_diff_response(
+            validated_data['repo_url'],
+            validated_data['base'],
+            validated_data.get('head'),
+        )
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    except Exception as error:
+        return _diff_error_response(error)
+    if response is None:
+        return Response({'error': '비교할 분석 결과를 찾을 수 없습니다'}, status=404)
     return Response(response)
 
 
