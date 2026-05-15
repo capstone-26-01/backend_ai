@@ -39,6 +39,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() == 'true'
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return int(value.strip())
+
+
 def _env_list(name: str, default: list[str]) -> list[str]:
     value = os.getenv(name)
     if value is None:
@@ -65,6 +72,12 @@ SECURE_SSL_REDIRECT = False if IS_TESTING else _env_bool('SECURE_SSL_REDIRECT', 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 SESSION_COOKIE_SECURE = False if IS_TESTING else not DEBUG
 CSRF_COOKIE_SECURE = False if IS_TESTING else not DEBUG
+
+GITHUB_REPO_GIT_TIMEOUT_SECONDS = _env_int('GITHUB_REPO_GIT_TIMEOUT_SECONDS', 30)
+GITHUB_REPO_MAX_FILES = _env_int('GITHUB_REPO_MAX_FILES', 5000)
+GITHUB_REPO_MAX_PYTHON_FILES = _env_int('GITHUB_REPO_MAX_PYTHON_FILES', 1000)
+GITHUB_REPO_MAX_SINGLE_FILE_BYTES = _env_int('GITHUB_REPO_MAX_SINGLE_FILE_BYTES', 300_000)
+GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES = _env_int('GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES', 5_000_000)
 
 
 # Application definition
