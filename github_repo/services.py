@@ -13,6 +13,7 @@ from django.conf import settings
 
 
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
+REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 MAX_STDERR_CHARS = 1200
 
 
@@ -47,6 +48,12 @@ class RepoIngestionError(Exception):
 
 def _is_safe_repo_segment(segment: str) -> bool:
     return bool(segment) and segment not in {'.', '..'} and REPO_SEGMENT_PATTERN.fullmatch(segment) is not None
+
+
+def _is_safe_revision(revision: str) -> bool:
+    if not revision or len(revision) > 255 or revision.startswith('-'):
+        return False
+    return revision not in {'.', '..'} and REVISION_PATTERN.fullmatch(revision) is not None
 
 
 def _repo_parts(repo_path: str) -> tuple[str, str]:
@@ -130,6 +137,18 @@ def _classify_git_error(args: tuple[str, ...], stderr: str, returncode: int) -> 
             stderr=stderr,
             metadata={'returncode': returncode},
         )
+    if category == 'fetch' and (
+        "couldn't find remote ref" in lowered
+        or 'server does not allow request for unadvertised object' in lowered
+        or 'not our ref' in lowered
+    ):
+        return RepoIngestionError(
+            'revision_not_found',
+            'revision을 찾을 수 없습니다.',
+            command_category=category,
+            stderr=stderr,
+            metadata={'returncode': returncode},
+        )
     return RepoIngestionError(
         'git_error',
         'Git 명령 실행 중 오류가 발생했습니다.',
@@ -197,6 +216,61 @@ def _default_remote_ref(repo_dir: Path) -> str:
         return f'origin/{branch_name}'
 
 
+def _revision_fetch_depth() -> int:
+    return max(1, _setting_int('GITHUB_REPO_REVISION_FETCH_DEPTH', 50))
+
+
+def _resolve_commit(repo_dir: Path, revision: str) -> str | None:
+    try:
+        return _run_git('rev-parse', '--verify', f'{revision}^{{commit}}', cwd=repo_dir)
+    except RepoIngestionError as error:
+        if error.code in {'git_error', 'revision_not_found'}:
+            return None
+        raise
+
+
+def _fetch_revision_candidate(repo_dir: Path, revision: str) -> str | None:
+    try:
+        _run_git('fetch', '--depth', '1', 'origin', revision, cwd=repo_dir)
+    except RepoIngestionError as error:
+        if error.code not in {'git_error', 'revision_not_found'}:
+            raise
+        return None
+    return _resolve_commit(repo_dir, 'FETCH_HEAD')
+
+
+def _fetch_default_history_for_revision(repo_dir: Path, revision: str) -> str | None:
+    default_remote_ref = _default_remote_ref(repo_dir)
+    default_branch = default_remote_ref.removeprefix('origin/')
+    try:
+        _run_git('fetch', f'--deepen={_revision_fetch_depth()}', 'origin', default_branch, cwd=repo_dir)
+    except RepoIngestionError as error:
+        if error.code not in {'git_error', 'revision_not_found'}:
+            raise
+    return _resolve_commit(repo_dir, revision)
+
+
+def _ensure_revision_available(repo_dir: Path, revision: str) -> str:
+    resolved_revision = _resolve_commit(repo_dir, revision)
+    if resolved_revision is not None:
+        return resolved_revision
+
+    resolved_revision = _fetch_revision_candidate(repo_dir, revision)
+    if resolved_revision is not None:
+        return resolved_revision
+
+    resolved_revision = _fetch_default_history_for_revision(repo_dir, revision)
+    if resolved_revision is not None:
+        return resolved_revision
+
+    raise RepoIngestionError(
+        'revision_not_found',
+        'revision을 찾을 수 없습니다.',
+        command_category='fetch',
+        metadata={'revision': revision},
+    )
+
+
 def _origin_matches(repo_dir: Path, repo_path: str) -> bool:
     try:
         remote_url = _run_git('remote', 'get-url', 'origin', cwd=repo_dir)
@@ -262,12 +336,41 @@ def _repo_snapshot(repo_path: str) -> tuple[Path, str, list[str]]:
     return repo_dir, revision, sorted_files
 
 
+def _repo_snapshot_at_revision(repo_path: str, revision: str) -> tuple[Path, str, list[str]]:
+    if not _is_safe_revision(revision):
+        raise ValueError('Unsafe revision')
+
+    with _repo_lock(repo_path):
+        repo_dir = _ensure_local_repo(repo_path)
+        target_revision = _ensure_revision_available(repo_dir, revision)
+        files_output = _run_git('ls-tree', '-r', '--name-only', target_revision, cwd=repo_dir)
+    files = [line for line in files_output.splitlines() if line]
+    sorted_files = sorted(files)
+    _enforce_snapshot_limits(sorted_files)
+    return repo_dir, target_revision, sorted_files
+
+
 def get_repo_snapshot_or_raise(repo_path: str) -> tuple[str, list[str]]:
     try:
         _repo_dir, revision, files = _repo_snapshot(repo_path)
     except ValueError as exc:
         raise RepoIngestionError('invalid_repo_path', '올바른 repo 경로가 아닙니다.') from exc
     return revision, files
+
+
+def get_repo_snapshot_at_revision_or_raise(repo_path: str, revision: str) -> tuple[str, list[str]]:
+    try:
+        _repo_dir, target_revision, files = _repo_snapshot_at_revision(repo_path, revision)
+    except ValueError as exc:
+        raise RepoIngestionError('invalid_repo_path', '올바른 repo 경로 또는 revision이 아닙니다.') from exc
+    return target_revision, files
+
+
+def get_repo_snapshot_at_revision(repo_path: str, revision: str) -> tuple[str, list[str]] | None:
+    try:
+        return get_repo_snapshot_at_revision_or_raise(repo_path, revision)
+    except RepoIngestionError:
+        return None
 
 
 def get_repo_snapshot(repo_path: str) -> tuple[str, list[str]] | None:

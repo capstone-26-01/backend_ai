@@ -15,7 +15,9 @@ def _is_safe_repo_segment(segment: str) -> bool:
 
 
 def is_safe_revision(revision: str) -> bool:
-    return bool(revision) and revision not in {'.', '..'} and REVISION_PATTERN.fullmatch(revision) is not None
+    if not revision or len(revision) > 255 or revision.startswith('-'):
+        return False
+    return revision not in {'.', '..'} and REVISION_PATTERN.fullmatch(revision) is not None
 
 
 def is_safe_ref(ref: str) -> bool:
@@ -80,6 +82,25 @@ class AnalysisRequestSerializer(RepoUrlSerializer):
         if not is_safe_revision(value):
             raise serializers.ValidationError('올바른 revision이 아닙니다')
         return value
+
+
+class DiffRequestSerializer(RepoUrlSerializer):
+    base = serializers.CharField()
+    head = serializers.CharField(required=False)
+
+    def validate_base(self, value):
+        if not is_safe_revision(value):
+            raise serializers.ValidationError('올바른 base revision이 아닙니다')
+        return value
+
+    def validate_head(self, value):
+        if not is_safe_revision(value):
+            raise serializers.ValidationError('올바른 head revision이 아닙니다')
+        return value
+
+
+class AnalysisDiffRequestSerializer(serializers.Serializer):
+    base = serializers.IntegerField(min_value=1)
 
 
 class QASerializer(serializers.Serializer):

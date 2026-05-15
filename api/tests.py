@@ -27,6 +27,7 @@ from api.artifacts import (
     coerce_graph_artifact,
     validate_graph_artifact,
 )
+from api.diff import compare_graph_artifacts
 from api.models import AnalysisArtifact, AnalysisRun, Repository
 from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision
 from api.services import get_artifact_by_revision, get_repo_analysis
@@ -92,6 +93,7 @@ class WorkspaceSettingsTests(TestCase):
         self.assertGreater(settings.GITHUB_REPO_MAX_PYTHON_FILES, 0)
         self.assertGreater(settings.GITHUB_REPO_MAX_SINGLE_FILE_BYTES, 0)
         self.assertGreater(settings.GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES, 0)
+        self.assertGreater(settings.GITHUB_REPO_REVISION_FETCH_DEPTH, 0)
 
 
 class RepoUrlSerializerTests(TestCase):
@@ -120,6 +122,7 @@ class RepoUrlSerializerTests(TestCase):
         self.assertFalse(is_safe_revision('../../escaped'))
         self.assertFalse(is_safe_revision('a/b'))
         self.assertFalse(is_safe_revision('..'))
+        self.assertFalse(is_safe_revision('-abc123'))
         self.assertTrue(is_safe_revision('main'))
 
     def test_ref_validator_allows_branch_like_refs_without_path_escape(self):
@@ -957,6 +960,107 @@ class GraphArtifactContractTests(TestCase):
         self.assertEqual(artifact['nodes'][0]['kind'], 'file')
 
 
+class GraphDiffContractTests(TestCase):
+    def _artifact(self, revision: str, *, nodes=None, edges=None, entrypoints=None):
+        return build_graph_artifact(
+            repo_path='owner/repo',
+            revision=revision,
+            graph={
+                'tree': [],
+                'nodes': nodes if nodes is not None else [],
+                'edges': edges if edges is not None else [],
+            },
+            entrypoints=entrypoints,
+            generated_at='2026-01-01T00:00:00Z',
+        )
+
+    def test_same_revision_diff_is_empty(self):
+        artifact = self._artifact(
+            'abc123',
+            nodes=[{'id': 'pkg/app.py::main', 'type': 'function', 'label': 'main', 'file': 'pkg/app.py'}],
+            edges=[{'id': 'e1', 'source': 'pkg/app.py', 'target': 'pkg/app.py::main', 'type': 'contains', 'file': 'pkg/app.py'}],
+        )
+
+        diff = compare_graph_artifacts(artifact, artifact)
+
+        self.assertEqual(
+            diff['summary'],
+            {
+                'added_nodes': 0,
+                'removed_nodes': 0,
+                'changed_nodes': 0,
+                'added_edges': 0,
+                'removed_edges': 0,
+                'changed_edges': 0,
+                'changed_metadata': 0,
+            },
+        )
+
+    def test_added_function_node_is_reported(self):
+        base = self._artifact('abc123')
+        head = self._artifact(
+            'def456',
+            nodes=[{'id': 'pkg/app.py::main', 'type': 'function', 'label': 'main', 'file': 'pkg/app.py'}],
+        )
+
+        diff = compare_graph_artifacts(base, head)
+
+        self.assertEqual(diff['summary']['added_nodes'], 1)
+        self.assertEqual(diff['nodes']['added'][0]['id'], 'pkg/app.py::main')
+
+    def test_removed_class_node_is_reported(self):
+        base = self._artifact(
+            'abc123',
+            nodes=[{'id': 'pkg/app.py::Worker', 'type': 'class', 'label': 'Worker', 'file': 'pkg/app.py'}],
+        )
+        head = self._artifact('def456')
+
+        diff = compare_graph_artifacts(base, head)
+
+        self.assertEqual(diff['summary']['removed_nodes'], 1)
+        self.assertEqual(diff['nodes']['removed'][0]['id'], 'pkg/app.py::Worker')
+
+    def test_added_call_and_removed_import_edges_are_reported(self):
+        base = self._artifact(
+            'abc123',
+            edges=[
+                {'id': 'e1', 'source': 'pkg/app.py', 'target': 'module::pkg.lib', 'type': 'imports', 'file': 'pkg/app.py'},
+            ],
+        )
+        head = self._artifact(
+            'def456',
+            edges=[
+                {'id': 'e2', 'source': 'pkg/app.py::main', 'target': 'pkg/lib.py::helper', 'type': 'calls', 'file': 'pkg/app.py'},
+            ],
+        )
+
+        diff = compare_graph_artifacts(base, head)
+
+        self.assertEqual(diff['summary']['added_edges'], 1)
+        self.assertEqual(diff['summary']['removed_edges'], 1)
+        self.assertEqual(diff['edges']['added'][0]['kind'], 'calls')
+        self.assertEqual(diff['edges']['removed'][0]['kind'], 'imports')
+
+    def test_changed_node_and_metadata_are_reported(self):
+        base = self._artifact(
+            'abc123',
+            nodes=[{'id': 'pkg/app.py::main', 'type': 'function', 'label': 'main', 'file': 'pkg/app.py'}],
+            entrypoints=[],
+        )
+        head = self._artifact(
+            'def456',
+            nodes=[{'id': 'pkg/app.py::main', 'type': 'function', 'label': 'run', 'file': 'pkg/app.py'}],
+            entrypoints=[{'id': 'pkg/app.py::main', 'kind': 'main_function'}],
+        )
+
+        diff = compare_graph_artifacts(base, head)
+
+        self.assertEqual(diff['summary']['changed_nodes'], 1)
+        self.assertIn('label', diff['nodes']['changed'][0]['changed_fields'])
+        self.assertEqual(diff['summary']['changed_metadata'], 1)
+        self.assertEqual(diff['metadata']['changed'][0]['field'], 'entrypoints')
+
+
 @override_settings(
     TEMP_DIR=settings.TEMP_DIR / 'analysis-service-tests',
 )
@@ -1755,6 +1859,137 @@ class RevisionPinnedApiTests(TestCase):
         self.assertEqual(payload['revision'], ['올바른 revision이 아닙니다'])
 
 
+@override_settings(
+    TEMP_DIR=settings.BASE_DIR / 'temp' / 'diff-api-tests',
+    PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'diff-api-tests' / 'playground',
+)
+class DiffLatestRefreshApiTests(TestCase):
+    source_repo: Path = Path()
+
+    def setUp(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
+        self.source_repo = settings.TEMP_DIR / 'source-repo'
+        create_git_fixture_repo(self.source_repo, {'pkg/app.py': 'def greet():\n    return "v1"\n'}, commit_message='v1')
+
+    def tearDown(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+
+    def _clone_url(self) -> str:
+        return f'file://{self.source_repo}'
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_diff_without_head_uses_latest_refresh_and_reuses_same_revision(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        base_analysis = get_repo_analysis('owner/repo')
+        self.assertIsNotNone(base_analysis)
+        base_revision = cast(dict[str, object], base_analysis)['revision']
+
+        response = cast(HttpResponse, self.client.get('/api/diff/', {'url': 'https://github.com/owner/repo', 'base': base_revision}))
+        payload = cast(dict[str, object], json.loads(response.content))
+        diff = cast(dict[str, object], payload['diff'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(cast(dict[str, object], payload['base'])['revision'], base_revision)
+        self.assertEqual(cast(dict[str, object], payload['head'])['revision'], base_revision)
+        self.assertEqual(cast(dict[str, object], diff['summary'])['added_nodes'], 0)
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 1)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_diff_without_head_refreshes_latest_when_remote_head_changes(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        base_analysis = get_repo_analysis('owner/repo')
+        self.assertIsNotNone(base_analysis)
+        base_revision = cast(dict[str, object], base_analysis)['revision']
+        write_files(
+            self.source_repo,
+            {'pkg/app.py': 'def greet():\n    return "v2"\n\ndef helper():\n    return greet()\n'},
+        )
+        head_revision = commit_all(self.source_repo, 'v2')
+
+        response = cast(HttpResponse, self.client.get('/api/diff/', {'url': 'https://github.com/owner/repo', 'base': base_revision}))
+        payload = cast(dict[str, object], json.loads(response.content))
+        diff = cast(dict[str, object], payload['diff'])
+        summary = cast(dict[str, object], diff['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(cast(dict[str, object], payload['head'])['revision'], head_revision)
+        self.assertGreaterEqual(cast(int, summary['added_nodes']), 1)
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 2)
+        self.assertEqual(AnalysisArtifact.objects.count(), 2)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_diff_endpoint_fetches_missing_revision_from_shallow_history(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        base_revision = run_git(self.source_repo, 'rev-parse', 'HEAD')
+        write_files(
+            self.source_repo,
+            {'pkg/app.py': 'def greet():\n    return "v2"\n\ndef helper():\n    return greet()\n'},
+        )
+        head_revision = commit_all(self.source_repo, 'v2')
+        self.assertIsNotNone(get_repo_analysis('owner/repo', head_revision))
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/diff/',
+                {'url': 'https://github.com/owner/repo', 'base': base_revision, 'head': head_revision},
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        diff = cast(dict[str, object], payload['diff'])
+        summary = cast(dict[str, object], diff['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(cast(dict[str, object], payload['base'])['revision'], base_revision)
+        self.assertEqual(cast(dict[str, object], payload['head'])['revision'], head_revision)
+        self.assertGreaterEqual(cast(int, summary['added_nodes']), 1)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_analysis_id_diff_compares_stored_artifacts(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        base_analysis = get_repo_analysis('owner/repo')
+        self.assertIsNotNone(base_analysis)
+        write_files(
+            self.source_repo,
+            {'pkg/app.py': 'def greet():\n    return "v2"\n\ndef helper():\n    return greet()\n'},
+        )
+        commit_all(self.source_repo, 'v2')
+        head_analysis = get_repo_analysis('owner/repo')
+        self.assertIsNotNone(head_analysis)
+        base_run = get_artifact_by_revision('owner/repo', cast(str, cast(dict[str, object], base_analysis)['revision']))
+        head_run = get_artifact_by_revision('owner/repo', cast(str, cast(dict[str, object], head_analysis)['revision']))
+        self.assertIsNotNone(base_run)
+        self.assertIsNotNone(head_run)
+        base_analysis_run = AnalysisRun.objects.get(revision=cast(dict[str, object], base_analysis)['revision'])
+        head_analysis_run = AnalysisRun.objects.get(revision=cast(dict[str, object], head_analysis)['revision'])
+
+        response = cast(HttpResponse, self.client.get(f'/api/analysis/{head_analysis_run.id}/diff/', {'base': base_analysis_run.id}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(cast(dict[str, object], payload['base'])['analysis_id'], base_analysis_run.id)
+        self.assertEqual(cast(dict[str, object], payload['head'])['analysis_id'], head_analysis_run.id)
+
+    def test_diff_endpoint_rejects_invalid_revision(self):
+        response = cast(HttpResponse, self.client.get('/api/diff/', {'url': 'https://github.com/owner/repo', 'base': '-abc123'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('base', payload)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_diff_endpoint_returns_404_for_missing_revision(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+
+        response = cast(HttpResponse, self.client.get('/api/diff/', {'url': 'https://github.com/owner/repo', 'base': 'deadbeef'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(payload['code'], 'revision_not_found')
+
+
 class SchemaRevisionDocumentationTests(TestCase):
     def test_schema_documents_revision_for_tree_graph_and_qa(self):
         response = cast(HttpResponse, self.client.get('/api/schema/'))
@@ -1762,6 +1997,8 @@ class SchemaRevisionDocumentationTests(TestCase):
 
         self.assertIn('/api/analysis/', schema_text)
         self.assertIn('/api/analysis/{analysis_id}/', schema_text)
+        self.assertIn('/api/analysis/{analysis_id}/diff/', schema_text)
+        self.assertIn('/api/diff/', schema_text)
         self.assertIn('/api/tree/', schema_text)
         self.assertIn('/api/graph/', schema_text)
         self.assertIn('/api/summary/', schema_text)
