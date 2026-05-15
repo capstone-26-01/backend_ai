@@ -5,6 +5,7 @@ import re
 
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
+UNSAFE_REF_PATTERN = re.compile(r'[\s\\~^:?*\[\]\x00-\x1f]')
 
 
 def _is_safe_repo_segment(segment: str) -> bool:
@@ -13,6 +14,16 @@ def _is_safe_repo_segment(segment: str) -> bool:
 
 def is_safe_revision(revision: str) -> bool:
     return bool(revision) and revision not in {'.', '..'} and REVISION_PATTERN.fullmatch(revision) is not None
+
+
+def is_safe_ref(ref: str) -> bool:
+    if not ref or len(ref) > 255:
+        return False
+    if ref.startswith(('/', '-')) or ref.endswith('/') or ref.endswith('.lock'):
+        return False
+    if '..' in ref or '@{' in ref or '//' in ref or UNSAFE_REF_PATTERN.search(ref):
+        return False
+    return all(part not in {'.', '..'} for part in ref.split('/'))
 
 
 def extract_repo_path(repo_url):

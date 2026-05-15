@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
 from rest_framework import serializers
 
-from github_repo.services import get_file_tree
+from github_repo.services import RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
 from .serializers import RepoUrlSerializer, QASerializer, is_safe_revision
 
@@ -16,6 +16,27 @@ api_services = importlib.import_module('api.services')
 
 def get_repo_analysis(repo_path: str, revision: str | None = None):
     return api_services.get_repo_analysis(repo_path, revision)
+
+
+def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
+    status_by_code = {
+        'invalid_repo_path': 400,
+        'unsafe_path': 400,
+        'repo_not_found': 404,
+        'private_repo': 404,
+        'timeout': 504,
+        'too_large': 413,
+        'git_error': 502,
+    }
+    logger.warning('Repo ingestion failed: %s', error.as_dict())
+    return Response(
+        {
+            'error': error.message,
+            'code': error.code,
+            'detail': error.as_dict(),
+        },
+        status=status_by_code.get(error.code, 502),
+    )
 
 
 @extend_schema(
@@ -41,7 +62,11 @@ def get_repo_file(request):
     repo_path = validated_data['repo_url']
     logger.info(f"파일트리 요청: {repo_path}")
 
-    files = get_file_tree(repo_path)
+    try:
+        files = get_file_tree_or_raise(repo_path)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+
     if not files:
         logger.error(f"레포 찾기 실패: {repo_path}")
         return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
@@ -78,7 +103,11 @@ def get_repo_tree(request):
         return Response({'revision': ['올바른 revision이 아닙니다']}, status=400)
     logger.info(f"트리 요청: {repo_path}")
 
-    analysis = get_repo_analysis(repo_path, revision)
+    try:
+        analysis = get_repo_analysis(repo_path, revision)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+
     if analysis is None:
         logger.error(f"레포 찾기 실패: {repo_path}")
         return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
@@ -117,7 +146,11 @@ def get_repo_graph(request):
         return Response({'revision': ['올바른 revision이 아닙니다']}, status=400)
     logger.info(f"그래프 요청: {repo_path}")
 
-    analysis = get_repo_analysis(repo_path, revision)
+    try:
+        analysis = get_repo_analysis(repo_path, revision)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+
     if analysis is None:
         logger.error(f"레포 찾기 실패: {repo_path}")
         return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
@@ -162,7 +195,11 @@ def qa(request):
     revision = validated_data.get('revision')
     logger.info(f"QA 요청: {repo_path} / 질문: {question}")
 
-    analysis = get_repo_analysis(repo_path, revision)
+    try:
+        analysis = get_repo_analysis(repo_path, revision)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+
     if analysis is None:
         logger.error(f"레포 찾기 실패: {repo_path}")
         return Response({'error': '레포를 찾을 수 없습니다'}, status=404)

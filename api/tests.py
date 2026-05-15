@@ -3,12 +3,23 @@ from pathlib import Path
 from unittest.mock import patch
 import importlib
 import json
+import subprocess
 import shutil
 
 from django.conf import settings
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
-from github_repo.services import get_file_content, get_file_tree, get_repo_revision, _repo_lock, _repo_lock_path
+from github_repo.services import (
+    RepoIngestionError,
+    get_file_content,
+    get_file_content_or_raise,
+    get_file_tree,
+    get_repo_revision,
+    get_repo_snapshot_or_raise,
+    _repo_lock,
+    _repo_lock_path,
+    _run_git,
+)
 from api.artifacts import (
     GRAPH_ARTIFACT_SCHEMA_VERSION,
     ArtifactValidationError,
@@ -16,7 +27,7 @@ from api.artifacts import (
     coerce_graph_artifact,
     validate_graph_artifact,
 )
-from api.serializers import extract_repo_path, is_safe_revision
+from api.serializers import extract_repo_path, is_safe_ref, is_safe_revision
 from api.services import get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
@@ -72,13 +83,24 @@ class WorkspaceSettingsTests(TestCase):
         self.assertFalse(settings.CSRF_COOKIE_SECURE)
         self.assertIn('testserver', settings.ALLOWED_HOSTS)
 
+    def test_repo_ingestion_limits_are_configured(self):
+        self.assertGreater(settings.GITHUB_REPO_GIT_TIMEOUT_SECONDS, 0)
+        self.assertGreater(settings.GITHUB_REPO_MAX_FILES, 0)
+        self.assertGreater(settings.GITHUB_REPO_MAX_PYTHON_FILES, 0)
+        self.assertGreater(settings.GITHUB_REPO_MAX_SINGLE_FILE_BYTES, 0)
+        self.assertGreater(settings.GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES, 0)
+
 
 class RepoUrlSerializerTests(TestCase):
     def test_extract_repo_path_accepts_owner_repo_only(self):
         self.assertEqual(extract_repo_path('https://github.com/owner/repo'), 'owner/repo')
 
+    def test_extract_repo_path_accepts_trailing_slash(self):
+        self.assertEqual(extract_repo_path('https://github.com/owner/repo/'), 'owner/repo')
+
     def test_extract_repo_path_rejects_extra_segments(self):
         self.assertIsNone(extract_repo_path('https://github.com/owner/repo/issues/1'))
+        self.assertIsNone(extract_repo_path('https://github.com/owner/repo/tree/main'))
 
     def test_extract_repo_path_rejects_non_github_hosts(self):
         self.assertIsNone(extract_repo_path('https://example.com/owner/repo'))
@@ -97,6 +119,16 @@ class RepoUrlSerializerTests(TestCase):
         self.assertFalse(is_safe_revision('..'))
         self.assertTrue(is_safe_revision('main'))
 
+    def test_ref_validator_allows_branch_like_refs_without_path_escape(self):
+        self.assertTrue(is_safe_ref('main'))
+        self.assertTrue(is_safe_ref('feature/safe-branch'))
+        self.assertTrue(is_safe_ref('refs/heads/dev'))
+        self.assertFalse(is_safe_ref('../main'))
+        self.assertFalse(is_safe_ref('feature//branch'))
+        self.assertFalse(is_safe_ref('feature branch'))
+        self.assertFalse(is_safe_ref('refs/heads/main.lock'))
+        self.assertFalse(is_safe_ref('main@{1}'))
+
 
 class ServicePathValidationTests(TestCase):
     def test_get_file_tree_rejects_repo_paths_with_extra_segments(self):
@@ -113,6 +145,10 @@ class ServicePathValidationTests(TestCase):
 
     def test_get_repo_analysis_rejects_repo_paths_with_spaces(self):
         self.assertIsNone(get_repo_analysis('owner/re po'))
+
+    def test_repo_snapshot_or_raise_maps_invalid_repo_path(self):
+        with self.assertRaisesRegex(RepoIngestionError, '올바른 repo 경로'):
+            get_repo_snapshot_or_raise('owner/repo/extra')
 
 
 class RepoLockCleanupTests(TestCase):
@@ -214,6 +250,131 @@ class LocalRepoWorkspaceTests(TestCase):
         )
         shutil.rmtree(first_repo, ignore_errors=True)
         shutil.rmtree(second_repo, ignore_errors=True)
+
+
+@override_settings(
+    TEMP_DIR=settings.BASE_DIR / 'temp' / 'safe-ingestion-tests',
+    PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'safe-ingestion-tests' / 'playground',
+)
+class SafeRepoIngestionTests(TestCase):
+    source_repo: Path = Path()
+
+    def setUp(self):
+        self.source_repo = settings.TEMP_DIR / 'source-repo'
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+
+    def test_git_timeout_is_mapped_to_repo_ingestion_error(self):
+        with patch('github_repo.services.subprocess.run') as run_mock:
+            run_mock.side_effect = subprocess.TimeoutExpired(['git', 'clone'], timeout=30)
+
+            with self.assertRaises(RepoIngestionError) as context:
+                get_repo_snapshot_or_raise('owner/repo')
+
+        self.assertEqual(context.exception.code, 'timeout')
+        self.assertEqual(context.exception.command_category, 'clone')
+        self.assertEqual(context.exception.metadata['timeout_seconds'], settings.GITHUB_REPO_GIT_TIMEOUT_SECONDS)
+
+    def test_git_error_sanitizes_tokenized_stderr_and_preserves_category(self):
+        with patch('github_repo.services.subprocess.run') as run_mock:
+            run_mock.side_effect = subprocess.CalledProcessError(
+                128,
+                ['git', 'clone'],
+                stderr='fatal: repository https://secret-token@github.com/owner/repo.git not found',
+            )
+
+            with self.assertRaises(RepoIngestionError) as context:
+                _run_git('clone', 'https://github.com/owner/repo.git', '/tmp/repo')
+
+        self.assertEqual(context.exception.code, 'repo_not_found')
+        self.assertEqual(context.exception.command_category, 'clone')
+        self.assertNotIn('secret-token', context.exception.stderr)
+
+    @override_settings(GITHUB_REPO_MAX_FILES=1)
+    @patch('github_repo.services._repo_clone_url')
+    def test_repo_file_count_limit_raises_too_large(self, repo_clone_url):
+        create_git_fixture_repo(
+            self.source_repo,
+            {
+                'README.md': '# demo\n',
+                'pkg/app.py': 'def app():\n    return "ok"\n',
+            },
+        )
+        repo_clone_url.return_value = str(self.source_repo)
+
+        with self.assertRaises(RepoIngestionError) as context:
+            get_repo_snapshot_or_raise('owner/repo')
+
+        self.assertEqual(context.exception.code, 'too_large')
+        self.assertEqual(context.exception.metadata['limit_type'], 'max_files')
+
+    @override_settings(GITHUB_REPO_MAX_PYTHON_FILES=1)
+    @patch('github_repo.services._repo_clone_url')
+    def test_python_file_count_limit_raises_too_large(self, repo_clone_url):
+        create_git_fixture_repo(
+            self.source_repo,
+            {
+                'pkg/one.py': 'def one():\n    return 1\n',
+                'pkg/two.py': 'def two():\n    return 2\n',
+            },
+        )
+        repo_clone_url.return_value = str(self.source_repo)
+
+        with self.assertRaises(RepoIngestionError) as context:
+            get_repo_snapshot_or_raise('owner/repo')
+
+        self.assertEqual(context.exception.code, 'too_large')
+        self.assertEqual(context.exception.metadata['limit_type'], 'max_python_files')
+
+    @override_settings(GITHUB_REPO_MAX_SINGLE_FILE_BYTES=12)
+    @patch('github_repo.services._repo_clone_url')
+    def test_large_single_file_limit_raises_too_large(self, repo_clone_url):
+        create_git_fixture_repo(
+            self.source_repo,
+            {'pkg/big.py': 'def big():\n    return "this is too large"\n'},
+        )
+        repo_clone_url.return_value = str(self.source_repo)
+        get_repo_snapshot_or_raise('owner/repo')
+
+        with self.assertRaises(RepoIngestionError) as context:
+            get_file_content_or_raise('owner/repo', 'pkg/big.py')
+
+        self.assertEqual(context.exception.code, 'too_large')
+        self.assertEqual(context.exception.metadata['limit_type'], 'max_single_file_bytes')
+
+    @override_settings(GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES=45)
+    @patch('github_repo.services._repo_clone_url')
+    def test_total_analyzed_python_bytes_limit_raises_too_large(self, repo_clone_url):
+        create_git_fixture_repo(
+            self.source_repo,
+            {
+                'pkg/one.py': 'def one():\n    return "1234567890"\n',
+                'pkg/two.py': 'def two():\n    return "abcdefghij"\n',
+            },
+        )
+        repo_clone_url.return_value = str(self.source_repo)
+
+        with self.assertRaises(RepoIngestionError) as context:
+            get_repo_analysis('owner/repo')
+
+        self.assertEqual(context.exception.code, 'too_large')
+        self.assertEqual(context.exception.metadata['limit_type'], 'max_total_analyzed_bytes')
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_origin_mismatch_is_cleaned_before_clone(self, repo_clone_url):
+        create_git_fixture_repo(self.source_repo, {'pkg/app.py': 'def app():\n    return "source"\n'})
+        wrong_checkout = settings.PLAYGROUND_DIR / 'owner' / 'repo'
+        create_git_fixture_repo(wrong_checkout, {'pkg/app.py': 'def app():\n    return "wrong"\n'})
+        repo_clone_url.return_value = str(self.source_repo)
+
+        files = get_file_tree('owner/repo')
+
+        self.assertEqual(files, ['pkg/app.py'])
+        self.assertEqual(get_file_content('owner/repo', 'pkg/app.py'), 'def app():\n    return "source"\n')
 
 
 class ParserGraphTests(TestCase):
@@ -583,7 +744,8 @@ class AnalysisArtifactServiceTests(TestCase):
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
-    def test_get_repo_analysis_caches_graph_payload(self, get_repo_snapshot_mock, parse_repo_mock):
+    @patch('api.services.get_file_content_or_raise', return_value='def main():\n    pass\n')
+    def test_get_repo_analysis_caches_graph_payload(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
         get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
         parse_repo_mock.return_value = {
             'tree': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'children': []}],
@@ -601,7 +763,8 @@ class AnalysisArtifactServiceTests(TestCase):
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
-    def test_get_repo_analysis_returns_v1_artifact_without_breaking_graph_aliases(self, get_repo_snapshot_mock, parse_repo_mock):
+    @patch('api.services.get_file_content_or_raise', return_value='def main():\n    pass\n')
+    def test_get_repo_analysis_returns_v1_artifact_without_breaking_graph_aliases(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
         get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
         parse_repo_mock.return_value = {
             'tree': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'children': []}],
@@ -627,7 +790,8 @@ class AnalysisArtifactServiceTests(TestCase):
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
-    def test_get_repo_analysis_refreshes_cache_for_new_revision(self, get_repo_snapshot_mock, parse_repo_mock):
+    @patch('api.services.get_file_content_or_raise', return_value='def main():\n    pass\n')
+    def test_get_repo_analysis_refreshes_cache_for_new_revision(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
         get_repo_snapshot_mock.side_effect = [('abc123', ['pkg/app.py']), ('def456', ['pkg/app.py'])]
         parse_repo_mock.side_effect = [
             {
@@ -658,7 +822,8 @@ class AnalysisArtifactServiceTests(TestCase):
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
-    def test_get_repo_analysis_uses_single_snapshot_per_call(self, get_repo_snapshot_mock, parse_repo_mock):
+    @patch('api.services.get_file_content_or_raise', return_value='def main():\n    pass\n')
+    def test_get_repo_analysis_uses_single_snapshot_per_call(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
         get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
         parse_repo_mock.return_value = {
             'tree': [],
@@ -698,6 +863,34 @@ class AnalysisArtifactServiceTests(TestCase):
 
 
 class AnalysisEndpointReuseTests(TestCase):
+    @patch('api.views.get_file_tree_or_raise')
+    def test_repo_endpoint_maps_ingestion_timeout_to_json_error(self, get_file_tree_mock):
+        get_file_tree_mock.side_effect = RepoIngestionError('timeout', 'Git 명령 시간이 초과되었습니다.', command_category='clone')
+
+        response = cast(HttpResponse, self.client.get('/api/repo/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(payload['code'], 'timeout')
+        self.assertEqual(payload['error'], 'Git 명령 시간이 초과되었습니다.')
+
+    @patch('api.views.get_repo_analysis')
+    def test_graph_endpoint_maps_repo_too_large_to_json_error(self, get_repo_analysis_mock):
+        get_repo_analysis_mock.side_effect = RepoIngestionError(
+            'too_large',
+            '레포 파일 수가 허용 한도를 초과했습니다.',
+            metadata={'limit_type': 'max_files'},
+        )
+
+        response = cast(HttpResponse, self.client.get('/api/graph/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(payload['code'], 'too_large')
+        detail = cast(dict[str, object], payload['detail'])
+        metadata = cast(dict[str, object], detail['metadata'])
+        self.assertEqual(metadata['limit_type'], 'max_files')
+
     @patch('api.views.get_repo_analysis')
     def test_tree_endpoint_uses_cached_analysis(self, get_repo_analysis_mock):
         get_repo_analysis_mock.return_value = {

@@ -9,7 +9,7 @@ from django.conf import settings
 
 from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
 from api.serializers import is_safe_revision, _is_safe_repo_segment
-from github_repo.services import get_file_content, get_repo_snapshot
+from github_repo.services import RepoIngestionError, get_file_content_or_raise, get_repo_snapshot_or_raise as get_repo_snapshot
 from parser.services import parse_repo
 
 
@@ -51,6 +51,10 @@ def _read_analysis_artifact(artifact_path) -> dict[str, Any]:
     return analysis
 
 
+def _max_total_analyzed_bytes() -> int:
+    return int(getattr(settings, 'GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES', 5_000_000))
+
+
 def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
     try:
         _analysis_parts(repo_path)
@@ -77,11 +81,25 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
         return _read_analysis_artifact(artifact_path)
 
     python_files = [file_path for file_path in files if file_path.endswith('.py')]
-    file_contents = {
-        file_path: content
-        for file_path in python_files
-        if (content := get_file_content(repo_path, file_path, revision)) is not None
-    }
+    file_contents = {}
+    total_analyzed_bytes = 0
+    max_total_analyzed_bytes = _max_total_analyzed_bytes()
+    for file_path in python_files:
+        content = get_file_content_or_raise(repo_path, file_path, revision)
+        if content is None:
+            continue
+        total_analyzed_bytes += len(content.encode('utf-8'))
+        if total_analyzed_bytes > max_total_analyzed_bytes:
+            raise RepoIngestionError(
+                'too_large',
+                '분석 대상 Python 코드 총량이 허용 한도를 초과했습니다.',
+                metadata={
+                    'limit': max_total_analyzed_bytes,
+                    'actual': total_analyzed_bytes,
+                    'limit_type': 'max_total_analyzed_bytes',
+                },
+            )
+        file_contents[file_path] = content
 
     graph = parse_repo(repo_path, python_files, lambda _repo_path, file_path: file_contents.get(file_path))
     analysis = build_graph_artifact(
