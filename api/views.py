@@ -6,6 +6,7 @@ from typing import Any, cast
 from django.http import HttpResponse
 from django.views.decorators.clickjacking import xframe_options_exempt
 from rest_framework.decorators import api_view
+from rest_framework.decorators import throttle_classes
 from rest_framework.response import Response
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
@@ -13,6 +14,7 @@ from rest_framework import serializers
 
 from github_repo.services import RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
+from .throttles import ShareCreateRateThrottle
 from .serializers import (
     AnalysisDiffRequestSerializer,
     AnalysisRequestSerializer,
@@ -329,6 +331,7 @@ def graph_diff(request):
     responses={201: _SHARE_RESPONSE_SCHEMA},
 )
 @api_view(['POST'])
+@throttle_classes([ShareCreateRateThrottle])
 def share(request):
     serializer = ShareCreateSerializer(data=request.data)
     if not serializer.is_valid():

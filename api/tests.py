@@ -8,6 +8,7 @@ import subprocess
 import shutil
 
 from django.conf import settings
+from django.core.cache import cache
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -731,6 +732,26 @@ class ParserRelationshipEntrypointTests(TestCase):
         self.assertIn('web_route', entrypoint_kinds)
         self.assertIn('module::service.api', key_module_ids)
         self.assertTrue(entrypoint_edges)
+
+    def test_flask_route_decorator_is_reported_as_web_route_entrypoint(self):
+        files = ['web/app.py']
+        file_contents = {
+            'web/app.py': (
+                'from flask import Flask\n\n'
+                'app = Flask(__name__)\n\n'
+                '@app.route("/")\n'
+                'def index():\n'
+                '    return "ok"\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        entrypoints = {
+            (entrypoint['id'], entrypoint['kind'])
+            for entrypoint in graph['entrypoints']
+        }
+
+        self.assertIn(('web/app.py::index', 'web_route'), entrypoints)
 
 
 @override_settings(
@@ -1759,6 +1780,29 @@ class SummaryEndpointTests(TestCase):
         self.assertIn('pkg/app.py', summary['source_files'])
 
     @patch('llm.summaries._generate_answer')
+    def test_node_summary_endpoint_can_explain_file_node(self, generate_answer):
+        generate_answer.return_value = 'app.py 파일 설명입니다.'
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/node-summary/',
+                {
+                    'analysis_id': self.analysis_run.id,
+                    'node_id': 'pkg/app.py',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        summary = cast(dict[str, object], payload['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(summary['kind'], 'node')
+        self.assertEqual(summary['target_id'], 'pkg/app.py')
+        self.assertIn('pkg/app.py', summary['source_nodes'])
+        self.assertIn('pkg/app.py', summary['source_files'])
+
+    @patch('llm.summaries._generate_answer')
     def test_node_summary_missing_node_returns_400(self, generate_answer):
         response = cast(
             HttpResponse,
@@ -2012,6 +2056,7 @@ class ShareEmbedPublicApiTests(TestCase):
         create_git_fixture_repo(self.source_repo, {'pkg/app.py': 'def greet():\n    return "v1"\n'}, commit_message='v1')
 
     def tearDown(self):
+        cache.clear()
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
 
     def _clone_url(self) -> str:
@@ -2139,6 +2184,18 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertNotEqual(first['share_id'], second['share_id'])
         self.assertFalse(cast(str, first['share_id']).isdigit())
         self.assertFalse(cast(str, second['share_id']).isdigit())
+
+    @override_settings(SHARE_CREATE_THROTTLE_RATE='1/min')
+    @patch('github_repo.services._repo_clone_url')
+    def test_share_create_has_minimal_anonymous_throttle(self, repo_clone_url):
+        cache.clear()
+        repo_clone_url.return_value = self._clone_url()
+
+        first = self._create_share()
+        second = self._create_share()
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 429)
 
     @patch('github_repo.services._repo_clone_url')
     def test_latest_share_rejects_revision(self, repo_clone_url):
