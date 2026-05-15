@@ -1771,3 +1771,4 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('analysis_id', schema_text)
         self.assertIn('selected_node_id', schema_text)
         self.assertIn('context_summary', schema_text)
+        self.assertIn('tool_trace', schema_text)

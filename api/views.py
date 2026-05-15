@@ -367,6 +367,7 @@ def node_summary(request):
             'selected_nodes': serializers.ListField(child=serializers.CharField()),
             'context_files': serializers.ListField(child=serializers.CharField()),
             'context_summary': serializers.JSONField(),
+            'tool_trace': serializers.JSONField(),
             'warnings': serializers.JSONField(),
         },
     ),
