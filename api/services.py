@@ -153,6 +153,99 @@ def get_artifact_by_revision(repo_path: str, revision: str) -> dict[str, Any] | 
     return artifact.payload
 
 
+def get_analysis_run_by_revision(repo_path: str, revision: str) -> AnalysisRun | None:
+    try:
+        _analysis_parts(repo_path)
+    except ValueError:
+        return None
+    if not is_safe_revision(revision):
+        return None
+
+    return (
+        AnalysisRun.objects
+        .select_related('repository')
+        .filter(
+            repository__provider='github',
+            repository__full_name=repo_path,
+            revision=revision,
+            status=AnalysisRun.STATUS_SUCCEEDED,
+        )
+        .order_by('-finished_at', '-started_at')
+        .first()
+    )
+
+
+def build_analysis_response(payload: dict[str, Any], analysis_run: AnalysisRun | None = None) -> dict[str, Any]:
+    return {
+        'analysis_id': analysis_run.id if analysis_run is not None else None,
+        'repo': payload['repo'],
+        'revision': payload['revision'],
+        'status': analysis_run.status if analysis_run is not None else payload.get('status', 'succeeded'),
+        'artifact': payload,
+        'warnings': payload.get('warnings', []),
+    }
+
+
+def build_tree_response(payload: dict[str, Any], analysis_run: AnalysisRun | None = None) -> dict[str, Any]:
+    return {
+        'analysis_id': analysis_run.id if analysis_run is not None else None,
+        'repo': payload['repo'],
+        'revision': payload['revision'],
+        'tree': payload['tree'],
+        'warnings': payload.get('warnings', []),
+    }
+
+
+def build_graph_response(payload: dict[str, Any], analysis_run: AnalysisRun | None = None) -> dict[str, Any]:
+    return {
+        'analysis_id': analysis_run.id if analysis_run is not None else None,
+        'repo': payload['repo'],
+        'revision': payload['revision'],
+        'nodes': payload['nodes'],
+        'edges': payload['edges'],
+        'entrypoints': payload.get('entrypoints', []),
+        'key_modules': payload.get('key_modules', []),
+        'warnings': payload.get('warnings', []),
+    }
+
+
+def get_analysis_response(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
+    payload = get_repo_analysis(repo_path, revision)
+    if payload is None:
+        return None
+    analysis_run = get_analysis_run_by_revision(repo_path, str(payload['revision']))
+    return build_analysis_response(payload, analysis_run)
+
+
+def get_analysis_response_by_id(analysis_id: int) -> dict[str, Any] | None:
+    analysis_run = (
+        AnalysisRun.objects
+        .select_related('repository')
+        .filter(id=analysis_id)
+        .first()
+    )
+    if analysis_run is None:
+        return None
+    if analysis_run.status != AnalysisRun.STATUS_SUCCEEDED:
+        return {
+            'analysis_id': analysis_run.id,
+            'repo': analysis_run.repository.full_name,
+            'revision': analysis_run.revision,
+            'status': analysis_run.status,
+            'artifact': None,
+            'warnings': [],
+            'error': {
+                'code': analysis_run.error_code,
+                'message': analysis_run.error_message,
+            },
+        }
+    try:
+        artifact = analysis_run.artifact
+    except AnalysisArtifact.DoesNotExist:
+        return None
+    return build_analysis_response(artifact.payload, analysis_run)
+
+
 def _persist_succeeded_artifact(repo_path: str, payload: dict[str, Any]) -> dict[str, Any]:
     revision = str(payload['revision'])
     existing_payload = get_artifact_by_revision(repo_path, revision)

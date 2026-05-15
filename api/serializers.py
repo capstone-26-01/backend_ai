@@ -55,6 +55,15 @@ class RepoUrlSerializer(serializers.Serializer):
         return repo_path  # 검증 후 repo_path로 변환해서 반환
 
 
+class AnalysisRequestSerializer(RepoUrlSerializer):
+    revision = serializers.CharField(required=False)
+
+    def validate_revision(self, value):
+        if not is_safe_revision(value):
+            raise serializers.ValidationError('올바른 revision이 아닙니다')
+        return value
+
+
 class QASerializer(serializers.Serializer):
     repo_url = serializers.CharField()
     question = serializers.CharField()

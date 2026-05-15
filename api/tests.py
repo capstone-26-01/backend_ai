@@ -62,6 +62,7 @@ class DocsEndpointsTests(TestCase):
         self.assertIn('openapi', payload)
         self.assertIn('paths', payload)
         self.assertIn('/api/repo/', paths)
+        self.assertIn('/api/analysis/', paths)
         self.assertIn('/api/qa/', paths)
 
     def test_swagger_docs_endpoint_renders_ui(self):
@@ -1173,14 +1174,17 @@ class AnalysisEndpointReuseTests(TestCase):
             'tree': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'children': []}],
             'nodes': [],
             'edges': [],
+            'warnings': [{'code': 'demo', 'path': 'pkg/app.py'}],
         }
 
         response = cast(HttpResponse, self.client.get('/api/tree/', {'url': 'https://github.com/owner/repo'}))
         payload = cast(dict[str, object], json.loads(response.content))
 
         self.assertEqual(response.status_code, 200)
+        self.assertIsNone(payload['analysis_id'])
         self.assertEqual(payload['revision'], 'abc123')
         self.assertEqual(cast(list[dict[str, object]], payload['tree'])[0]['id'], 'pkg/app.py')
+        self.assertEqual(payload['warnings'], [{'code': 'demo', 'path': 'pkg/app.py'}])
 
     @patch('api.views.get_repo_analysis')
     def test_graph_endpoint_uses_cached_analysis(self, get_repo_analysis_mock):
@@ -1190,15 +1194,22 @@ class AnalysisEndpointReuseTests(TestCase):
             'tree': [],
             'nodes': [{'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'file': 'pkg/app.py'}],
             'edges': [{'id': 'e1', 'source': 'pkg/app.py', 'target': 'pkg/app.py::main', 'type': 'contains', 'file': 'pkg/app.py'}],
+            'entrypoints': [{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}],
+            'key_modules': [{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 3}],
+            'warnings': [{'code': 'demo', 'path': 'pkg/app.py'}],
         }
 
         response = cast(HttpResponse, self.client.get('/api/graph/', {'url': 'https://github.com/owner/repo'}))
         payload = cast(dict[str, object], json.loads(response.content))
 
         self.assertEqual(response.status_code, 200)
+        self.assertIsNone(payload['analysis_id'])
         self.assertEqual(payload['revision'], 'abc123')
         self.assertEqual(cast(list[dict[str, object]], payload['nodes'])[0]['id'], 'pkg/app.py')
         self.assertEqual(cast(list[dict[str, object]], payload['edges'])[0]['id'], 'e1')
+        self.assertEqual(payload['entrypoints'], [{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}])
+        self.assertEqual(payload['key_modules'], [{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 3}])
+        self.assertEqual(payload['warnings'], [{'code': 'demo', 'path': 'pkg/app.py'}])
 
     @patch('api.views.answer_question')
     @patch('api.views.get_repo_analysis')
@@ -1228,6 +1239,208 @@ class AnalysisEndpointReuseTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['answer'], 'builder.py에서 처리합니다.')
         self.assertEqual(payload['citations'], ['sample_pkg/factory.py'])
+
+
+@override_settings(
+    TEMP_DIR=settings.BASE_DIR / 'temp' / 'analysis-endpoint-tests',
+    PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'analysis-endpoint-tests' / 'playground',
+)
+class AnalysisEndpointVerticalSliceTests(TestCase):
+    source_repo: Path = Path()
+
+    def setUp(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
+        self.source_repo = settings.TEMP_DIR / 'source-repo'
+        create_git_fixture_repo(
+            self.source_repo,
+            {
+                'pkg/app.py': (
+                    'def main():\n'
+                    '    return "ok"\n'
+                ),
+                'README.md': '# demo\n',
+            },
+            commit_message='init',
+        )
+
+    def tearDown(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_post_analysis_returns_artifact_with_analysis_id(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        artifact = cast(dict[str, object], payload['artifact'])
+        node_ids = {node['id'] for node in cast(list[dict[str, object]], artifact['nodes'])}
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(payload['analysis_id'], int)
+        self.assertEqual(payload['repo'], 'owner/repo')
+        self.assertEqual(payload['status'], AnalysisRun.STATUS_SUCCEEDED)
+        self.assertEqual(artifact['repo'], 'owner/repo')
+        self.assertIn('module::pkg.app', node_ids)
+        self.assertIn('pkg/app.py::main', node_ids)
+        self.assertEqual(Repository.objects.count(), 1)
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 1)
+        self.assertEqual(AnalysisArtifact.objects.count(), 1)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_same_revision_returns_cached_analysis_run(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+
+        first = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        second = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        first_payload = cast(dict[str, object], json.loads(first.content))
+        second_payload = cast(dict[str, object], json.loads(second.content))
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first_payload['analysis_id'], second_payload['analysis_id'])
+        self.assertEqual(first_payload['revision'], second_payload['revision'])
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 1)
+        self.assertEqual(AnalysisArtifact.objects.count(), 1)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_get_analysis_can_pin_cached_revision(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+        created = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        created_payload = cast(dict[str, object], json.loads(created.content))
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/analysis/',
+                {
+                    'url': 'https://github.com/owner/repo',
+                    'revision': created_payload['revision'],
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['analysis_id'], created_payload['analysis_id'])
+        self.assertEqual(payload['revision'], created_payload['revision'])
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_tree_and_graph_endpoints_reuse_analysis_artifact(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+        created = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        created_payload = cast(dict[str, object], json.loads(created.content))
+        artifact = cast(dict[str, object], created_payload['artifact'])
+        query = {
+            'url': 'https://github.com/owner/repo',
+            'revision': created_payload['revision'],
+        }
+
+        tree_response = cast(HttpResponse, self.client.get('/api/tree/', query))
+        graph_response = cast(HttpResponse, self.client.get('/api/graph/', query))
+        tree_payload = cast(dict[str, object], json.loads(tree_response.content))
+        graph_payload = cast(dict[str, object], json.loads(graph_response.content))
+
+        self.assertEqual(tree_response.status_code, 200)
+        self.assertEqual(graph_response.status_code, 200)
+        self.assertEqual(tree_payload['analysis_id'], created_payload['analysis_id'])
+        self.assertEqual(graph_payload['analysis_id'], created_payload['analysis_id'])
+        self.assertEqual(tree_payload['tree'], artifact['tree'])
+        self.assertEqual(graph_payload['nodes'], artifact['nodes'])
+        self.assertEqual(graph_payload['edges'], artifact['edges'])
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_get_analysis_detail_returns_stored_artifact(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+        created = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        created_payload = cast(dict[str, object], json.loads(created.content))
+        analysis_id = created_payload['analysis_id']
+
+        response = cast(HttpResponse, self.client.get(f'/api/analysis/{analysis_id}/'))
+        payload = cast(dict[str, object], json.loads(response.content))
+        artifact = cast(dict[str, object], payload['artifact'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['analysis_id'], analysis_id)
+        self.assertEqual(artifact['revision'], created_payload['revision'])
+
+    def test_analysis_endpoint_rejects_invalid_url(self):
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://example.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('repo_url', payload)
+
+    @patch('api.views.get_analysis_response')
+    def test_analysis_endpoint_maps_repo_too_large_error(self, get_analysis_response_mock):
+        get_analysis_response_mock.side_effect = RepoIngestionError(
+            'too_large',
+            '레포 파일 수가 허용 한도를 초과했습니다.',
+            metadata={'limit_type': 'max_files'},
+        )
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/analysis/',
+                data={'repo_url': 'https://github.com/owner/repo'},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(payload['code'], 'too_large')
 
 
 @override_settings(
@@ -1324,6 +1537,8 @@ class SchemaRevisionDocumentationTests(TestCase):
         response = cast(HttpResponse, self.client.get('/api/schema/'))
         schema_text = response.content.decode('utf-8')
 
+        self.assertIn('/api/analysis/', schema_text)
+        self.assertIn('/api/analysis/{analysis_id}/', schema_text)
         self.assertIn('/api/tree/', schema_text)
         self.assertIn('/api/graph/', schema_text)
         self.assertIn('/api/qa/', schema_text)
