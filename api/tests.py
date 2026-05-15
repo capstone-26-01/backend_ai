@@ -404,7 +404,8 @@ class ParserGraphTests(TestCase):
         edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
 
         self.assertIn('module::pkg.utils', nodes_by_id)
-        self.assertIn(('pkg/models.py', 'pkg/models.py::Child', 'contains'), edges)
+        self.assertIn(('pkg/models.py', 'module::pkg.models', 'contains'), edges)
+        self.assertIn(('module::pkg.models', 'pkg/models.py::Child', 'contains'), edges)
         self.assertIn(('pkg/models.py::Child', 'pkg/models.py::Child::run', 'contains'), edges)
         self.assertIn(('pkg/models.py', 'module::pkg.utils', 'imports'), edges)
         self.assertIn(('pkg/models.py::Child', 'pkg/models.py::Base', 'inherits'), edges)
@@ -497,6 +498,101 @@ class ParserGraphTests(TestCase):
         edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
 
         self.assertNotIn(('app.py::outer', 'app.py::helper', 'calls'), edges)
+
+
+class ParserDirectorySymbolTests(TestCase):
+    def test_parse_repo_builds_directory_tree_and_unsupported_file_nodes(self):
+        files = ['README.md', 'pkg/app.py', 'pkg/nested/util.py']
+        file_contents = {
+            'pkg/app.py': 'def main():\n    return "ok"\n',
+            'pkg/nested/util.py': 'def helper():\n    return "ok"\n',
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents.get(path))
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+        tree_ids = json.dumps(graph['tree'], ensure_ascii=False)
+
+        self.assertIn('pkg', nodes_by_id)
+        self.assertIn('pkg/nested', nodes_by_id)
+        self.assertIn('README.md', nodes_by_id)
+        self.assertIn('module::pkg.app', nodes_by_id)
+        self.assertTrue(cast(dict[str, object], nodes_by_id['README.md']['metadata'])['unsupported'])
+        self.assertIn(('pkg', 'pkg/app.py', 'contains'), edges)
+        self.assertIn(('pkg/nested', 'pkg/nested/util.py', 'contains'), edges)
+        self.assertIn('module::pkg.app', tree_ids)
+        self.assertIn('README.md', tree_ids)
+
+    def test_python_symbols_include_line_decorator_and_docstring_metadata(self):
+        files = ['app.py']
+        file_contents = {
+            'app.py': (
+                '@app.get("/users")\n'
+                'def route():\n'
+                '    """Serve users."""\n'
+                '    return "ok"\n\n'
+                'class User:\n'
+                '    """User model."""\n'
+                '    @property\n'
+                '    def name(self):\n'
+                '        """Display name."""\n'
+                '        return "Ada"\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+
+        route = nodes_by_id['app.py::route']
+        user = nodes_by_id['app.py::User']
+        method = nodes_by_id['app.py::User::name']
+
+        self.assertEqual(route['type'], 'function')
+        self.assertEqual(route['start_line'], 2)
+        self.assertEqual(cast(dict[str, object], route['metadata'])['decorators'], ['app.get("/users")'])
+        self.assertEqual(cast(dict[str, object], route['metadata'])['docstring'], 'Serve users.')
+        self.assertEqual(user['type'], 'class')
+        self.assertEqual(cast(dict[str, object], user['metadata'])['docstring'], 'User model.')
+        self.assertEqual(method['type'], 'method')
+        self.assertEqual(method['parent'], 'app.py::User')
+        self.assertEqual(cast(dict[str, object], method['metadata'])['decorators'], ['property'])
+        self.assertEqual(cast(dict[str, object], method['metadata'])['docstring'], 'Display name.')
+
+    def test_syntax_error_file_adds_warning_and_does_not_stop_repo_parse(self):
+        files = ['bad.py', 'good.py']
+        file_contents = {
+            'bad.py': 'def broken(:\n    pass\n',
+            'good.py': 'def ok():\n    return True\n',
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        node_ids = {node['id'] for node in graph['nodes']}
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+        warnings = graph['warnings']
+
+        self.assertIn('bad.py', node_ids)
+        self.assertIn('module::bad', node_ids)
+        self.assertIn('good.py::ok', node_ids)
+        self.assertFalse(cast(dict[str, object], nodes_by_id['bad.py']['metadata'])['analyzed'])
+        self.assertEqual(warnings[0]['code'], 'syntax_error')
+        self.assertEqual(warnings[0]['path'], 'bad.py')
+
+    def test_parse_repo_ordering_is_deterministic(self):
+        files = ['b.py', 'a.py']
+        file_contents = {
+            'a.py': 'def alpha():\n    return 1\n',
+            'b.py': 'def beta():\n    return alpha()\n',
+        }
+
+        first = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        second = parse_repo('owner/repo', list(reversed(files)), lambda _repo, path: file_contents[path])
+
+        self.assertEqual([node['id'] for node in first['nodes']], [node['id'] for node in second['nodes']])
+        self.assertEqual(
+            [(edge['id'], edge['source'], edge['target'], edge['type']) for edge in first['edges']],
+            [(edge['id'], edge['source'], edge['target'], edge['type']) for edge in second['edges']],
+        )
+        self.assertEqual(first['tree'], second['tree'])
 
 
 @override_settings(

@@ -186,7 +186,7 @@ GOLDEN_FIXTURE_REPOS: dict[str, GoldenFixtureRepo] = {
             ),
         },
         expected_nodes=('src/사용자.py::build_user',),
-        expected_edges=(('src/사용자.py', 'src/사용자.py::build_user', 'contains'),),
+        expected_edges=(('module::src.사용자', 'src/사용자.py::build_user', 'contains'),),
         rubric_tags=('graph_node_recall', 'qa_citation_correctness'),
     ),
 }
