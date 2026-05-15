@@ -2201,8 +2201,12 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertIn('<svg', svg_text)
         self.assertIn('GitStarter dynamic codebase graph', svg_text)
         self.assertIn('owner/repo', svg_text)
-        self.assertIn('greet', svg_text)
+        self.assertIn('app.py', svg_text)
         self.assertNotIn('return "v1"', svg_text)
+
+        head_response = cast(HttpResponse, self.client.head(f'/api/share/{create_payload["share_id"]}/graph.svg'))
+        self.assertEqual(head_response.status_code, 200)
+        self.assertIn('image/svg+xml', head_response.headers.get('Content-Type', ''))
 
     @patch('github_repo.services._repo_clone_url')
     def test_share_id_is_not_sequential(self, repo_clone_url):

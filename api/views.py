@@ -422,7 +422,7 @@ def share_detail(request, share_id: str):
     ],
     responses={200: OpenApiTypes.STR},
 )
-@api_view(['GET'])
+@api_view(['GET', 'HEAD'])
 def share_graph_svg(request, share_id: str):
     if not is_safe_share_id(share_id):
         return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
