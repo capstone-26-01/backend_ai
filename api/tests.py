@@ -27,8 +27,9 @@ from api.artifacts import (
     coerce_graph_artifact,
     validate_graph_artifact,
 )
+from api.models import AnalysisArtifact, AnalysisRun, Repository
 from api.serializers import extract_repo_path, is_safe_ref, is_safe_revision
-from api.services import get_repo_analysis
+from api.services import get_artifact_by_revision, get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
     GOLDEN_FIXTURE_REPOS,
@@ -42,6 +43,7 @@ from parser.services import parse_repo
 import yaml
 
 get_repo_analysis = importlib.import_module('api.services').get_repo_analysis
+get_artifact_by_revision = importlib.import_module('api.services').get_artifact_by_revision
 
 
 class DocsEndpointsTests(TestCase):
@@ -760,6 +762,14 @@ class AnalysisArtifactServiceTests(TestCase):
         self.assertTrue(artifact_path.is_file())
         self.assertEqual(first, second)
         parse_repo_mock.assert_called_once()
+        self.assertEqual(Repository.objects.count(), 1)
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 1)
+        self.assertEqual(AnalysisArtifact.objects.count(), 1)
+        artifact = AnalysisArtifact.objects.select_related('analysis_run').get()
+        self.assertEqual(artifact.analysis_run.repository.full_name, 'owner/repo')
+        self.assertEqual(artifact.analysis_run.revision, 'abc123')
+        self.assertEqual(artifact.node_count, 1)
+        self.assertEqual(artifact.edge_count, 0)
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
@@ -819,6 +829,8 @@ class AnalysisArtifactServiceTests(TestCase):
         second_analysis = cast(dict[str, object], second)
         self.assertNotEqual(first_analysis['revision'], second_analysis['revision'])
         self.assertEqual(parse_repo_mock.call_count, 2)
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 2)
+        self.assertEqual(AnalysisArtifact.objects.count(), 2)
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
@@ -850,6 +862,36 @@ class AnalysisArtifactServiceTests(TestCase):
         get_repo_snapshot_mock.assert_not_called()
         cached_payload = json.loads(artifact_path.read_text(encoding='utf-8'))
         self.assertEqual(cached_payload['schema_version'], GRAPH_ARTIFACT_SCHEMA_VERSION)
+        self.assertIsNotNone(get_artifact_by_revision('owner/repo', 'abc123'))
+
+    @patch('api.services.parse_repo')
+    @patch('api.services.get_repo_snapshot')
+    @patch('api.services.get_file_content_or_raise')
+    def test_failed_analysis_stores_failed_run(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
+        get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
+        get_file_content_mock.side_effect = RepoIngestionError('too_large', '분석 대상 파일이 허용 크기를 초과했습니다.')
+
+        with self.assertRaises(RepoIngestionError):
+            get_repo_analysis('owner/repo')
+
+        parse_repo_mock.assert_not_called()
+        failed_run = AnalysisRun.objects.get(status=AnalysisRun.STATUS_FAILED)
+        self.assertEqual(failed_run.repository.full_name, 'owner/repo')
+        self.assertEqual(failed_run.revision, 'abc123')
+        self.assertEqual(failed_run.error_code, 'too_large')
+        self.assertEqual(AnalysisArtifact.objects.count(), 0)
+
+    @patch('api.services.get_repo_snapshot')
+    def test_snapshot_failure_stores_failed_run_without_revision(self, get_repo_snapshot_mock):
+        get_repo_snapshot_mock.side_effect = RepoIngestionError('timeout', 'Git 명령 시간이 초과되었습니다.')
+
+        with self.assertRaises(RepoIngestionError):
+            get_repo_analysis('owner/repo')
+
+        failed_run = AnalysisRun.objects.get(status=AnalysisRun.STATUS_FAILED)
+        self.assertEqual(failed_run.repository.full_name, 'owner/repo')
+        self.assertEqual(failed_run.revision, '')
+        self.assertEqual(failed_run.error_code, 'timeout')
 
     def test_get_repo_analysis_rejects_unsafe_cached_revision(self):
         self.assertIsNone(get_repo_analysis('owner/repo', '../../escaped'))
@@ -997,6 +1039,24 @@ class RevisionPinnedApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         called_analysis = answer_question_mock.call_args.args[1]
         self.assertEqual(called_analysis['revision'], revision)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_pinned_artifact_loads_from_db_after_temp_and_playground_cleanup(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+        analysis = get_repo_analysis('owner/repo')
+        self.assertIsNotNone(analysis)
+        revision = cast(dict[str, object], analysis)['revision']
+        self.assertIsNotNone(get_artifact_by_revision('owner/repo', cast(str, revision)))
+
+        shutil.rmtree(settings.TEMP_DIR / 'analysis', ignore_errors=True)
+        shutil.rmtree(settings.PLAYGROUND_DIR, ignore_errors=True)
+
+        cached_analysis = get_repo_analysis('owner/repo', cast(str, revision))
+
+        self.assertIsNotNone(cached_analysis)
+        cached_payload = cast(dict[str, object], cached_analysis)
+        self.assertEqual(cached_payload['revision'], revision)
+        self.assertEqual(cached_payload['file_contents'], {'pkg/app.py': 'def greet():\n    return "v1"\n'})
 
     def test_tree_endpoint_rejects_unsafe_revision(self):
         response = cast(HttpResponse, self.client.get('/api/tree/', {'url': 'https://github.com/owner/repo', 'revision': '../../escaped'}))
