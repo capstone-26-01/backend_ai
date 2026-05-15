@@ -1,4 +1,5 @@
 from typing import cast
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 import importlib
@@ -9,6 +10,7 @@ import shutil
 from django.conf import settings
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from github_repo.services import (
     RepoIngestionError,
     get_file_content,
@@ -28,8 +30,8 @@ from api.artifacts import (
     validate_graph_artifact,
 )
 from api.diff import compare_graph_artifacts
-from api.models import AnalysisArtifact, AnalysisRun, Repository
-from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision
+from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
+from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision, is_safe_share_id
 from api.services import get_artifact_by_revision, get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
@@ -140,6 +142,11 @@ class RepoUrlSerializerTests(TestCase):
         self.assertTrue(is_safe_graph_id('module::pkg.app'))
         self.assertFalse(is_safe_graph_id('../pkg/app.py::run'))
         self.assertFalse(is_safe_graph_id('pkg/app.py::bad id'))
+
+    def test_share_id_validator_accepts_urlsafe_tokens_only(self):
+        self.assertTrue(is_safe_share_id('abcdefghijklmnopqrstuvwxyz_123456'))
+        self.assertFalse(is_safe_share_id('short'))
+        self.assertFalse(is_safe_share_id('../bad-share-token'))
 
     def test_repo_file_path_validator_rejects_unsafe_paths(self):
         self.assertTrue(is_safe_repo_file_path('pkg/app.py'))
@@ -1990,6 +1997,185 @@ class DiffLatestRefreshApiTests(TestCase):
         self.assertEqual(payload['code'], 'revision_not_found')
 
 
+@override_settings(
+    TEMP_DIR=settings.BASE_DIR / 'temp' / 'share-api-tests',
+    PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'share-api-tests' / 'playground',
+)
+class ShareEmbedPublicApiTests(TestCase):
+    source_repo: Path = Path()
+
+    def setUp(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
+        self.source_repo = settings.TEMP_DIR / 'source-repo'
+        create_git_fixture_repo(self.source_repo, {'pkg/app.py': 'def greet():\n    return "v1"\n'}, commit_message='v1')
+
+    def tearDown(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+
+    def _clone_url(self) -> str:
+        return f'file://{self.source_repo}'
+
+    def _create_share(self, *, mode='fixed', revision=None):
+        data = {'repo_url': 'https://github.com/owner/repo', 'mode': mode}
+        if revision is not None:
+            data['revision'] = revision
+        return cast(
+            HttpResponse,
+            self.client.post('/api/share/', data=data, content_type='application/json'),
+        )
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_create_fixed_share_returns_token_and_public_graph(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+
+        response = self._create_share()
+        payload = cast(dict[str, object], json.loads(response.content))
+        graph = cast(dict[str, object], payload['graph'])
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(is_safe_share_id(cast(str, payload['share_id'])))
+        self.assertEqual(payload['mode'], ShareLink.MODE_FIXED)
+        self.assertEqual(payload['repo'], 'owner/repo')
+        self.assertIn('nodes', graph)
+        self.assertNotIn('file_contents', graph)
+        self.assertIn('markdown_link', cast(dict[str, object], payload['snippets']))
+        self.assertIn('/api/embed/', cast(dict[str, object], payload['urls'])['embed'])
+        self.assertEqual(ShareLink.objects.count(), 1)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_create_latest_share_and_retrieve(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+
+        create_response = self._create_share(mode='latest')
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+        share_id = cast(str, create_payload['share_id'])
+        retrieve_response = cast(HttpResponse, self.client.get(f'/api/share/{share_id}/'))
+        retrieve_payload = cast(dict[str, object], json.loads(retrieve_response.content))
+
+        self.assertEqual(create_response.status_code, 201)
+        self.assertEqual(retrieve_response.status_code, 200)
+        self.assertEqual(retrieve_payload['mode'], ShareLink.MODE_LATEST)
+        self.assertEqual(retrieve_payload['share_id'], share_id)
+
+    def test_invalid_share_id_returns_404(self):
+        response = cast(HttpResponse, self.client.get('/api/share/short/'))
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_expired_share_returns_404(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        create_response = self._create_share()
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+        share_link = ShareLink.objects.get(token=create_payload['share_id'])
+        share_link.expires_at = timezone.now() - timedelta(minutes=1)
+        share_link.save(update_fields=['expires_at'])
+
+        response = cast(HttpResponse, self.client.get(f'/api/share/{create_payload["share_id"]}/'))
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_fixed_share_stays_on_original_revision_after_remote_changes(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        create_response = self._create_share(mode='fixed')
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+        fixed_revision = create_payload['revision']
+        write_files(
+            self.source_repo,
+            {'pkg/app.py': 'def greet():\n    return "v2"\n\ndef helper():\n    return greet()\n'},
+        )
+        commit_all(self.source_repo, 'v2')
+
+        retrieve_response = cast(HttpResponse, self.client.get(f'/api/share/{create_payload["share_id"]}/'))
+        retrieve_payload = cast(dict[str, object], json.loads(retrieve_response.content))
+
+        self.assertEqual(retrieve_response.status_code, 200)
+        self.assertEqual(retrieve_payload['revision'], fixed_revision)
+        self.assertEqual(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).count(), 1)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_latest_share_resolves_new_revision(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        create_response = self._create_share(mode='latest')
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+        write_files(
+            self.source_repo,
+            {'pkg/app.py': 'def greet():\n    return "v2"\n\ndef helper():\n    return greet()\n'},
+        )
+        head_revision = commit_all(self.source_repo, 'v2')
+
+        retrieve_response = cast(HttpResponse, self.client.get(f'/api/share/{create_payload["share_id"]}/'))
+        retrieve_payload = cast(dict[str, object], json.loads(retrieve_response.content))
+        share_link = ShareLink.objects.get(token=create_payload['share_id'])
+
+        self.assertEqual(retrieve_response.status_code, 200)
+        self.assertEqual(retrieve_payload['revision'], head_revision)
+        self.assertEqual(share_link.analysis_run.revision, head_revision)
+        self.assertEqual(AnalysisArtifact.objects.count(), 2)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_embed_endpoint_returns_html_without_global_frame_header(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        create_response = self._create_share()
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+
+        response = cast(HttpResponse, self.client.get(f'/api/embed/{create_payload["share_id"]}/'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('text/html', response.headers.get('Content-Type', ''))
+        self.assertContains(response, 'graph-data')
+        self.assertNotIn('X-Frame-Options', response.headers)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_share_id_is_not_sequential(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+
+        first = cast(dict[str, object], json.loads(self._create_share().content))
+        second = cast(dict[str, object], json.loads(self._create_share().content))
+
+        self.assertNotEqual(first['share_id'], second['share_id'])
+        self.assertFalse(cast(str, first['share_id']).isdigit())
+        self.assertFalse(cast(str, second['share_id']).isdigit())
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_latest_share_rejects_revision(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+
+        response = self._create_share(mode='latest', revision='abc123')
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('revision', payload)
+
+    def test_share_endpoint_rejects_unsupported_repo_url(self):
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/share/',
+                data={'repo_url': 'https://example.com/owner/repo', 'mode': 'fixed'},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('repo_url', payload)
+
+    @patch('api.views.create_share_response')
+    def test_share_endpoint_forbids_private_repo(self, create_share_response_mock):
+        create_share_response_mock.side_effect = RepoIngestionError('private_repo', '레포 접근 권한이 없거나 private repository입니다.')
+
+        response = self._create_share(mode='fixed')
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(payload['code'], 'private_repo')
+        self.assertEqual(ShareLink.objects.count(), 0)
+
+
 class SchemaRevisionDocumentationTests(TestCase):
     def test_schema_documents_revision_for_tree_graph_and_qa(self):
         response = cast(HttpResponse, self.client.get('/api/schema/'))
@@ -1999,6 +2185,9 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('/api/analysis/{analysis_id}/', schema_text)
         self.assertIn('/api/analysis/{analysis_id}/diff/', schema_text)
         self.assertIn('/api/diff/', schema_text)
+        self.assertIn('/api/share/', schema_text)
+        self.assertIn('/api/share/{share_id}/', schema_text)
+        self.assertIn('/api/embed/{share_id}/', schema_text)
         self.assertIn('/api/tree/', schema_text)
         self.assertIn('/api/graph/', schema_text)
         self.assertIn('/api/summary/', schema_text)

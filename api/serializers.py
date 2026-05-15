@@ -7,6 +7,7 @@ import re
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 GRAPH_ID_PATTERN = re.compile(r'^[A-Za-z0-9_./:-]+$')
+SHARE_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
 UNSAFE_REF_PATTERN = re.compile(r'[\s\\~^:?*\[\]\x00-\x1f]')
 
 
@@ -44,6 +45,10 @@ def is_safe_repo_file_path(file_path: str) -> bool:
     if path.is_absolute():
         return False
     return all(part not in {'', '.', '..'} for part in path.parts)
+
+
+def is_safe_share_id(share_id: str) -> bool:
+    return 16 <= len(share_id) <= 128 and SHARE_ID_PATTERN.fullmatch(share_id) is not None
 
 
 def extract_repo_path(repo_url):
@@ -101,6 +106,23 @@ class DiffRequestSerializer(RepoUrlSerializer):
 
 class AnalysisDiffRequestSerializer(serializers.Serializer):
     base = serializers.IntegerField(min_value=1)
+
+
+class ShareCreateSerializer(RepoUrlSerializer):
+    mode = serializers.ChoiceField(choices=('fixed', 'latest'), required=False, default='fixed')
+    revision = serializers.CharField(required=False)
+    title = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    expires_at = serializers.DateTimeField(required=False, allow_null=True)
+
+    def validate_revision(self, value):
+        if not is_safe_revision(value):
+            raise serializers.ValidationError('올바른 revision이 아닙니다')
+        return value
+
+    def validate(self, attrs):
+        if attrs.get('mode') == 'latest' and attrs.get('revision'):
+            raise serializers.ValidationError({'revision': ['latest share에는 revision을 지정할 수 없습니다']})
+        return attrs
 
 
 class QASerializer(serializers.Serializer):

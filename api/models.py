@@ -71,3 +71,39 @@ class AnalysisArtifact(models.Model):
 
     def __str__(self):
         return f'{self.analysis_run.repository.full_name}@{self.analysis_run.revision}'
+
+
+class ShareLink(models.Model):
+    MODE_FIXED = 'fixed'
+    MODE_LATEST = 'latest'
+    MODE_CHOICES = [
+        (MODE_FIXED, 'Fixed revision'),
+        (MODE_LATEST, 'Latest branch'),
+    ]
+
+    token = models.CharField(max_length=128, unique=True, db_index=True)
+    repository = models.ForeignKey(Repository, on_delete=models.CASCADE, related_name='share_links')
+    analysis_run = models.ForeignKey(
+        AnalysisRun,
+        on_delete=models.SET_NULL,
+        related_name='share_links',
+        blank=True,
+        null=True,
+    )
+    mode = models.CharField(max_length=32, choices=MODE_CHOICES, default=MODE_FIXED)
+    ref = models.CharField(max_length=255, default='HEAD')
+    title = models.CharField(max_length=255, blank=True)
+    is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['token', 'is_active']),
+            models.Index(fields=['repository', 'mode']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.repository.full_name}:{self.mode}:{self.token}'
