@@ -9,8 +9,10 @@ from typing import cast
 
 from api.services import get_repo_analysis
 from api.test_utils import create_git_fixture_repo
+from llm.agents import AgentTimedOut, AgentUnavailable, answer_question_with_smolagents
 from llm.services import answer_question, _build_context, _question_tokens, _rank_files
 from llm.summaries import SUMMARY_KIND_ONBOARDING, SummaryUnavailable, generate_summary
+from llm.tools import ArtifactToolbox, ToolLimitExceeded
 
 
 class SelectiveQuestionAnsweringTests(TestCase):
@@ -200,6 +202,106 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         with self.assertRaises(SummaryUnavailable):
             generate_summary(analysis, SUMMARY_KIND_ONBOARDING)
+
+
+class SmolagentsToolAgentTests(TestCase):
+    def _analysis(self):
+        return {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'file_contents': {
+                'pkg/app.py': 'def main():\n    return helper()\n',
+                'pkg/utils.py': 'def helper():\n    return "ok"\n',
+            },
+            'nodes': [
+                {'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2},
+                {'id': 'pkg/utils.py::helper', 'kind': 'function', 'label': 'helper', 'path': 'pkg/utils.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [
+                {'id': 'e1', 'kind': 'calls', 'source': 'pkg/app.py::main', 'target': 'pkg/utils.py::helper', 'path': 'pkg/app.py'},
+            ],
+            'entrypoints': [{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}],
+            'key_modules': [{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 5}],
+            'summaries': {
+                'repo_overview:summary.v1': {
+                    'kind': 'repo_overview',
+                    'text': 'main이 helper를 호출합니다.',
+                    'source_nodes': ['pkg/app.py::main'],
+                    'source_files': ['pkg/app.py'],
+                },
+            },
+            'warnings': [],
+        }
+
+    def test_artifact_toolbox_only_reads_stored_file_contents(self):
+        toolbox = ArtifactToolbox(self._analysis())
+
+        valid = toolbox.get_file_excerpt('pkg/app.py')
+        missing = toolbox.get_file_excerpt('/etc/passwd')
+
+        self.assertIn('def main', valid['excerpt'])
+        self.assertEqual(missing['error'], 'file_not_found')
+        self.assertEqual(missing['path'], '/etc/passwd')
+
+    def test_artifact_toolbox_rejects_missing_nodes_and_enforces_call_limit(self):
+        toolbox = ArtifactToolbox(self._analysis(), max_tool_calls=1)
+
+        missing = toolbox.get_node('pkg/app.py::missing')
+
+        self.assertEqual(missing['error'], 'node_not_found')
+        with self.assertRaises(ToolLimitExceeded):
+            toolbox.get_entrypoints()
+
+    @patch('llm.agents._run_smolagents_agent', return_value='agent 답변입니다.')
+    def test_smolagents_engine_returns_tool_trace_and_citations(self, run_agent):
+        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+            response = answer_question(
+                'owner/repo',
+                self._analysis(),
+                'main은 무엇을 호출하나요?',
+                selected_node_id='pkg/app.py::main',
+                max_context_files=2,
+            )
+
+        self.assertEqual(response['answer'], 'agent 답변입니다.')
+        self.assertEqual(response['citations'], ['pkg/app.py', 'pkg/utils.py'])
+        self.assertIn('pkg/app.py::main', response['selected_nodes'])
+        self.assertTrue(response['tool_trace'])
+        run_agent.assert_called_once()
+
+    @patch('llm.agents._run_smolagents_agent')
+    @patch('llm.services._generate_answer', return_value='classic 답변입니다.')
+    def test_classic_engine_does_not_invoke_smolagents(self, generate_answer, run_agent):
+        with patch.dict(os.environ, {'QA_ENGINE': 'classic', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+            response = answer_question('owner/repo', self._analysis(), 'Where is helper defined?')
+
+        self.assertEqual(response['answer'], 'classic 답변입니다.')
+        self.assertEqual(response['tool_trace'], [])
+        run_agent.assert_not_called()
+
+    @patch('llm.agents._run_smolagents_agent', side_effect=RuntimeError('agent failed'))
+    @patch('llm.services._generate_answer', return_value='fallback 답변입니다.')
+    def test_smolagents_failure_falls_back_to_classic_qa(self, generate_answer, run_agent):
+        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+            response = answer_question('owner/repo', self._analysis(), 'Where is helper defined?')
+
+        self.assertEqual(response['answer'], 'fallback 답변입니다.')
+        self.assertEqual(response['warnings'][-1]['code'], 'smolagents_fallback')
+
+    @patch('llm.agents._run_smolagents_agent', side_effect=AgentTimedOut('timeout'))
+    @patch('llm.services._generate_answer', return_value='timeout fallback입니다.')
+    def test_smolagents_timeout_falls_back_to_classic_qa(self, generate_answer, run_agent):
+        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+            response = answer_question('owner/repo', self._analysis(), 'Where is helper defined?')
+
+        self.assertEqual(response['answer'], 'timeout fallback입니다.')
+        self.assertEqual(response['warnings'][-1]['code'], 'smolagents_fallback')
+        self.assertIn('timeout', response['warnings'][-1]['message'])
+
+    def test_smolagents_engine_requires_openai_key(self):
+        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents'}, clear=True):
+            with self.assertRaises(AgentUnavailable):
+                answer_question_with_smolagents('owner/repo', self._analysis(), 'Where is helper defined?')
 
 
 @override_settings(

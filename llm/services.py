@@ -130,7 +130,7 @@ def _generate_answer(messages: list[dict[str, str]]) -> str:
     raise RuntimeError('사용 가능한 AI API 키가 없습니다.')
 
 
-def answer_question(
+def _answer_question_classic(
     repo_path: str,
     analysis: dict[str, Any],
     question: str,
@@ -154,6 +154,7 @@ def answer_question(
             'selected_nodes': qa_context.selected_nodes,
             'context_files': qa_context.context_files,
             'context_summary': qa_context.context_summary,
+            'tool_trace': [],
             'warnings': [{'code': 'no_context'}, *qa_context.warnings],
         }
 
@@ -166,5 +167,52 @@ def answer_question(
         'selected_nodes': qa_context.selected_nodes,
         'context_files': qa_context.context_files,
         'context_summary': qa_context.context_summary,
+        'tool_trace': [],
         'warnings': qa_context.warnings,
     }
+
+
+def answer_question(
+    repo_path: str,
+    analysis: dict[str, Any],
+    question: str,
+    *,
+    selected_node_id: str | None = None,
+    selected_file_path: str | None = None,
+    max_context_files: int = 4,
+) -> dict[str, object]:
+    if os.getenv('QA_ENGINE', 'classic').lower() == 'smolagents':
+        try:
+            from llm.agents import answer_question_with_smolagents
+
+            return answer_question_with_smolagents(
+                repo_path,
+                analysis,
+                question,
+                selected_node_id=selected_node_id,
+                selected_file_path=selected_file_path,
+                max_context_files=max_context_files,
+            )
+        except Exception as exc:
+            logger.warning('smolagents QA failed; falling back to classic QA.', exc_info=True)
+            response = _answer_question_classic(
+                repo_path,
+                analysis,
+                question,
+                selected_node_id=selected_node_id,
+                selected_file_path=selected_file_path,
+                max_context_files=max_context_files,
+            )
+            warnings = list(response.get('warnings', []))
+            warnings.append({'code': 'smolagents_fallback', 'message': str(exc)})
+            response['warnings'] = warnings
+            return response
+
+    return _answer_question_classic(
+        repo_path,
+        analysis,
+        question,
+        selected_node_id=selected_node_id,
+        selected_file_path=selected_file_path,
+        max_context_files=max_context_files,
+    )
