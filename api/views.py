@@ -3,6 +3,8 @@ import importlib
 import json
 import logging
 from typing import Any, cast
+
+from django.conf import settings
 from django.http import HttpResponse
 from django.views.decorators.clickjacking import xframe_options_exempt
 from rest_framework.decorators import api_view
@@ -14,6 +16,19 @@ from rest_framework import serializers
 
 from github_repo.services import RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
+from .readme_svg import (
+    DEFAULT_NODE_LIMIT,
+    DEFAULT_SVG_HEIGHT,
+    DEFAULT_SVG_WIDTH,
+    MAX_NODE_LIMIT,
+    MAX_SVG_HEIGHT,
+    MAX_SVG_WIDTH,
+    MIN_NODE_LIMIT,
+    MIN_SVG_HEIGHT,
+    MIN_SVG_WIDTH,
+    normalize_svg_options,
+    render_share_graph_svg,
+)
 from .throttles import ShareCreateRateThrottle
 from .serializers import (
     AnalysisDiffRequestSerializer,
@@ -122,22 +137,52 @@ def _share_error_response(error: Exception) -> Response:
     raise error
 
 
+def _frontend_share_url(request, share_id: str) -> str:
+    base_url = getattr(settings, 'FRONTEND_BASE_URL', '').rstrip('/')
+    if base_url:
+        return f'{base_url}/share/{share_id}'
+    return request.build_absolute_uri(f'/share/{share_id}')
+
+
 def _share_payload_with_links(request, payload: dict[str, Any]) -> dict[str, Any]:
     response_payload = dict(payload)
     share_id = str(response_payload['share_id'])
     repo_name = html.escape(str(response_payload['repo']))
     share_url = request.build_absolute_uri(f'/api/share/{share_id}/')
     embed_url = request.build_absolute_uri(f'/api/embed/{share_id}/')
+    readme_svg_url = request.build_absolute_uri(f'/api/share/{share_id}/graph.svg')
+    frontend_share_url = _frontend_share_url(request, share_id)
     response_payload['urls'] = {
         'share': share_url,
         'embed': embed_url,
+        'readme_svg': readme_svg_url,
+        'frontend_share': frontend_share_url,
     }
     response_payload['snippets'] = {
-        'markdown_link': f'[{response_payload["repo"]} graph]({share_url})',
+        'markdown_link': f'[{response_payload["repo"]} graph]({frontend_share_url})',
+        'markdown_image_link': f'[![{response_payload["repo"]} code graph]({readme_svg_url})]({frontend_share_url})',
+        'html_image_link': f'<a href="{html.escape(frontend_share_url)}"><img src="{html.escape(readme_svg_url)}" alt="{repo_name} code graph" /></a>',
         'html_iframe': f'<iframe src="{embed_url}" width="100%" height="640" loading="lazy" title="{repo_name} graph"></iframe>',
-        'github_readme_note': 'GitHub README는 iframe을 렌더링하지 않으므로 markdown_link를 사용하세요.',
+        'github_readme_note': 'GitHub README는 iframe을 렌더링하지 않으므로 markdown_image_link를 사용하세요.',
     }
     return response_payload
+
+
+def _svg_response(svg: str) -> HttpResponse:
+    response_obj = HttpResponse(svg, content_type='image/svg+xml; charset=utf-8')
+    response_obj['Cache-Control'] = 'public, max-age=300, stale-while-revalidate=3600'
+    response_obj['X-Content-Type-Options'] = 'nosniff'
+    return response_obj
+
+
+def _query_int(request, name: str) -> int | None:
+    value = request.GET.get(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 _ANALYSIS_REQUEST_SCHEMA = inline_serializer(
@@ -210,6 +255,37 @@ _SHARE_RESPONSE_SCHEMA = inline_serializer(
         'snippets': serializers.JSONField(),
     },
 )
+_README_GRAPH_SVG_DESCRIPTION = f'''
+Render a README-safe SVG codebase structure image directly from a GitHub repository URL.
+
+Use this endpoint when a GitHub README needs an `<img>`/Markdown image URL and you do
+not want to create or store a `share_id` first. The backend validates the GitHub URL,
+runs or reuses the repository analysis cache, groups Python modules into role columns,
+and returns `image/svg+xml`.
+
+Required query parameter:
+- `url`: URL-encoded GitHub repository URL. Example raw URL:
+  `https://github.com/psf/requests`
+
+GitHub README Markdown example:
+```md
+![Codebase structure](https://gitstarter.kro.kr/api/readme-graph.svg?url=https%3A%2F%2Fgithub.com%2Fpsf%2Frequests)
+```
+
+Optional query parameters:
+- `revision`: specific git revision/ref to analyze. Omit for latest HEAD.
+- `width`: SVG width in pixels. Allowed range: {MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}.
+- `height`: SVG height in pixels. Allowed range: {MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}.
+- `limit`: internal render selection limit. Allowed range: {MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}.
+- `theme`: `light` or `dark`.
+- `title`: visible SVG title override.
+
+Notes:
+- No `share_id` is required.
+- No `ShareLink` row is created by this endpoint.
+- GitHub README does not render iframes, so use the Markdown image URL above.
+- The URL must point to a public GitHub repository in `https://github.com/owner/repo` format.
+'''
 
 
 @extend_schema(
@@ -356,6 +432,75 @@ def share(request):
 
 
 @extend_schema(
+    operation_id='readme_graph_svg_by_repo_url',
+    description=_README_GRAPH_SVG_DESCRIPTION,
+    parameters=[
+        OpenApiParameter(
+            name='url',
+            description='Required. URL-encoded GitHub repository URL, e.g. https%3A%2F%2Fgithub.com%2Fpsf%2Frequests.',
+            required=True,
+            type=str,
+        ),
+        OpenApiParameter(
+            name='revision',
+            description='Optional git revision/ref. Omit to analyze the latest default-branch HEAD.',
+            required=False,
+            type=str,
+        ),
+        OpenApiParameter(name='width', description=f'Optional SVG width in pixels ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}).', required=False, type=int),
+        OpenApiParameter(name='height', description=f'Optional SVG height in pixels ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}).', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'Optional internal render selection limit ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}).', required=False, type=int),
+        OpenApiParameter(name='theme', description='Optional theme: light or dark.', required=False, type=str),
+        OpenApiParameter(name='title', description='Optional visible SVG title override.', required=False, type=str),
+    ],
+    responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
+)
+@api_view(['GET', 'HEAD'])
+def readme_graph_svg(request):
+    request_data = {'repo_url': request.GET.get('url') or request.GET.get('repo_url')}
+    if request.GET.get('revision') is not None:
+        request_data['revision'] = request.GET.get('revision')
+    serializer = AnalysisRequestSerializer(data=request_data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, str], serializer.validated_data)
+    repo_path = validated_data['repo_url']
+    revision = validated_data.get('revision')
+    try:
+        analysis = get_repo_analysis(repo_path, revision)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    if analysis is None:
+        return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
+
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    graph = build_graph_response(analysis, analysis_run)
+    options = normalize_svg_options(
+        width=_query_int(request, 'width') or DEFAULT_SVG_WIDTH,
+        height=_query_int(request, 'height') or DEFAULT_SVG_HEIGHT,
+        node_limit=_query_int(request, 'limit') or DEFAULT_NODE_LIMIT,
+        theme=request.GET.get('theme'),
+    )
+    svg = render_share_graph_svg(
+        {
+            'mode': 'repo URL input',
+            'title': str(request.GET.get('title') or graph['repo'])[:255],
+            'repo': graph['repo'],
+            'revision': graph['revision'],
+            'analysis_id': graph.get('analysis_id'),
+            'graph': graph,
+            'warnings': graph.get('warnings', []),
+        },
+        width=cast(int, options['width']),
+        height=cast(int, options['height']),
+        node_limit=cast(int, options['node_limit']),
+        theme_name=cast(str, options['theme']),
+    )
+    return _svg_response(svg)
+
+
+@extend_schema(
     operation_id='share_retrieve',
     responses=_SHARE_RESPONSE_SCHEMA,
 )
@@ -372,6 +517,45 @@ def share_detail(request, share_id: str):
     if response is None:
         return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
     return Response(_share_payload_with_links(request, response))
+
+
+@extend_schema(
+    operation_id='share_graph_svg',
+    parameters=[
+        OpenApiParameter(name='width', description=f'SVG width ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH})', required=False, type=int),
+        OpenApiParameter(name='height', description=f'SVG height ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT})', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'Max rendered graph nodes ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT})', required=False, type=int),
+        OpenApiParameter(name='theme', description='light 또는 dark', required=False, type=str),
+    ],
+    responses={200: OpenApiTypes.STR},
+)
+@api_view(['GET', 'HEAD'])
+def share_graph_svg(request, share_id: str):
+    if not is_safe_share_id(share_id):
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+    try:
+        response = get_share_response(share_id)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    except Exception as error:
+        return _share_error_response(error)
+    if response is None:
+        return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
+
+    options = normalize_svg_options(
+        width=_query_int(request, 'width') or DEFAULT_SVG_WIDTH,
+        height=_query_int(request, 'height') or DEFAULT_SVG_HEIGHT,
+        node_limit=_query_int(request, 'limit') or DEFAULT_NODE_LIMIT,
+        theme=request.GET.get('theme'),
+    )
+    svg = render_share_graph_svg(
+        response,
+        width=cast(int, options['width']),
+        height=cast(int, options['height']),
+        node_limit=cast(int, options['node_limit']),
+        theme_name=cast(str, options['theme']),
+    )
+    return _svg_response(svg)
 
 
 @extend_schema(
