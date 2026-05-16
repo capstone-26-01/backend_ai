@@ -255,6 +255,37 @@ _SHARE_RESPONSE_SCHEMA = inline_serializer(
         'snippets': serializers.JSONField(),
     },
 )
+_README_GRAPH_SVG_DESCRIPTION = f'''
+Render a README-safe SVG codebase structure image directly from a GitHub repository URL.
+
+Use this endpoint when a GitHub README needs an `<img>`/Markdown image URL and you do
+not want to create or store a `share_id` first. The backend validates the GitHub URL,
+runs or reuses the repository analysis cache, groups Python modules into role columns,
+and returns `image/svg+xml`.
+
+Required query parameter:
+- `url`: URL-encoded GitHub repository URL. Example raw URL:
+  `https://github.com/psf/requests`
+
+GitHub README Markdown example:
+```md
+![Codebase structure](https://gitstarter.kro.kr/api/readme-graph.svg?url=https%3A%2F%2Fgithub.com%2Fpsf%2Frequests)
+```
+
+Optional query parameters:
+- `revision`: specific git revision/ref to analyze. Omit for latest HEAD.
+- `width`: SVG width in pixels. Allowed range: {MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}.
+- `height`: SVG height in pixels. Allowed range: {MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}.
+- `limit`: internal render selection limit. Allowed range: {MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}.
+- `theme`: `light` or `dark`.
+- `title`: visible SVG title override.
+
+Notes:
+- No `share_id` is required.
+- No `ShareLink` row is created by this endpoint.
+- GitHub README does not render iframes, so use the Markdown image URL above.
+- The URL must point to a public GitHub repository in `https://github.com/owner/repo` format.
+'''
 
 
 @extend_schema(
@@ -402,16 +433,27 @@ def share(request):
 
 @extend_schema(
     operation_id='readme_graph_svg_by_repo_url',
+    description=_README_GRAPH_SVG_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
-        OpenApiParameter(name='revision', description='분석할 revision. 생략하면 latest HEAD', required=False, type=str),
-        OpenApiParameter(name='width', description=f'SVG width ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH})', required=False, type=int),
-        OpenApiParameter(name='height', description=f'SVG height ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT})', required=False, type=int),
-        OpenApiParameter(name='limit', description=f'Max rendered graph nodes ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT})', required=False, type=int),
-        OpenApiParameter(name='theme', description='light 또는 dark', required=False, type=str),
-        OpenApiParameter(name='title', description='SVG title override', required=False, type=str),
+        OpenApiParameter(
+            name='url',
+            description='Required. URL-encoded GitHub repository URL, e.g. https%3A%2F%2Fgithub.com%2Fpsf%2Frequests.',
+            required=True,
+            type=str,
+        ),
+        OpenApiParameter(
+            name='revision',
+            description='Optional git revision/ref. Omit to analyze the latest default-branch HEAD.',
+            required=False,
+            type=str,
+        ),
+        OpenApiParameter(name='width', description=f'Optional SVG width in pixels ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}).', required=False, type=int),
+        OpenApiParameter(name='height', description=f'Optional SVG height in pixels ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}).', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'Optional internal render selection limit ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}).', required=False, type=int),
+        OpenApiParameter(name='theme', description='Optional theme: light or dark.', required=False, type=str),
+        OpenApiParameter(name='title', description='Optional visible SVG title override.', required=False, type=str),
     ],
-    responses={200: OpenApiTypes.STR},
+    responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
 )
 @api_view(['GET', 'HEAD'])
 def readme_graph_svg(request):
