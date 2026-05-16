@@ -168,6 +168,13 @@ def _share_payload_with_links(request, payload: dict[str, Any]) -> dict[str, Any
     return response_payload
 
 
+def _svg_response(svg: str) -> HttpResponse:
+    response_obj = HttpResponse(svg, content_type='image/svg+xml; charset=utf-8')
+    response_obj['Cache-Control'] = 'public, max-age=300, stale-while-revalidate=3600'
+    response_obj['X-Content-Type-Options'] = 'nosniff'
+    return response_obj
+
+
 def _query_int(request, name: str) -> int | None:
     value = request.GET.get(name)
     if value is None:
@@ -394,6 +401,64 @@ def share(request):
 
 
 @extend_schema(
+    operation_id='readme_graph_svg_by_repo_url',
+    parameters=[
+        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
+        OpenApiParameter(name='revision', description='분석할 revision. 생략하면 latest HEAD', required=False, type=str),
+        OpenApiParameter(name='width', description=f'SVG width ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH})', required=False, type=int),
+        OpenApiParameter(name='height', description=f'SVG height ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT})', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'Max rendered graph nodes ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT})', required=False, type=int),
+        OpenApiParameter(name='theme', description='light 또는 dark', required=False, type=str),
+        OpenApiParameter(name='title', description='SVG title override', required=False, type=str),
+    ],
+    responses={200: OpenApiTypes.STR},
+)
+@api_view(['GET', 'HEAD'])
+def readme_graph_svg(request):
+    request_data = {'repo_url': request.GET.get('url') or request.GET.get('repo_url')}
+    if request.GET.get('revision') is not None:
+        request_data['revision'] = request.GET.get('revision')
+    serializer = AnalysisRequestSerializer(data=request_data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, str], serializer.validated_data)
+    repo_path = validated_data['repo_url']
+    revision = validated_data.get('revision')
+    try:
+        analysis = get_repo_analysis(repo_path, revision)
+    except RepoIngestionError as error:
+        return _repo_ingestion_error_response(error)
+    if analysis is None:
+        return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
+
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    graph = build_graph_response(analysis, analysis_run)
+    options = normalize_svg_options(
+        width=_query_int(request, 'width') or DEFAULT_SVG_WIDTH,
+        height=_query_int(request, 'height') or DEFAULT_SVG_HEIGHT,
+        node_limit=_query_int(request, 'limit') or DEFAULT_NODE_LIMIT,
+        theme=request.GET.get('theme'),
+    )
+    svg = render_share_graph_svg(
+        {
+            'mode': 'repo URL input',
+            'title': str(request.GET.get('title') or graph['repo'])[:255],
+            'repo': graph['repo'],
+            'revision': graph['revision'],
+            'analysis_id': graph.get('analysis_id'),
+            'graph': graph,
+            'warnings': graph.get('warnings', []),
+        },
+        width=cast(int, options['width']),
+        height=cast(int, options['height']),
+        node_limit=cast(int, options['node_limit']),
+        theme_name=cast(str, options['theme']),
+    )
+    return _svg_response(svg)
+
+
+@extend_schema(
     operation_id='share_retrieve',
     responses=_SHARE_RESPONSE_SCHEMA,
 )
@@ -448,10 +513,7 @@ def share_graph_svg(request, share_id: str):
         node_limit=cast(int, options['node_limit']),
         theme_name=cast(str, options['theme']),
     )
-    response_obj = HttpResponse(svg, content_type='image/svg+xml; charset=utf-8')
-    response_obj['Cache-Control'] = 'public, max-age=300, stale-while-revalidate=3600'
-    response_obj['X-Content-Type-Options'] = 'nosniff'
-    return response_obj
+    return _svg_response(svg)
 
 
 @extend_schema(

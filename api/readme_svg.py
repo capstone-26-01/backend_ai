@@ -852,7 +852,7 @@ def render_share_graph_svg(
     for item in scope_lines:
         sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">- {escape(item)}</text>')
         cursor_y += 19
-    sidebar_lines.append(f'<text x="58" y="{height - 78}" class="small">{escape(str(payload.get("mode") or "fixed"))} share - README-safe SVG</text>')
+    sidebar_lines.append(f'<text x="58" y="{height - 78}" class="small">{escape(str(payload.get("mode") or "fixed"))} - README-safe SVG</text>')
     sidebar_lines.append(f'<text x="58" y="{height - 56}" class="small">Collapsed symbols open in the app</text>')
 
     sidebar = f'''

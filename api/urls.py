@@ -7,6 +7,7 @@ urlpatterns = [
     path('analysis/<int:analysis_id>/diff/', views.analysis_diff),
     path('analysis/<int:analysis_id>/', views.analysis_detail),
     path('diff/', views.graph_diff),
+    path('readme-graph.svg', views.readme_graph_svg),
     path('share/', views.share),
     path('share/<str:share_id>/graph.svg', views.share_graph_svg),
     path('share/<str:share_id>/', views.share_detail),

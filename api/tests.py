@@ -2209,6 +2209,36 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertIn('image/svg+xml', head_response.headers.get('Content-Type', ''))
 
     @patch('github_repo.services._repo_clone_url')
+    def test_readme_graph_svg_accepts_repo_url_without_share(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+
+        response = cast(
+            HttpResponse,
+            self.client.get('/api/readme-graph.svg', {'url': 'https://github.com/owner/repo', 'width': '960', 'height': '620', 'limit': '40'}),
+        )
+        svg_text = response.content.decode('utf-8')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('image/svg+xml', response.headers.get('Content-Type', ''))
+        self.assertIn('public, max-age=300', response.headers.get('Cache-Control', ''))
+        self.assertIn('owner/repo', svg_text)
+        self.assertIn('app.py', svg_text)
+        self.assertIn('repo URL input', svg_text)
+        self.assertNotIn('return "v1"', svg_text)
+        self.assertEqual(ShareLink.objects.count(), 0)
+
+        head_response = cast(HttpResponse, self.client.head('/api/readme-graph.svg', {'url': 'https://github.com/owner/repo'}))
+        self.assertEqual(head_response.status_code, 200)
+        self.assertIn('image/svg+xml', head_response.headers.get('Content-Type', ''))
+
+    def test_readme_graph_svg_rejects_unsupported_repo_url(self):
+        response = cast(HttpResponse, self.client.get('/api/readme-graph.svg', {'url': 'https://example.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('repo_url', payload)
+
+    @patch('github_repo.services._repo_clone_url')
     def test_share_id_is_not_sequential(self, repo_clone_url):
         repo_clone_url.return_value = self._clone_url()
 
@@ -2277,6 +2307,7 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('/api/analysis/{analysis_id}/diff/', schema_text)
         self.assertIn('/api/diff/', schema_text)
         self.assertIn('/api/share/', schema_text)
+        self.assertIn('/api/readme-graph.svg', schema_text)
         self.assertIn('/api/share/{share_id}/', schema_text)
         self.assertIn('/api/share/{share_id}/graph.svg', schema_text)
         self.assertIn('/api/embed/{share_id}/', schema_text)
