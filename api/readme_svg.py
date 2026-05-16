@@ -627,82 +627,47 @@ def _category_style(category: str) -> tuple[str, str]:
     }.get(category, ('#6c7370', '#f3f5f4'))
 
 
-def _render_card(card: Mapping[str, Any], box: tuple[float, float, float, float], theme: Mapping[str, str]) -> str:
-    x_pos, y_pos, width, height = box
-    stroke, fill = _category_style(str(card.get('category') or 'support'))
-    title = _shorten(str(card.get('title') or ''), 22)
-    subtitle = _shorten(str(card.get('subtitle') or ''), 34)
-    kind = _shorten(str(card.get('kind') or ''), 12)
-    return (
-        f'<g>'
-        f'<rect x="{x_pos:.1f}" y="{y_pos:.1f}" width="{width:.1f}" height="{height:.1f}" rx="18" fill="{fill}" stroke="{stroke}" stroke-width="1.8" filter="url(#soft-shadow)"/>'
-        f'<circle cx="{x_pos + 24:.1f}" cy="{y_pos + 25:.1f}" r="8" fill="{stroke}" opacity=".9"/>'
-        f'<text x="{x_pos + 42:.1f}" y="{y_pos + 27:.1f}" class="card-title">{escape(title)}</text>'
-        f'<text x="{x_pos + 18:.1f}" y="{y_pos + 50:.1f}" class="card-subtitle">{escape(subtitle)}</text>'
-        f'<rect x="{x_pos + width - 76:.1f}" y="{y_pos + height - 27:.1f}" width="58" height="18" rx="9" fill="{theme["panel"]}" opacity=".82"/>'
-        f'<text x="{x_pos + width - 47:.1f}" y="{y_pos + height - 14:.1f}" text-anchor="middle" class="tiny">{escape(kind)}</text>'
-        f'</g>'
-    )
+def _category_title(category: str) -> str:
+    return {
+        'entry': 'Public API',
+        'flow': 'Execution Flow',
+        'domain': 'Core Modules',
+        'support': 'Shared Support',
+    }.get(category, 'Modules')
 
 
-def _render_graph_edges(
-    card_positions: Mapping[str, tuple[float, float, float, float]],
-    visible_edges: list[dict[str, Any]],
-    theme: Mapping[str, str],
-) -> str:
-    paths = []
-    for index, edge in enumerate(visible_edges[:8]):
-        source = str(edge['source'])
-        target = str(edge['target'])
-        if source not in card_positions or target not in card_positions:
-            continue
-        sx, sy, sw, sh = card_positions[source]
-        tx, ty, _tw, th = card_positions[target]
-        start_x = sx + sw - 4
-        start_y = sy + sh / 2 + ((index % 3) - 1) * 2.5
-        end_x = tx + 4
-        end_y = ty + th / 2 + ((index % 3) - 1) * 2.5
-        distance = max(80, end_x - start_x)
-        curve = distance * 0.38
-        count = int(edge['count'])
-        inferred = bool(edge.get('inferred'))
-        stroke_width = 2.0 if inferred else 2.4 + min(count, 18) * 0.09
-        opacity = 0.34 if inferred else max(0.32, 0.74 - index * 0.04)
-        dash = ' stroke-dasharray="6 6"' if inferred else ''
-        paths.append(
-            f'<path d="M {start_x:.1f} {start_y:.1f} C {start_x + curve:.1f} {start_y:.1f}, {end_x - curve:.1f} {end_y:.1f}, {end_x:.1f} {end_y:.1f}" '
-            f'stroke="{theme["relationship"]}" stroke-width="{stroke_width:.1f}" stroke-linecap="round" fill="none" opacity="{opacity:.2f}" marker-end="url(#arrow)"{dash}/>'
-        )
-    return f"<g>{''.join(paths)}</g>"
+def _category_description(category: str) -> str:
+    return {
+        'entry': 'Where callers enter',
+        'flow': 'Coordinates work',
+        'domain': 'Owns repo behavior',
+        'support': 'Shared helpers',
+    }.get(category, 'Selected modules')
 
 
-def _render_lane_endpoint(
+def _render_module_chip(
     card: Mapping[str, Any],
     *,
     x_pos: float,
     y_pos: float,
     width: float,
-    height: float,
     theme: Mapping[str, str],
 ) -> str:
     stroke, fill = _category_style(str(card.get('category') or 'support'))
-    title = _shorten(str(card.get('title') or ''), 20)
-    subtitle = _shorten(str(card.get('subtitle') or ''), 31)
+    title = _shorten(str(card.get('title') or ''), 19)
+    subtitle = _shorten(str(card.get('subtitle') or ''), 28)
     return (
         f'<g>'
-        f'<rect x="{x_pos:.1f}" y="{y_pos:.1f}" width="{width:.1f}" height="{height:.1f}" rx="16" fill="{fill}" stroke="{stroke}" stroke-width="1.7"/>'
-        f'<circle cx="{x_pos + 21:.1f}" cy="{y_pos + 21:.1f}" r="7" fill="{stroke}" opacity=".9"/>'
-        f'<text x="{x_pos + 38:.1f}" y="{y_pos + 24:.1f}" class="card-title">{escape(title)}</text>'
-        f'<text x="{x_pos + 17:.1f}" y="{y_pos + 45:.1f}" class="card-subtitle">{escape(subtitle)}</text>'
-        f'<rect x="{x_pos + width - 72:.1f}" y="{y_pos + height - 24:.1f}" width="54" height="17" rx="8.5" fill="{theme["panel"]}" opacity=".82"/>'
-        f'<text x="{x_pos + width - 45:.1f}" y="{y_pos + height - 12:.1f}" text-anchor="middle" class="tiny">{escape(str(card.get("category") or "module"))}</text>'
+        f'<rect x="{x_pos:.1f}" y="{y_pos:.1f}" width="{width:.1f}" height="54" rx="15" fill="{fill}" stroke="{stroke}" stroke-width="1.5"/>'
+        f'<circle cx="{x_pos + 19:.1f}" cy="{y_pos + 20:.1f}" r="6.5" fill="{stroke}" opacity=".9"/>'
+        f'<text x="{x_pos + 34:.1f}" y="{y_pos + 23:.1f}" class="card-title">{escape(title)}</text>'
+        f'<text x="{x_pos + 15:.1f}" y="{y_pos + 42:.1f}" class="card-subtitle">{escape(subtitle)}</text>'
         f'</g>'
     )
 
 
-def _render_dependency_lanes(
+def _render_structure_overview(
     cards: list[dict[str, Any]],
-    visible_edges: list[dict[str, Any]],
     *,
     x_pos: float,
     y_pos: float,
@@ -710,76 +675,77 @@ def _render_dependency_lanes(
     height: float,
     theme: Mapping[str, str],
 ) -> str:
+    categories = ['entry', 'flow', 'domain', 'support']
     card_by_id = {str(card['id']): card for card in cards}
-    lane_edges = [
-        edge for edge in visible_edges[:7]
-        if str(edge.get('source')) in card_by_id and str(edge.get('target')) in card_by_id
+    cards_by_category = {
+        category: sorted(
+            [card for card in cards if str(card.get('category')) == category],
+            key=lambda card: (-int(card.get('score') or 0), str(card.get('title') or '')),
+        )
+        for category in categories
+    }
+    column_gap = 18
+    column_width = (width - column_gap * (len(categories) - 1)) / len(categories)
+    header_y = y_pos + 30
+    rail_y = y_pos + 58
+    capsule_y = y_pos + 82
+    capsule_height = 52
+    panel_y = y_pos + 150
+    panel_height = height - 168
+    chip_gap = 11
+    chip_height = 54
+    max_chips = max(1, int((panel_height - 66) / (chip_height + chip_gap)))
+    chunks = [
+        f'<rect x="{x_pos:.1f}" y="{y_pos:.1f}" width="{width:.1f}" height="{height:.1f}" rx="28" fill="{theme["panel"]}" opacity=".70" filter="url(#soft-shadow)"/>',
+        f'<text x="{x_pos + 24:.1f}" y="{header_y:.1f}" class="column-label">CODEBASE STRUCTURE OVERVIEW</text>',
+        f'<text x="{x_pos + width - 24:.1f}" y="{header_y:.1f}" text-anchor="end" class="small">role groups first, raw edges only summarized</text>',
     ]
-    if not lane_edges:
-        fallback_cards = cards[: min(4, len(cards))]
-        fallback = [
-            f'<rect x="{x_pos:.1f}" y="{y_pos:.1f}" width="{width:.1f}" height="{height:.1f}" rx="28" fill="{theme["panel"]}" opacity=".76"/>',
-            f'<text x="{x_pos + 24:.1f}" y="{y_pos + 32:.1f}" class="column-label">TOP MODULE DEPENDENCY LANES</text>',
-            f'<text x="{x_pos + width / 2:.1f}" y="{y_pos + 76:.1f}" text-anchor="middle" class="subtitle">No cross-module dependency lanes found.</text>',
-        ]
-        card_width = min(330, width - 64)
-        card_height = 66
-        current_y = y_pos + 108
-        for card in fallback_cards:
-            fallback.append(
-                _render_lane_endpoint(
+
+    for index in range(len(categories) - 1):
+        source_center = x_pos + index * (column_width + column_gap) + column_width / 2
+        target_center = x_pos + (index + 1) * (column_width + column_gap) + column_width / 2
+        start_x = source_center + 46
+        end_x = target_center - 46
+        chunks.append(
+            f'<path d="M {start_x:.1f} {rail_y:.1f} L {end_x:.1f} {rail_y:.1f}" stroke="{theme["relationship"]}" stroke-width="3" stroke-linecap="round" opacity=".52" marker-end="url(#arrow)"/>'
+        )
+
+    for index, category in enumerate(categories):
+        column_x = x_pos + index * (column_width + column_gap)
+        stroke, fill = _category_style(category)
+        title = _category_title(category)
+        description = _category_description(category)
+        category_cards = cards_by_category[category]
+        chunks.append(
+            f'<rect x="{column_x:.1f}" y="{capsule_y:.1f}" width="{column_width:.1f}" height="{capsule_height:.1f}" rx="22" fill="{fill}" stroke="{stroke}" stroke-width="1.8"/>'
+            f'<text x="{column_x + column_width / 2:.1f}" y="{capsule_y + 23:.1f}" text-anchor="middle" class="capsule-title">{escape(title)}</text>'
+            f'<text x="{column_x + column_width / 2:.1f}" y="{capsule_y + 40:.1f}" text-anchor="middle" class="capsule-subtitle">{escape(description)}</text>'
+            f'<rect x="{column_x:.1f}" y="{panel_y:.1f}" width="{column_width:.1f}" height="{panel_height:.1f}" rx="22" fill="{fill}" opacity=".58"/>'
+            f'<text x="{column_x + 16:.1f}" y="{panel_y + 30:.1f}" class="group-label">{len(category_cards)} MODULES</text>'
+        )
+        chip_y = panel_y + 48
+        for card in category_cards[:max_chips]:
+            chunks.append(
+                _render_module_chip(
                     card,
-                    x_pos=x_pos + (width - card_width) / 2,
-                    y_pos=current_y,
-                    width=card_width,
-                    height=card_height,
+                    x_pos=column_x + 12,
+                    y_pos=chip_y,
+                    width=column_width - 24,
                     theme=theme,
                 )
             )
-            current_y += card_height + 14
-        return f'<g>{"".join(fallback)}</g>'
+            chip_y += chip_height + chip_gap
+        hidden_count = max(0, len(category_cards) - max_chips)
+        if hidden_count:
+            chunks.append(
+                f'<text x="{column_x + column_width / 2:.1f}" y="{panel_y + panel_height - 18:.1f}" text-anchor="middle" class="small">+ {hidden_count} more in app</text>'
+            )
+        if not category_cards:
+            chunks.append(
+                f'<text x="{column_x + column_width / 2:.1f}" y="{panel_y + 82:.1f}" text-anchor="middle" class="small">No module selected</text>'
+            )
 
-    panel = [
-        f'<rect x="{x_pos:.1f}" y="{y_pos:.1f}" width="{width:.1f}" height="{height:.1f}" rx="28" fill="{theme["panel"]}" opacity=".70" filter="url(#soft-shadow)"/>',
-        f'<text x="{x_pos + 24:.1f}" y="{y_pos + 32:.1f}" class="column-label">TOP MODULE DEPENDENCY LANES</text>',
-        f'<text x="{x_pos + width - 24:.1f}" y="{y_pos + 32:.1f}" text-anchor="end" class="small">one relationship per row, no overlapping connectors</text>',
-    ]
-    lane_count = len(lane_edges)
-    lane_gap = 12
-    header_height = 54
-    usable_height = max(120, height - header_height - 24)
-    lane_height = clamp_int(int((usable_height - lane_gap * (lane_count - 1)) / lane_count), 54, 72)
-    source_width = min(285, (width - 184) * 0.36)
-    target_width = source_width
-    source_x = x_pos + 32
-    target_x = x_pos + width - target_width - 32
-    line_start = source_x + source_width + 16
-    line_end = target_x - 16
-    relation_x = (line_start + line_end) / 2
-    relation_width = 110
-
-    for index, edge in enumerate(lane_edges):
-        lane_y = y_pos + header_height + index * (lane_height + lane_gap)
-        center_y = lane_y + lane_height / 2
-        source_card = card_by_id[str(edge['source'])]
-        target_card = card_by_id[str(edge['target'])]
-        inferred = bool(edge.get('inferred'))
-        count = int(edge.get('count') or 0)
-        label = 'facade' if inferred else f'{escape(str(edge.get("kind") or "uses"))} x{count}'
-        dash = ' stroke-dasharray="7 7"' if inferred else ''
-        opacity = '.42' if inferred else '.76'
-        panel.append(
-            f'<rect x="{x_pos + 18:.1f}" y="{lane_y - 3:.1f}" width="{width - 36:.1f}" height="{lane_height + 6:.1f}" rx="20" fill="{theme["panel2"]}" opacity=".30"/>'
-            f'<circle cx="{x_pos + 28:.1f}" cy="{center_y:.1f}" r="13" fill="{theme["relationship"]}" opacity=".16"/>'
-            f'<text x="{x_pos + 28:.1f}" y="{center_y + 4:.1f}" text-anchor="middle" class="tiny">{index + 1}</text>'
-            f'{_render_lane_endpoint(source_card, x_pos=source_x, y_pos=lane_y, width=source_width, height=lane_height, theme=theme)}'
-            f'<path d="M {line_start:.1f} {center_y:.1f} L {line_end:.1f} {center_y:.1f}" stroke="{theme["relationship"]}" stroke-width="3.2" stroke-linecap="round" opacity="{opacity}" marker-end="url(#arrow)"{dash}/>'
-            f'<rect x="{relation_x - relation_width / 2:.1f}" y="{center_y - 14:.1f}" width="{relation_width:.1f}" height="28" rx="14" fill="{theme["panel"]}" stroke="{theme["line"]}" stroke-width="1" opacity=".96"/>'
-            f'<text x="{relation_x:.1f}" y="{center_y + 4:.1f}" text-anchor="middle" class="edge-label">{label}</text>'
-            f'{_render_lane_endpoint(target_card, x_pos=target_x, y_pos=lane_y, width=target_width, height=lane_height, theme=theme)}'
-        )
-
-    return f'<g>{"".join(panel)}</g>'
+    return f'<g>{"".join(chunks)}</g>'
 
 
 def render_share_graph_svg(
@@ -842,6 +808,8 @@ def render_share_graph_svg(
     .column-label {{ font: 900 13px ui-sans-serif, system-ui, sans-serif; fill: {theme['text']}; letter-spacing: .08em; }}
     .card-title {{ font: 800 14px ui-sans-serif, system-ui, sans-serif; fill: #16221d; }}
     .card-subtitle {{ font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #5f6d64; }}
+    .capsule-title {{ font: 900 12px ui-sans-serif, system-ui, sans-serif; fill: #16221d; letter-spacing: .04em; }}
+    .capsule-subtitle {{ font: 700 9px ui-sans-serif, system-ui, sans-serif; fill: #5f6d64; }}
     .tiny {{ font: 700 9px ui-sans-serif, system-ui, sans-serif; fill: #69766e; }}
     .edge-label {{ font: 900 10px ui-sans-serif, system-ui, sans-serif; fill: {theme['muted']}; }}
   </style>'''
@@ -865,9 +833,9 @@ def render_share_graph_svg(
     cursor_y = 178
     guide_lines = [
         'Start at Public API',
-        'Read one dependency lane per row',
-        'No connector crosses another row',
-        'Dotted lanes are facade links',
+        'Read columns as module roles',
+        'Arrows summarize group dependencies',
+        'Open app for raw symbol graph',
     ]
     for item in guide_lines:
         sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">- {escape(item)}</text>')
@@ -877,7 +845,7 @@ def render_share_graph_svg(
     cursor_y += 24
     scope_lines = [
         f'{len(visible_cards)} modules represented',
-        f'{len(visible_edges)} dependency lanes shown',
+        f'{len(visible_edges)} relationships summarized',
         f'{hidden_nodes} low-signal symbols collapsed',
         'Tests and externals omitted',
     ]
@@ -894,9 +862,8 @@ def render_share_graph_svg(
   {''.join(sidebar_lines)}
 '''
 
-    dependency_lanes = _render_dependency_lanes(
+    structure_overview = _render_structure_overview(
         visible_cards,
-        visible_edges,
         x_pos=graph_x,
         y_pos=graph_y,
         width=graph_width,
@@ -906,7 +873,7 @@ def render_share_graph_svg(
 
     legend_y = height - 34
     legend = f'''
-  <text x="{graph_x}" y="{legend_y}" class="small">Readable module graph: each row is one aggregated dependency. Builtins, external calls, tests, and {hidden_nodes} low-signal nodes are collapsed.</text>
+  <text x="{graph_x}" y="{legend_y}" class="small">Structure overview: modules are grouped by role and arrows summarize dependency direction. Builtins, external calls, tests, and {hidden_nodes} low-signal nodes are collapsed.</text>
 '''
 
     return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(repo)} GitStarter codebase graph">
@@ -914,7 +881,7 @@ def render_share_graph_svg(
 {styles}
 {header}
 {sidebar}
-  {dependency_lanes}
+  {structure_overview}
 {legend}
 </svg>
 '''
