@@ -18,6 +18,10 @@ MIN_NODE_LIMIT = 20
 MAX_NODE_LIMIT = 180
 
 RELATIONSHIP_KINDS = {'imports', 'inherits', 'calls', 'references', 'entrypoint'}
+PUBLIC_MODULE_BASENAMES = {'__init__.py', 'api.py', 'app.py', 'main.py', 'cli.py', 'manage.py', 'urls.py', 'asgi.py', 'wsgi.py'}
+FLOW_MODULE_TOKENS = {'client', 'clients', 'handler', 'handlers', 'pipeline', 'route', 'routes', 'service', 'services', 'session', 'sessions', 'view', 'views', 'workflow'}
+DOMAIN_MODULE_TOKENS = {'adapter', 'adapters', 'auth', 'cookie', 'cookies', 'github', 'llm', 'model', 'models', 'parser', 'parsers', 'repo', 'repository', 'repositories', 'schema', 'schemas', 'serializer', 'serializers', 'transport'}
+SUPPORT_MODULE_TOKENS = {'compat', 'config', 'constant', 'constants', 'exception', 'exceptions', 'helper', 'helpers', 'hook', 'hooks', 'internal', 'middleware', 'setting', 'settings', 'signal', 'signals', 'status', 'structure', 'structures', 'throttle', 'throttles', 'type', 'types', 'utility', 'utils', 'validator', 'validators'}
 NODE_KIND_PRIORITY = {
     'directory': 0,
     'module': 1,
@@ -223,6 +227,116 @@ def _node_card(
     }
 
 
+def _nearest_module_id(node_id: str, nodes_by_id: Mapping[str, Mapping[str, Any]]) -> str | None:
+    for ancestor_id in _ancestor_ids(node_id, nodes_by_id):
+        node = nodes_by_id.get(ancestor_id)
+        if node is not None and _node_kind(node) == 'module' and _node_path(node):
+            return ancestor_id
+    return None
+
+
+def _module_basename(node: Mapping[str, Any]) -> str:
+    path = _node_path(node)
+    return path.rsplit('/', 1)[-1] if path else _node_label(node)
+
+
+def _is_test_path(path: str) -> bool:
+    return path.startswith(('tests/', 'test/')) or '/tests/' in path or '/test/' in path
+
+
+def _module_relation_counts(
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    edges: list[Mapping[str, Any]],
+) -> tuple[Counter[tuple[str, str]], Counter[str], Counter[str]]:
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    fan_in: Counter[str] = Counter()
+    fan_out: Counter[str] = Counter()
+    for edge in edges:
+        if _edge_kind(edge) not in RELATIONSHIP_KINDS:
+            continue
+        source_module = _nearest_module_id(str(edge.get('source') or ''), nodes_by_id)
+        target_module = _nearest_module_id(str(edge.get('target') or ''), nodes_by_id)
+        if not source_module or not target_module or source_module == target_module:
+            continue
+        pair_counts[(source_module, target_module)] += 1
+        fan_out[source_module] += 1
+        fan_in[target_module] += 1
+    return pair_counts, fan_in, fan_out
+
+
+def _module_score(
+    module_id: str,
+    module: Mapping[str, Any],
+    fan_in: Mapping[str, int],
+    fan_out: Mapping[str, int],
+    key_module_ids: set[str],
+    entrypoint_module_ids: set[str],
+) -> int:
+    path = _node_path(module)
+    basename = _module_basename(module)
+    tokens = _module_tokens(module)
+    hints = PUBLIC_MODULE_BASENAMES | FLOW_MODULE_TOKENS | DOMAIN_MODULE_TOKENS | SUPPORT_MODULE_TOKENS
+    score = fan_in.get(module_id, 0) * 3 + fan_out.get(module_id, 0) * 2
+    if module_id in key_module_ids:
+        score += 70
+    if module_id in entrypoint_module_ids:
+        score += 55
+    if basename in {'__init__.py', 'api.py', 'app.py', 'main.py', 'cli.py', 'manage.py'}:
+        score += 65
+    if tokens & hints:
+        score += 28
+    if basename.startswith('_') and score > 0:
+        score -= 10
+    return score
+
+
+def _module_tokens(module: Mapping[str, Any]) -> set[str]:
+    path = _node_path(module).removesuffix('.py')
+    return {token for token in path.replace('/', '.').replace('-', '_').replace('_', '.').split('.') if token}
+
+
+def _module_name_tokens(module: Mapping[str, Any]) -> set[str]:
+    basename = _module_basename(module).removesuffix('.py')
+    return {token for token in basename.replace('-', '_').replace('_', '.').split('.') if token}
+
+
+def _public_module_score(module_id: str, module: Mapping[str, Any], entrypoint_module_ids: set[str]) -> int:
+    path = _node_path(module)
+    basename = _module_basename(module)
+    score = 0
+    if basename in {'api.py', 'app.py', 'main.py', 'cli.py', 'manage.py', 'urls.py'}:
+        score += 110
+    if basename == '__init__.py':
+        score += 75
+    if basename in {'asgi.py', 'wsgi.py'}:
+        score += 45
+    if module_id in entrypoint_module_ids and basename not in {'certs.py', 'help.py'}:
+        score += 25
+    if basename in {'help.py', 'certs.py'}:
+        score += 8
+    if path.count('/') <= 1:
+        score += 20
+    return score
+
+
+def _module_role(
+    module_id: str,
+    module: Mapping[str, Any],
+    entrypoint_module_ids: set[str],
+) -> str:
+    basename = _module_basename(module)
+    tokens = _module_name_tokens(module)
+    if basename in PUBLIC_MODULE_BASENAMES:
+        return 'entry'
+    if basename.startswith('_') or tokens & SUPPORT_MODULE_TOKENS:
+        return 'support'
+    if tokens & FLOW_MODULE_TOKENS:
+        return 'flow'
+    if tokens & DOMAIN_MODULE_TOKENS:
+        return 'domain'
+    return 'domain'
+
+
 def _entrypoint_card(
     entrypoint: Mapping[str, Any],
     nodes_by_id: Mapping[str, Mapping[str, Any]],
@@ -232,14 +346,12 @@ def _entrypoint_card(
     node = nodes_by_id.get(entrypoint_id)
     if node is None:
         return None
-    source_ids = set(_ancestor_ids(entrypoint_id, nodes_by_id))
     title = str(entrypoint.get('label') or _node_label(node))
     subtitle = str(entrypoint.get('path') or _node_subtitle(node))
     return _node_card(
         card_id=f'entry:{entrypoint_id}',
         category='entry',
         node=node,
-        source_ids=source_ids,
         title=title,
         subtitle=subtitle,
         score=scores.get(entrypoint_id, 0),
@@ -269,64 +381,79 @@ def _build_overview_cards(
     node_limit: int,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     key_module_ids = {str(module.get('id')) for module in key_modules if module.get('id')}
-    entrypoint_ids = {str(entrypoint.get('id')) for entrypoint in entrypoints if entrypoint.get('id')}
-    scores = _build_scores(nodes_by_id, edges, entrypoint_ids, key_module_ids)
-    max_cards = clamp_int(max(12, node_limit // 5), 12, 24)
+    entrypoint_module_ids = {
+        module_id
+        for entrypoint in entrypoints
+        if (module_id := _nearest_module_id(str(entrypoint.get('id') or ''), nodes_by_id)) is not None
+    }
+    module_nodes = {
+        node_id: node
+        for node_id, node in nodes_by_id.items()
+        if _node_kind(node) == 'module' and _node_path(node) and not _is_test_path(_node_path(node))
+    }
+    _pair_counts, fan_in, fan_out = _module_relation_counts(nodes_by_id, edges)
+    scores = {
+        module_id: _module_score(module_id, module, fan_in, fan_out, key_module_ids, entrypoint_module_ids)
+        for module_id, module in module_nodes.items()
+    }
+    max_cards = clamp_int(max(10, node_limit // 7), 10, 16)
+
+    ranked_modules = sorted(
+        module_nodes,
+        key=lambda module_id: (-scores.get(module_id, 0), _node_path(module_nodes[module_id]), module_id),
+    )
+    public_modules = sorted(
+        module_nodes,
+        key=lambda module_id: (-_public_module_score(module_id, module_nodes[module_id], entrypoint_module_ids), -scores.get(module_id, 0), _node_path(module_nodes[module_id])),
+    )
+    public_ids = [
+        module_id
+        for module_id in public_modules
+        if _public_module_score(module_id, module_nodes[module_id], entrypoint_module_ids) >= 75
+    ][:2]
+    if not public_ids:
+        public_ids = ranked_modules[:2]
+
+    roles = {
+        module_id: _module_role(module_id, module_nodes[module_id], entrypoint_module_ids)
+        for module_id in module_nodes
+    }
+    selected = set(public_ids)
+
+    def take(role: str, limit: int) -> list[str]:
+        result = [
+            module_id
+            for module_id in ranked_modules
+            if module_id not in selected and roles.get(module_id) == role
+        ][: max(0, limit)]
+        selected.update(result)
+        return result
+
+    flow_ids = take('flow', min(3, max_cards - len(selected)))
+    if not flow_ids and len(selected) < max_cards:
+        fallback = [module_id for module_id in ranked_modules if module_id not in selected][:1]
+        selected.update(fallback)
+        flow_ids = fallback
+    domain_ids = take('domain', min(4, max_cards - len(selected)))
+    support_ids = take('support', min(5, max_cards - len(selected)))
 
     entry_cards = [
-        card
-        for entrypoint in entrypoints[:4]
-        if (card := _entrypoint_card(entrypoint, nodes_by_id, scores)) is not None
+        _node_card(card_id=f'entry:{module_id}', category='entry', node=module_nodes[module_id], score=scores.get(module_id, 0))
+        for module_id in public_ids
     ]
-
-    core_cards = []
-    for module in key_modules:
-        node_id = str(module.get('id') or '')
-        node = nodes_by_id.get(node_id)
-        if node is None or _node_kind(node) == 'external':
-            continue
-        if _node_path(node).startswith('tests/'):
-            continue
-        core_cards.append(
-            _node_card(
-                card_id=f'core:{node_id}',
-                category='core',
-                node=node,
-                source_ids=set(_ancestor_ids(node_id, nodes_by_id)),
-                score=scores.get(node_id, 0),
-            )
-        )
-    core_cards = _dedupe_cards(core_cards)[: min(6, max_cards - len(entry_cards))]
-
-    used_node_ids = {str(card['node_id']) for card in [*entry_cards, *core_cards]}
-    support_candidates = []
-    for node_id, node in nodes_by_id.items():
-        kind = _node_kind(node)
-        path = _node_path(node)
-        if node_id in used_node_ids or kind == 'external':
-            continue
-        if kind == 'directory' and path and '/' not in path:
-            support_candidates.append(node_id)
-        elif kind == 'module' and path and not path.startswith('tests/'):
-            support_candidates.append(node_id)
-
-    support_candidates = sorted(
-        support_candidates,
-        key=lambda node_id: (-scores.get(node_id, 0), NODE_KIND_PRIORITY.get(_node_kind(nodes_by_id[node_id]), 9), _node_path(nodes_by_id[node_id]), node_id),
-    )
-    support_budget = max(0, max_cards - len(entry_cards) - len(core_cards))
+    flow_cards = [
+        _node_card(card_id=f'flow:{module_id}', category='flow', node=module_nodes[module_id], score=scores.get(module_id, 0))
+        for module_id in flow_ids
+    ]
+    domain_cards = [
+        _node_card(card_id=f'domain:{module_id}', category='domain', node=module_nodes[module_id], score=scores.get(module_id, 0))
+        for module_id in domain_ids
+    ]
     support_cards = [
-        _node_card(
-            card_id=f'support:{node_id}',
-            category='support',
-            node=nodes_by_id[node_id],
-            source_ids=set(_ancestor_ids(node_id, nodes_by_id)),
-            score=scores.get(node_id, 0),
-        )
-        for node_id in support_candidates[: min(6, support_budget)]
+        _node_card(card_id=f'support:{module_id}', category='support', node=module_nodes[module_id], score=scores.get(module_id, 0))
+        for module_id in support_ids
     ]
-
-    return [*entry_cards, *core_cards, *support_cards], scores
+    return [*entry_cards, *flow_cards, *domain_cards, *support_cards], scores
 
 
 def _layout_cards(
@@ -338,12 +465,13 @@ def _layout_cards(
     height: float,
 ) -> tuple[dict[str, tuple[float, float, float, float]], list[dict[str, Any]]]:
     categories = [
-        ('entry', 'Start here'),
-        ('core', 'Core modules'),
-        ('support', 'Structure'),
+        ('entry', 'Public API'),
+        ('flow', 'Execution Flow'),
+        ('domain', 'Core Modules'),
+        ('support', 'Shared Support'),
     ]
-    column_gap = 26
-    column_width = (width - column_gap * 2) / 3
+    column_gap = 20
+    column_width = (width - column_gap * (len(categories) - 1)) / len(categories)
     card_gap = 14
     category_cards = {category: [card for card in cards if card['category'] == category] for category, _label in categories}
     positions: dict[str, tuple[float, float, float, float]] = {}
@@ -399,7 +527,10 @@ def _overview_edges(
     limit: int = 24,
 ) -> list[dict[str, Any]]:
     owner = _card_owner_map(cards, nodes_by_id)
-    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    category_order = {'entry': 0, 'flow': 1, 'domain': 2, 'support': 3}
+    card_by_id = {str(card['id']): card for card in cards}
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    kinds_by_pair: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     for edge in edges:
         kind = _edge_kind(edge)
         if kind not in RELATIONSHIP_KINDS:
@@ -410,13 +541,67 @@ def _overview_edges(
             continue
         if source_card not in card_positions or target_card not in card_positions:
             continue
-        counts[(source_card, target_card, kind)] += 1
+        source_category = str(card_by_id[source_card]['category'])
+        target_category = str(card_by_id[target_card]['category'])
+        if source_category == target_category:
+            continue
+        if category_order.get(source_category, 99) > category_order.get(target_category, 99):
+            source_card, target_card = target_card, source_card
+        pair = (source_card, target_card)
+        counts[pair] += 1
+        kinds_by_pair[pair][kind] += 1
 
-    result = [
-        {'source': source, 'target': target, 'kind': kind, 'count': count}
-        for (source, target, kind), count in counts.items()
+    actual_edges = [
+        {
+            'source': source,
+            'target': target,
+            'kind': kinds_by_pair[(source, target)].most_common(1)[0][0],
+            'count': count,
+            'inferred': False,
+        }
+        for (source, target), count in counts.items()
     ]
-    return sorted(result, key=lambda item: (-int(item['count']), str(item['source']), str(item['target'])))[:limit]
+    inferred_edges: list[dict[str, Any]] = []
+    has_entry_edge = any(str(card_by_id.get(edge['source'], {}).get('category')) == 'entry' for edge in actual_edges)
+    if not has_entry_edge:
+        entry_cards = [card for card in cards if str(card.get('category')) == 'entry' and str(card.get('id')) in card_positions]
+        flow_cards = [
+            card for card in cards
+            if str(card.get('category')) == 'flow' and str(card.get('id')) in card_positions
+        ]
+        domain_cards = [
+            card for card in cards
+            if str(card.get('category')) == 'domain' and str(card.get('id')) in card_positions
+        ]
+        flow_cards.sort(key=lambda card: (-int(card.get('score') or 0), str(card.get('title') or '')))
+        domain_cards.sort(key=lambda card: (-int(card.get('score') or 0), str(card.get('title') or '')))
+        downstream_cards = flow_cards or domain_cards
+        if downstream_cards:
+            target = str(downstream_cards[0]['id'])
+            for card in entry_cards[:2]:
+                inferred_edges.append({
+                    'source': str(card['id']),
+                    'target': target,
+                    'kind': 'facade',
+                    'count': 1,
+                    'inferred': True,
+                })
+
+    def edge_sort_key(item: Mapping[str, Any]) -> tuple[int, int, str, str]:
+        source_category = str(card_by_id.get(str(item['source']), {}).get('category') or '')
+        target_category = str(card_by_id.get(str(item['target']), {}).get('category') or '')
+        pair_priority = {
+            ('flow', 'domain'): 0,
+            ('domain', 'support'): 1,
+            ('flow', 'support'): 2,
+            ('entry', 'flow'): 3,
+            ('entry', 'domain'): 4,
+        }.get((source_category, target_category), 5)
+        return (pair_priority, -int(item['count']), str(item['source']), str(item['target']))
+
+    actual_limit = max(0, limit - len(inferred_edges))
+    sorted_actual = sorted(actual_edges, key=edge_sort_key)[:actual_limit]
+    return [*inferred_edges, *sorted_actual]
 
 
 def _render_stat(label: str, value: object, x: int, y: int, theme: Mapping[str, str]) -> str:
@@ -436,7 +621,8 @@ def _safe_edge_id(edge: Mapping[str, Any], index: int) -> str:
 def _category_style(category: str) -> tuple[str, str]:
     return {
         'entry': ('#d05a2f', '#fff4ec'),
-        'core': ('#287c91', '#ecfbff'),
+        'flow': ('#287c91', '#ecfbff'),
+        'domain': ('#5f6fb3', '#f0f3ff'),
         'support': ('#4e8b58', '#f4fff1'),
     }.get(category, ('#6c7370', '#f3f5f4'))
 
@@ -444,8 +630,8 @@ def _category_style(category: str) -> tuple[str, str]:
 def _render_card(card: Mapping[str, Any], box: tuple[float, float, float, float], theme: Mapping[str, str]) -> str:
     x_pos, y_pos, width, height = box
     stroke, fill = _category_style(str(card.get('category') or 'support'))
-    title = _shorten(str(card.get('title') or ''), 26)
-    subtitle = _shorten(str(card.get('subtitle') or ''), 40)
+    title = _shorten(str(card.get('title') or ''), 22)
+    subtitle = _shorten(str(card.get('subtitle') or ''), 34)
     kind = _shorten(str(card.get('kind') or ''), 12)
     return (
         f'<g>'
@@ -459,65 +645,35 @@ def _render_card(card: Mapping[str, Any], box: tuple[float, float, float, float]
     )
 
 
-def _render_relationship_pipeline(
-    columns: list[dict[str, Any]],
-    cards: list[dict[str, Any]],
+def _render_graph_edges(
+    card_positions: Mapping[str, tuple[float, float, float, float]],
     visible_edges: list[dict[str, Any]],
     theme: Mapping[str, str],
-    *,
-    x: float,
-    width: float,
-    y: float,
 ) -> str:
-    columns_by_category = {str(column['category']): column for column in columns}
-    cards_by_id = {str(card['id']): card for card in cards}
-    pair_counts: Counter[tuple[str, str]] = Counter()
-    kind_counts: Counter[str] = Counter()
-    for edge in visible_edges:
-        source_card = cards_by_id.get(str(edge['source']))
-        target_card = cards_by_id.get(str(edge['target']))
-        if source_card is None or target_card is None:
+    paths = []
+    for index, edge in enumerate(visible_edges[:8]):
+        source = str(edge['source'])
+        target = str(edge['target'])
+        if source not in card_positions or target not in card_positions:
             continue
+        sx, sy, sw, sh = card_positions[source]
+        tx, ty, _tw, th = card_positions[target]
+        start_x = sx + sw - 4
+        start_y = sy + sh / 2 + ((index % 3) - 1) * 2.5
+        end_x = tx + 4
+        end_y = ty + th / 2 + ((index % 3) - 1) * 2.5
+        distance = max(80, end_x - start_x)
+        curve = distance * 0.38
         count = int(edge['count'])
-        source_category = str(source_card['category'])
-        target_category = str(target_card['category'])
-        pair_counts[(source_category, target_category)] += count
-        kind_counts[str(edge['kind'])] += count
-
-    total_count = sum(kind_counts.values())
-
-    def center(category: str) -> tuple[float, float]:
-        column = columns_by_category[category]
-        return float(column['x']) + float(column['width']) / 2, y
-
-    def segment(source: str, target: str) -> str:
-        source_x, source_y = center(source)
-        target_x, target_y = center(target)
-        count = pair_counts[(source, target)] + pair_counts[(target, source)]
-        stroke = theme['relationship'] if count else theme['line']
-        opacity = '.82' if count else '.26'
-        return (
-            f'<path d="M {source_x + 78:.1f} {source_y:.1f} L {target_x - 78:.1f} {target_y:.1f}" '
-            f'stroke="{stroke}" stroke-width="4.5" stroke-linecap="round" opacity="{opacity}" marker-end="url(#arrow)"/>'
+        inferred = bool(edge.get('inferred'))
+        stroke_width = 2.0 if inferred else 2.4 + min(count, 18) * 0.09
+        opacity = 0.34 if inferred else max(0.32, 0.74 - index * 0.04)
+        dash = ' stroke-dasharray="6 6"' if inferred else ''
+        paths.append(
+            f'<path d="M {start_x:.1f} {start_y:.1f} C {start_x + curve:.1f} {start_y:.1f}, {end_x - curve:.1f} {end_y:.1f}, {end_x:.1f} {end_y:.1f}" '
+            f'stroke="{theme["relationship"]}" stroke-width="{stroke_width:.1f}" stroke-linecap="round" fill="none" opacity="{opacity:.2f}" marker-end="url(#arrow)"{dash}/>'
         )
-
-    return f'''
-  <g>
-    <rect x="{x:.1f}" y="{y - 28:.1f}" width="{width:.1f}" height="58" rx="25" fill="{theme['panel']}" opacity=".55"/>
-    <text x="{x + width / 2:.1f}" y="{y - 11:.1f}" text-anchor="middle" class="pipeline-small">{total_count} cross-card relationships summarized</text>
-    {segment('entry', 'core')}
-    {segment('core', 'support')}
-    <circle cx="{center('entry')[0]:.1f}" cy="{y:.1f}" r="15" fill="#d05a2f"/>
-    <circle cx="{center('core')[0]:.1f}" cy="{y:.1f}" r="15" fill="#287c91"/>
-    <circle cx="{center('support')[0]:.1f}" cy="{y:.1f}" r="15" fill="#4e8b58"/>
-    <text x="{center('entry')[0]:.1f}" y="{y + 4:.1f}" text-anchor="middle" class="pipeline-number">1</text>
-    <text x="{center('core')[0]:.1f}" y="{y + 4:.1f}" text-anchor="middle" class="pipeline-number">2</text>
-    <text x="{center('support')[0]:.1f}" y="{y + 4:.1f}" text-anchor="middle" class="pipeline-number">3</text>
-    <text x="{center('entry')[0]:.1f}" y="{y + 29:.1f}" text-anchor="middle" class="pipeline-label">entrypoints</text>
-    <text x="{center('core')[0]:.1f}" y="{y + 29:.1f}" text-anchor="middle" class="pipeline-label">core modules</text>
-    <text x="{center('support')[0]:.1f}" y="{y + 29:.1f}" text-anchor="middle" class="pipeline-label">repo structure</text>
-  </g>
-'''
+    return f"<g>{''.join(paths)}</g>"
 
 
 def render_share_graph_svg(
@@ -548,7 +704,7 @@ def render_share_graph_svg(
     cards, _scores = _build_overview_cards(nodes_by_id, edges, entrypoints, key_modules, node_limit=node_limit)
     card_positions, columns = _layout_cards(cards, x=graph_x, y=graph_y, width=graph_width, height=graph_height)
     visible_cards = [card for card in cards if str(card['id']) in card_positions]
-    visible_edges = _overview_edges(visible_cards, card_positions, nodes_by_id, edges, limit=16)
+    visible_edges = _overview_edges(visible_cards, card_positions, nodes_by_id, edges, limit=8)
 
     hidden_nodes = max(0, len(nodes_by_id) - len(visible_cards))
     represented_edges = sum(int(edge['count']) for edge in visible_edges)
@@ -581,9 +737,7 @@ def render_share_graph_svg(
     .card-title {{ font: 800 14px ui-sans-serif, system-ui, sans-serif; fill: #16221d; }}
     .card-subtitle {{ font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #5f6d64; }}
     .tiny {{ font: 700 9px ui-sans-serif, system-ui, sans-serif; fill: #69766e; }}
-    .pipeline-label {{ font: 800 10px ui-sans-serif, system-ui, sans-serif; fill: {theme['muted']}; letter-spacing: .04em; }}
-    .pipeline-small {{ font: 700 9px ui-sans-serif, system-ui, sans-serif; fill: {theme['muted']}; }}
-    .pipeline-number {{ font: 900 11px ui-sans-serif, system-ui, sans-serif; fill: #ffffff; }}
+    .edge-label {{ font: 800 8px ui-sans-serif, system-ui, sans-serif; fill: {theme['muted']}; }}
   </style>'''
 
     stat_y = 44
@@ -600,23 +754,29 @@ def render_share_graph_svg(
 '''
 
     sidebar_lines = [
-        f'<text x="58" y="154" class="group-label">ENTRYPOINTS</text>',
+        f'<text x="58" y="154" class="group-label">HOW TO READ</text>',
     ]
     cursor_y = 178
-    for item in [str(entry.get('path') or entry.get('label') or entry.get('id')) for entry in entrypoints[:6]]:
-        sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">- {escape(_shorten(item, 34))}</text>')
-        cursor_y += 19
-    if not entrypoints:
-        sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">No deterministic entrypoint found</text>')
+    guide_lines = [
+        'Start at Public API',
+        'Follow arrows left to right',
+        'Solid arrows are parsed dependencies',
+        'Dotted arrows are facade links',
+    ]
+    for item in guide_lines:
+        sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">- {escape(item)}</text>')
         cursor_y += 19
     cursor_y += 18
-    sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="group-label">KEY MODULES</text>')
+    sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="group-label">RENDERED SCOPE</text>')
     cursor_y += 24
-    for item in [str(module.get('path') or module.get('label') or module.get('id')) for module in key_modules[:7]]:
-        sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">- {escape(_shorten(item, 34))}</text>')
-        cursor_y += 19
-    if not key_modules:
-        sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">No key module score yet</text>')
+    scope_lines = [
+        f'{len(visible_cards)} module cards shown',
+        f'{len(visible_edges)} relationships highlighted',
+        f'{hidden_nodes} low-signal symbols collapsed',
+        'Tests and externals omitted',
+    ]
+    for item in scope_lines:
+        sidebar_lines.append(f'<text x="58" y="{cursor_y}" class="small">- {escape(item)}</text>')
         cursor_y += 19
     sidebar_lines.append(f'<text x="58" y="{height - 78}" class="small">{escape(str(payload.get("mode") or "fixed"))} share - README-safe SVG</text>')
     sidebar_lines.append(f'<text x="58" y="{height - 56}" class="small">Collapsed symbols open in the app</text>')
@@ -636,15 +796,7 @@ def render_share_graph_svg(
             f'<text x="{column["x"] + column["width"] - 22:.1f}" y="{column["y"] + 29:.1f}" text-anchor="end" class="small">{column["count"]} cards</text>'
         )
 
-    relationship_pipeline = _render_relationship_pipeline(
-        columns,
-        visible_cards,
-        visible_edges,
-        theme,
-        x=graph_x,
-        width=graph_width,
-        y=118,
-    )
+    graph_edges = _render_graph_edges(card_positions, visible_edges, theme)
 
     card_svg = []
     for card in visible_cards:
@@ -660,8 +812,8 @@ def render_share_graph_svg(
 {styles}
 {header}
 {sidebar}
-{relationship_pipeline}
   <g>{''.join(column_svg)}</g>
+  {graph_edges}
   <g>{''.join(card_svg)}</g>
 {legend}
 </svg>
