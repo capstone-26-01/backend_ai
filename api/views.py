@@ -258,12 +258,15 @@ _SHARE_RESPONSE_SCHEMA = inline_serializer(
 _README_GRAPH_SVG_DESCRIPTION = f'''
 GitHub 레포 URL 하나로 README용 코드 구조 SVG를 생성합니다.
 
-프런트엔드에서는 이 엔드포인트 URL을 `<img src>` 또는 Markdown 이미지 주소로 그대로 사용하면 됩니다.
-별도 `share_id`를 먼저 만들 필요가 없습니다.
+프런트엔드 연결:
+```ts
+const src = `https://gitstarter.kro.kr/api/readme-graph.svg?${{new URLSearchParams({{ url: repoUrl }})}}`;
+```
+`repoUrl`은 사용자가 입력한 원본 GitHub URL입니다. `URLSearchParams`가 인코딩을 처리합니다.
 
 Swagger에서 테스트할 때:
-- `url` 입력칸에는 인코딩하지 않은 원본 GitHub URL을 넣으세요.
-- 예: `https://github.com/psf/requests`
+- `url`에는 원본 URL을 그대로 입력하세요. 예: `https://github.com/psf/requests`
+- 응답은 `image/svg+xml`입니다. 새 탭에서 열거나 `<img src>`에 넣어 확인하세요.
 
 README 또는 `<img src>`에 붙일 때:
 ```md
@@ -271,10 +274,10 @@ README 또는 `<img src>`에 붙일 때:
 ```
 
 알아둘 점:
-- 응답은 `image/svg+xml`입니다.
+- 공식 파라미터는 `url`입니다. `share_id`는 필요하지 않습니다.
 - 첫 요청은 레포 분석 때문에 느릴 수 있고, 이후에는 분석 캐시를 재사용합니다.
 - public GitHub 레포만 지원합니다.
-- 대부분의 경우 `width`, `height`, `theme`, `title`은 생략해도 됩니다.
+- 주요 실패: 400 잘못된 URL, 404 private/not found, 413 너무 큰 레포, 504 timeout.
 '''
 
 
@@ -427,7 +430,7 @@ def share(request):
     parameters=[
         OpenApiParameter(
             name='url',
-            description='필수. Swagger에서는 원본 GitHub URL을 그대로 입력하세요. 예: https://github.com/psf/requests',
+            description='필수 공식 파라미터. Swagger에는 원본 GitHub URL을 그대로 입력하세요. FE 코드에서는 URLSearchParams 또는 encodeURIComponent로 인코딩하세요.',
             required=True,
             type=str,
         ),
@@ -437,9 +440,9 @@ def share(request):
             required=False,
             type=str,
         ),
-        OpenApiParameter(name='width', description=f'선택. SVG 너비 px ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}). 보통 생략합니다.', required=False, type=int),
-        OpenApiParameter(name='height', description=f'선택. SVG 높이 px ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}). 보통 생략합니다.', required=False, type=int),
-        OpenApiParameter(name='limit', description=f'선택. 표시할 모듈 선별 한도 ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}). 보통 생략합니다.', required=False, type=int),
+        OpenApiParameter(name='width', description=f'선택. SVG 너비 px ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}). 기본값 권장.', required=False, type=int),
+        OpenApiParameter(name='height', description=f'선택. SVG 높이 px ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}). 기본값 권장.', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'선택. 모듈 선별 한도 ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}). 고급 옵션이며 기본값 권장.', required=False, type=int),
         OpenApiParameter(name='theme', description='선택. light 또는 dark.', required=False, type=str),
         OpenApiParameter(name='title', description='선택. SVG 상단 제목을 직접 지정할 때 사용합니다.', required=False, type=str),
     ],
