@@ -256,35 +256,28 @@ _SHARE_RESPONSE_SCHEMA = inline_serializer(
     },
 )
 _README_GRAPH_SVG_DESCRIPTION = f'''
-Render a README-safe SVG codebase structure image directly from a GitHub repository URL.
+GitHub 레포 URL 하나로 README용 코드 구조 SVG를 생성합니다.
 
-Use this endpoint when a GitHub README needs an `<img>`/Markdown image URL and you do
-not want to create or store a `share_id` first. The backend validates the GitHub URL,
-runs or reuses the repository analysis cache, groups Python modules into role columns,
-and returns `image/svg+xml`.
+프런트엔드 연결:
+```ts
+const src = `https://gitstarter.kro.kr/api/readme-graph.svg?${{new URLSearchParams({{ url: repoUrl }})}}`;
+```
+`repoUrl`은 사용자가 입력한 원본 GitHub URL입니다. `URLSearchParams`가 인코딩을 처리합니다.
 
-Required query parameter:
-- `url`: URL-encoded GitHub repository URL. Example raw URL:
-  `https://github.com/psf/requests`
+Swagger에서 테스트할 때:
+- `url`에는 원본 URL을 그대로 입력하세요. 예: `https://github.com/psf/requests`
+- 응답은 `image/svg+xml`입니다. 새 탭에서 열거나 `<img src>`에 넣어 확인하세요.
 
-GitHub README Markdown example:
+README 또는 `<img src>`에 붙일 때:
 ```md
 ![Codebase structure](https://gitstarter.kro.kr/api/readme-graph.svg?url=https%3A%2F%2Fgithub.com%2Fpsf%2Frequests)
 ```
 
-Optional query parameters:
-- `revision`: specific git revision/ref to analyze. Omit for latest HEAD.
-- `width`: SVG width in pixels. Allowed range: {MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}.
-- `height`: SVG height in pixels. Allowed range: {MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}.
-- `limit`: internal render selection limit. Allowed range: {MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}.
-- `theme`: `light` or `dark`.
-- `title`: visible SVG title override.
-
-Notes:
-- No `share_id` is required.
-- No `ShareLink` row is created by this endpoint.
-- GitHub README does not render iframes, so use the Markdown image URL above.
-- The URL must point to a public GitHub repository in `https://github.com/owner/repo` format.
+알아둘 점:
+- 공식 파라미터는 `url`입니다. `share_id`는 필요하지 않습니다.
+- 첫 요청은 레포 분석 때문에 느릴 수 있고, 이후에는 분석 캐시를 재사용합니다.
+- public GitHub 레포만 지원합니다.
+- 주요 실패: 400 잘못된 URL, 404 private/not found, 413 너무 큰 레포, 504 timeout.
 '''
 
 
@@ -437,21 +430,21 @@ def share(request):
     parameters=[
         OpenApiParameter(
             name='url',
-            description='Required. URL-encoded GitHub repository URL, e.g. https%3A%2F%2Fgithub.com%2Fpsf%2Frequests.',
+            description='필수 공식 파라미터. Swagger에는 원본 GitHub URL을 그대로 입력하세요. FE 코드에서는 URLSearchParams 또는 encodeURIComponent로 인코딩하세요.',
             required=True,
             type=str,
         ),
         OpenApiParameter(
             name='revision',
-            description='Optional git revision/ref. Omit to analyze the latest default-branch HEAD.',
+            description='선택. 특정 revision/ref를 고정해서 분석할 때만 입력합니다. 생략하면 최신 HEAD를 사용합니다.',
             required=False,
             type=str,
         ),
-        OpenApiParameter(name='width', description=f'Optional SVG width in pixels ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}).', required=False, type=int),
-        OpenApiParameter(name='height', description=f'Optional SVG height in pixels ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}).', required=False, type=int),
-        OpenApiParameter(name='limit', description=f'Optional internal render selection limit ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}).', required=False, type=int),
-        OpenApiParameter(name='theme', description='Optional theme: light or dark.', required=False, type=str),
-        OpenApiParameter(name='title', description='Optional visible SVG title override.', required=False, type=str),
+        OpenApiParameter(name='width', description=f'선택. SVG 너비 px ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}). 기본값 권장.', required=False, type=int),
+        OpenApiParameter(name='height', description=f'선택. SVG 높이 px ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}). 기본값 권장.', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'선택. 모듈 선별 한도 ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}). 고급 옵션이며 기본값 권장.', required=False, type=int),
+        OpenApiParameter(name='theme', description='선택. light 또는 dark.', required=False, type=str),
+        OpenApiParameter(name='title', description='선택. SVG 상단 제목을 직접 지정할 때 사용합니다.', required=False, type=str),
     ],
     responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
 )
