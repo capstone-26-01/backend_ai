@@ -188,71 +188,71 @@ def _query_int(request, name: str) -> int | None:
 _ANALYSIS_REQUEST_SCHEMA = inline_serializer(
     name='AnalysisRequest',
     fields={
-        'repo_url': serializers.CharField(),
-        'revision': serializers.CharField(required=False),
+        'repo_url': serializers.CharField(help_text='분석할 public GitHub 레포 URL입니다. 예: https://github.com/psf/requests'),
+        'revision': serializers.CharField(required=False, help_text='선택. 특정 commit/ref를 고정할 때 사용합니다. 생략하면 최신 HEAD를 분석합니다.'),
     },
 )
 _ANALYSIS_RESPONSE_SCHEMA = inline_serializer(
     name='AnalysisResponse',
     fields={
-        'analysis_id': serializers.IntegerField(allow_null=True),
-        'repo': serializers.CharField(),
-        'revision': serializers.CharField(),
-        'status': serializers.CharField(),
-        'artifact': serializers.JSONField(allow_null=True),
-        'warnings': serializers.JSONField(),
+        'analysis_id': serializers.IntegerField(allow_null=True, help_text='이 분석 run의 ID입니다. summary, node-summary, qa에서 재사용합니다.'),
+        'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
+        'revision': serializers.CharField(help_text='실제로 분석된 git commit SHA입니다. tree/graph/qa 재조회 시 같은 결과를 고정하는 데 사용합니다.'),
+        'status': serializers.CharField(help_text='분석 상태입니다. succeeded면 artifact를 사용할 수 있습니다.'),
+        'artifact': serializers.JSONField(allow_null=True, help_text='tree, nodes, edges, entrypoints, key_modules 등을 포함한 전체 분석 결과입니다.'),
+        'warnings': serializers.JSONField(help_text='분석 중 일부 파일 제외 등 사용자에게 보여줄 수 있는 경고 목록입니다.'),
     },
 )
 _ANALYSIS_DETAIL_RESPONSE_SCHEMA = inline_serializer(
     name='AnalysisByIdResponse',
     fields={
-        'analysis_id': serializers.IntegerField(),
-        'repo': serializers.CharField(),
-        'revision': serializers.CharField(allow_blank=True),
-        'status': serializers.CharField(),
-        'artifact': serializers.JSONField(allow_null=True),
-        'warnings': serializers.JSONField(),
-        'error': serializers.JSONField(required=False, allow_null=True),
+        'analysis_id': serializers.IntegerField(help_text='조회한 분석 run ID입니다.'),
+        'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
+        'revision': serializers.CharField(allow_blank=True, help_text='분석된 git commit SHA입니다. 실패/진행 중이면 비어 있을 수 있습니다.'),
+        'status': serializers.CharField(help_text='started, succeeded, failed 중 하나입니다.'),
+        'artifact': serializers.JSONField(allow_null=True, help_text='성공한 분석의 전체 artifact입니다. 실패/진행 중이면 null입니다.'),
+        'warnings': serializers.JSONField(help_text='분석 경고 목록입니다.'),
+        'error': serializers.JSONField(required=False, allow_null=True, help_text='실패한 분석 run의 에러 정보입니다.'),
     },
 )
 _DIFF_RESPONSE_SCHEMA = inline_serializer(
     name='GraphDiffResponse',
     fields={
-        'repo': serializers.CharField(),
-        'base': serializers.JSONField(),
-        'head': serializers.JSONField(),
-        'diff': serializers.JSONField(),
-        'warnings': serializers.JSONField(),
+        'repo': serializers.CharField(help_text='비교 대상 owner/repo입니다.'),
+        'base': serializers.JSONField(help_text='기준 분석 결과의 revision/analysis 정보입니다.'),
+        'head': serializers.JSONField(help_text='대상 분석 결과의 revision/analysis 정보입니다.'),
+        'diff': serializers.JSONField(help_text='추가/삭제/변경된 노드와 엣지 요약입니다.'),
+        'warnings': serializers.JSONField(help_text='비교 중 발생한 경고 목록입니다.'),
     },
 )
 _SHARE_CREATE_SCHEMA = inline_serializer(
     name='ShareCreateRequest',
     fields={
-        'repo_url': serializers.CharField(),
-        'mode': serializers.ChoiceField(choices=('fixed', 'latest'), required=False),
-        'revision': serializers.CharField(required=False),
-        'title': serializers.CharField(required=False, allow_blank=True),
-        'expires_at': serializers.DateTimeField(required=False, allow_null=True),
+        'repo_url': serializers.CharField(help_text='공유할 public GitHub 레포 URL입니다.'),
+        'mode': serializers.ChoiceField(choices=('fixed', 'latest'), required=False, help_text='fixed는 현재 revision 고정, latest는 조회 시 최신 HEAD로 갱신합니다. 기본값 fixed.'),
+        'revision': serializers.CharField(required=False, help_text='fixed 공유에서 특정 revision을 지정할 때 사용합니다. latest 모드에서는 사용할 수 없습니다.'),
+        'title': serializers.CharField(required=False, allow_blank=True, help_text='공유 화면/SVG에 표시할 제목입니다. 생략하면 repo 이름을 사용합니다.'),
+        'expires_at': serializers.DateTimeField(required=False, allow_null=True, help_text='선택. 공유 링크 만료 시간입니다.'),
     },
 )
 _SHARE_RESPONSE_SCHEMA = inline_serializer(
     name='ShareResponse',
     fields={
-        'share_id': serializers.CharField(),
-        'mode': serializers.CharField(),
-        'title': serializers.CharField(allow_blank=True),
-        'repo': serializers.CharField(),
-        'repository': serializers.JSONField(),
-        'ref': serializers.CharField(),
-        'revision': serializers.CharField(),
-        'analysis_id': serializers.IntegerField(),
-        'graph': serializers.JSONField(),
-        'is_active': serializers.BooleanField(),
-        'created_at': serializers.CharField(),
-        'expires_at': serializers.CharField(allow_null=True),
-        'warnings': serializers.JSONField(),
-        'urls': serializers.JSONField(),
-        'snippets': serializers.JSONField(),
+        'share_id': serializers.CharField(help_text='공유 링크 식별자입니다. /api/share/{share_id}/ 등에 사용합니다.'),
+        'mode': serializers.CharField(help_text='fixed 또는 latest입니다.'),
+        'title': serializers.CharField(allow_blank=True, help_text='공유 제목입니다.'),
+        'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
+        'repository': serializers.JSONField(help_text='owner, name, full_name 등 레포 메타데이터입니다.'),
+        'ref': serializers.CharField(help_text='공유가 가리키는 ref입니다. fixed면 revision, latest면 HEAD입니다.'),
+        'revision': serializers.CharField(help_text='현재 응답이 실제로 사용하는 분석 revision입니다.'),
+        'analysis_id': serializers.IntegerField(help_text='현재 공유 응답에 연결된 분석 run ID입니다.'),
+        'graph': serializers.JSONField(help_text='공유 화면에 사용할 공개 graph payload입니다. file_contents는 포함하지 않습니다.'),
+        'is_active': serializers.BooleanField(help_text='공유 링크 활성 여부입니다.'),
+        'created_at': serializers.CharField(help_text='공유 링크 생성 시각입니다.'),
+        'expires_at': serializers.CharField(allow_null=True, help_text='공유 링크 만료 시각입니다. 없으면 null입니다.'),
+        'warnings': serializers.JSONField(help_text='분석 경고 목록입니다.'),
+        'urls': serializers.JSONField(help_text='share, embed, readme_svg, frontend_share URL 모음입니다.'),
+        'snippets': serializers.JSONField(help_text='README/HTML에 바로 붙일 수 있는 markdown/html snippet 모음입니다.'),
     },
 )
 _README_GRAPH_SVG_DESCRIPTION = f'''
@@ -279,20 +279,123 @@ README 또는 `<img src>`에 붙일 때:
 - public GitHub 레포만 지원합니다.
 - 주요 실패: 400 잘못된 URL, 404 private/not found, 413 너무 큰 레포, 504 timeout.
 '''
+_ANALYSIS_GET_DESCRIPTION = '''
+레포를 분석하고 프런트엔드가 재사용할 기본 분석 결과를 반환합니다.
+
+프런트엔드 권장 흐름:
+1. 사용자가 GitHub URL을 입력하면 먼저 이 API를 호출합니다.
+2. 응답의 `analysis_id`는 `/api/summary/`, `/api/node-summary/`, `/api/qa/`에서 재사용합니다.
+3. 응답의 `revision`은 실제 분석된 git commit SHA입니다. 같은 커밋을 다시 조회할 때
+   `/api/tree/`, `/api/graph/`, `/api/qa/`의 `revision`으로 넘기면 같은 분석 결과를 고정해서 볼 수 있습니다.
+
+캐시 의미:
+- 서버는 `repo + revision(commit SHA)` 기준으로 분석 결과를 저장합니다.
+- 같은 repo/revision 요청은 다시 clone/parse하지 않고 저장된 분석 artifact를 반환합니다.
+- `revision`을 생략하면 현재 HEAD를 분석합니다. HEAD가 바뀌면 새 분석 결과가 만들어질 수 있습니다.
+
+주요 실패: 400 잘못된 URL/revision, 404 not found/private/revision 없음, 413 너무 큰 레포, 504 timeout.
+'''
+_ANALYSIS_POST_DESCRIPTION = '''
+GET `/api/analysis/`와 같은 분석을 POST body로 요청합니다.
+
+폼/query string보다 JSON body가 편한 클라이언트에서 사용하세요.
+응답의 `analysis_id`와 `revision` 재사용 방식은 GET과 같습니다.
+'''
+_ANALYSIS_DETAIL_DESCRIPTION = '''
+이미 생성된 분석 run을 `analysis_id`로 다시 조회합니다.
+
+프런트엔드가 이전 응답에서 받은 `analysis_id`를 보관하고 있다면 repo URL 없이도 같은 분석 artifact를 불러올 수 있습니다.
+'''
+_TREE_DESCRIPTION = '''
+레포 파일/심볼 트리를 반환합니다.
+
+초기 화면에서 사이드바 파일 트리나 구조 트리를 그릴 때 사용합니다.
+`revision`을 생략하면 최신 HEAD 기준으로 분석하고, 특정 커밋을 고정하려면 `/api/analysis/` 응답의 `revision`을 넣으세요.
+분석 캐시는 `/api/analysis/`, `/api/graph/`, `/api/qa/`와 공유됩니다.
+'''
+_GRAPH_DESCRIPTION = '''
+레포의 코드 그래프 노드/엣지를 반환합니다.
+
+캔버스/그래프 뷰를 그릴 때 사용합니다. 응답의 `nodes[].id`는 `/api/node-summary/`의 `node_id`,
+`/api/qa/`의 `selected_node_id`로 재사용할 수 있습니다.
+`revision`은 `/api/analysis/` 응답 값을 넣으면 같은 분석 결과를 고정합니다.
+'''
+_SHARE_CREATE_DESCRIPTION = '''
+현재 분석 결과를 공유 가능한 링크로 만듭니다.
+
+프런트엔드에서 "공유하기" 버튼을 만들 때 사용합니다.
+응답의 `urls.readme_svg`와 `snippets.markdown_image_link`는 README에 바로 붙일 수 있습니다.
+`mode=fixed`는 현재 revision에 고정되고, `mode=latest`는 조회 시 최신 HEAD 분석으로 갱신됩니다.
+'''
+_SHARE_DETAIL_DESCRIPTION = '''
+share_id로 공개 공유 데이터를 다시 조회합니다.
+
+공유 상세 페이지를 열 때 사용합니다. 응답에는 graph 데이터와 embed/readme 링크가 포함됩니다.
+'''
+_SHARE_GRAPH_SVG_DESCRIPTION = '''
+이미 생성된 share_id를 기준으로 README-safe SVG 이미지를 반환합니다.
+
+새 연결에는 `/api/readme-graph.svg?url=...`가 더 단순합니다.
+이 엔드포인트는 `/api/share/` 응답의 `urls.readme_svg`를 그대로 렌더링할 때 사용합니다.
+'''
+_EMBED_DESCRIPTION = '''
+share_id 기반 HTML embed 페이지입니다.
+
+일반 웹페이지 iframe에는 사용할 수 있지만, GitHub README는 iframe을 렌더링하지 않습니다.
+GitHub README에는 `snippets.markdown_image_link` 또는 `/api/readme-graph.svg`를 사용하세요.
+'''
+_DIFF_BY_REVISION_DESCRIPTION = '''
+같은 레포의 두 revision 분석 결과를 비교합니다.
+
+`base`는 필수이고 `head`를 생략하면 최신 HEAD와 비교합니다.
+프런트엔드에서 변경 전/후 그래프 차이를 보여줄 때 사용합니다.
+'''
+_DIFF_BY_ID_DESCRIPTION = '''
+두 분석 run ID를 비교합니다.
+
+현재 path의 `analysis_id`가 head이고, query의 `base`가 비교 기준 분석 run ID입니다.
+'''
+_SUMMARY_DESCRIPTION = '''
+분석 결과 전체에 대한 LLM 요약을 생성하거나 캐시된 요약을 반환합니다.
+
+반드시 `/api/analysis/`에서 받은 `analysis_id`를 먼저 넣어야 합니다.
+`kind=repo_overview`는 짧은 전체 설명, `kind=onboarding_guide`는 온보딩 관점 설명입니다.
+'''
+_NODE_SUMMARY_DESCRIPTION = '''
+그래프의 특정 노드 하나를 요약합니다.
+
+`analysis_id`는 `/api/analysis/` 응답에서, `node_id`는 `/api/graph/` 응답의 `nodes[].id`에서 가져오세요.
+'''
+_QA_DESCRIPTION = '''
+레포 분석 결과를 바탕으로 질문에 답합니다.
+
+권장 사용법:
+- 이미 `/api/analysis/`를 호출했다면 `analysis_id`를 보내세요. repo URL 재분석을 피할 수 있습니다.
+- 특정 그래프 노드를 선택한 상태라면 `selected_node_id`를 함께 보내면 답변 범위가 좁아집니다.
+- `repo_url`만 보내도 동작하지만, 프런트엔드에서는 `analysis_id` 재사용이 더 안정적입니다.
+'''
+_REPO_FILES_DESCRIPTION = '''
+GitHub 레포의 파일 경로 목록만 빠르게 반환합니다.
+
+코드 그래프/요약이 필요 없는 단순 파일 목록 UI에 사용합니다.
+구조 분석이 필요한 화면에서는 `/api/tree/` 또는 `/api/analysis/`를 사용하세요.
+'''
 
 
 @extend_schema(
     methods=['GET'],
     operation_id='analysis_retrieve_by_url',
+    description=_ANALYSIS_GET_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
-        OpenApiParameter(name='revision', description='캐시된 분석 revision', required=False, type=str),
+        OpenApiParameter(name='url', description='필수. 분석할 public GitHub 레포 URL. 예: https://github.com/psf/requests', required=True, type=str),
+        OpenApiParameter(name='revision', description='선택. 특정 commit/ref를 고정할 때 입력합니다. 보통은 생략하고, 재조회 시 응답의 revision을 재사용합니다.', required=False, type=str),
     ],
     responses=_ANALYSIS_RESPONSE_SCHEMA,
 )
 @extend_schema(
     methods=['POST'],
     operation_id='analysis_create',
+    description=_ANALYSIS_POST_DESCRIPTION,
     request=_ANALYSIS_REQUEST_SCHEMA,
     responses=_ANALYSIS_RESPONSE_SCHEMA,
 )
@@ -323,6 +426,7 @@ def analysis(request):
 
 @extend_schema(
     operation_id='analysis_retrieve_by_id',
+    description=_ANALYSIS_DETAIL_DESCRIPTION,
     responses=_ANALYSIS_DETAIL_RESPONSE_SCHEMA,
 )
 @api_view(['GET'])
@@ -335,8 +439,9 @@ def analysis_detail(request, analysis_id: int):
 
 @extend_schema(
     operation_id='analysis_diff_by_id',
+    description=_DIFF_BY_ID_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='base', description='비교 기준 분석 run ID', required=True, type=int),
+        OpenApiParameter(name='base', description='필수. 비교 기준이 되는 analysis_id. path의 analysis_id는 비교 대상 head입니다.', required=True, type=int),
     ],
     responses=_DIFF_RESPONSE_SCHEMA,
 )
@@ -358,10 +463,11 @@ def analysis_diff(request, analysis_id: int):
 
 @extend_schema(
     operation_id='analysis_diff_by_revision',
+    description=_DIFF_BY_REVISION_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
-        OpenApiParameter(name='base', description='기준 revision', required=True, type=str),
-        OpenApiParameter(name='head', description='대상 revision. 생략하면 latest HEAD', required=False, type=str),
+        OpenApiParameter(name='url', description='필수. 비교할 public GitHub 레포 URL.', required=True, type=str),
+        OpenApiParameter(name='base', description='필수. 기준 revision 또는 commit SHA.', required=True, type=str),
+        OpenApiParameter(name='head', description='선택. 대상 revision. 생략하면 최신 HEAD와 비교합니다.', required=False, type=str),
     ],
     responses=_DIFF_RESPONSE_SCHEMA,
 )
@@ -396,6 +502,7 @@ def graph_diff(request):
 @extend_schema(
     methods=['POST'],
     operation_id='share_create',
+    description=_SHARE_CREATE_DESCRIPTION,
     request=_SHARE_CREATE_SCHEMA,
     responses={201: _SHARE_RESPONSE_SCHEMA},
 )
@@ -495,6 +602,7 @@ def readme_graph_svg(request):
 
 @extend_schema(
     operation_id='share_retrieve',
+    description=_SHARE_DETAIL_DESCRIPTION,
     responses=_SHARE_RESPONSE_SCHEMA,
 )
 @api_view(['GET'])
@@ -514,13 +622,14 @@ def share_detail(request, share_id: str):
 
 @extend_schema(
     operation_id='share_graph_svg',
+    description=_SHARE_GRAPH_SVG_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='width', description=f'SVG width ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH})', required=False, type=int),
-        OpenApiParameter(name='height', description=f'SVG height ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT})', required=False, type=int),
-        OpenApiParameter(name='limit', description=f'Max rendered graph nodes ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT})', required=False, type=int),
-        OpenApiParameter(name='theme', description='light 또는 dark', required=False, type=str),
+        OpenApiParameter(name='width', description=f'선택. SVG 너비 px ({MIN_SVG_WIDTH}-{MAX_SVG_WIDTH}).', required=False, type=int),
+        OpenApiParameter(name='height', description=f'선택. SVG 높이 px ({MIN_SVG_HEIGHT}-{MAX_SVG_HEIGHT}).', required=False, type=int),
+        OpenApiParameter(name='limit', description=f'선택. 모듈 선별 한도 ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}). 기본값 권장.', required=False, type=int),
+        OpenApiParameter(name='theme', description='선택. light 또는 dark.', required=False, type=str),
     ],
-    responses={200: OpenApiTypes.STR},
+    responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
 )
 @api_view(['GET', 'HEAD'])
 def share_graph_svg(request, share_id: str):
@@ -553,6 +662,7 @@ def share_graph_svg(request, share_id: str):
 
 @extend_schema(
     operation_id='share_embed',
+    description=_EMBED_DESCRIPTION,
     responses={200: OpenApiTypes.STR},
 )
 @xframe_options_exempt
@@ -602,14 +712,15 @@ def embed(request, share_id: str):
 
 
 @extend_schema(
+    description=_REPO_FILES_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
+        OpenApiParameter(name='url', description='필수. 파일 목록을 조회할 public GitHub 레포 URL.', required=True, type=str),
     ],
     responses=inline_serializer(
         name='RepoFilesResponse',
         fields={
-            'repo': serializers.CharField(),
-            'files': serializers.ListField(child=serializers.CharField()),
+            'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
+            'files': serializers.ListField(child=serializers.CharField(), help_text='레포 안의 파일 경로 목록입니다.'),
         },
     ),
 )
@@ -638,18 +749,19 @@ def get_repo_file(request):
 
 
 @extend_schema(
+    description=_TREE_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
-        OpenApiParameter(name='revision', description='캐시된 분석 revision', required=False, type=str),
+        OpenApiParameter(name='url', description='필수. 트리를 조회할 public GitHub 레포 URL.', required=True, type=str),
+        OpenApiParameter(name='revision', description='선택. 특정 분석 결과를 고정할 때 `/api/analysis/` 응답의 revision을 넣습니다.', required=False, type=str),
     ],
     responses=inline_serializer(
         name='RepoTreeResponse',
         fields={
-            'analysis_id': serializers.IntegerField(allow_null=True),
-            'repo': serializers.CharField(),
-            'revision': serializers.CharField(),
-            'tree': serializers.JSONField(),
-            'warnings': serializers.JSONField(),
+            'analysis_id': serializers.IntegerField(allow_null=True, help_text='이 tree가 나온 분석 run ID입니다. summary/qa에 재사용할 수 있습니다.'),
+            'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
+            'revision': serializers.CharField(help_text='실제로 분석된 git commit SHA입니다. 같은 tree를 다시 볼 때 query revision으로 재사용합니다.'),
+            'tree': serializers.JSONField(help_text='프런트엔드 파일/심볼 트리 UI에 사용할 계층 구조입니다.'),
+            'warnings': serializers.JSONField(help_text='분석 경고 목록입니다.'),
         },
     ),
 )
@@ -683,21 +795,22 @@ def get_repo_tree(request):
 
 
 @extend_schema(
+    description=_GRAPH_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='url', description='GitHub 레포 URL', required=True, type=str),
-        OpenApiParameter(name='revision', description='캐시된 분석 revision', required=False, type=str),
+        OpenApiParameter(name='url', description='필수. 그래프를 조회할 public GitHub 레포 URL.', required=True, type=str),
+        OpenApiParameter(name='revision', description='선택. 특정 분석 결과를 고정할 때 `/api/analysis/` 응답의 revision을 넣습니다.', required=False, type=str),
     ],
     responses=inline_serializer(
         name='RepoGraphResponse',
         fields={
-            'analysis_id': serializers.IntegerField(allow_null=True),
-            'repo': serializers.CharField(),
-            'revision': serializers.CharField(),
-            'nodes': serializers.JSONField(),
-            'edges': serializers.JSONField(),
-            'entrypoints': serializers.JSONField(),
-            'key_modules': serializers.JSONField(),
-            'warnings': serializers.JSONField(),
+            'analysis_id': serializers.IntegerField(allow_null=True, help_text='이 graph가 나온 분석 run ID입니다. summary/qa에 재사용할 수 있습니다.'),
+            'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
+            'revision': serializers.CharField(help_text='실제로 분석된 git commit SHA입니다. 같은 graph를 다시 볼 때 query revision으로 재사용합니다.'),
+            'nodes': serializers.JSONField(help_text='그래프 노드 목록입니다. 각 node의 id는 node-summary/qa selected_node_id에 재사용합니다.'),
+            'edges': serializers.JSONField(help_text='그래프 엣지 목록입니다. source/target은 nodes[].id를 참조합니다.'),
+            'entrypoints': serializers.JSONField(help_text='파서가 추정한 진입점 목록입니다.'),
+            'key_modules': serializers.JSONField(help_text='중요도가 높게 계산된 모듈 목록입니다.'),
+            'warnings': serializers.JSONField(help_text='분석 경고 목록입니다.'),
         },
     ),
 )
@@ -733,19 +846,20 @@ def get_repo_graph(request):
 _SUMMARY_RESPONSE_SCHEMA = inline_serializer(
     name='SummaryResponse',
     fields={
-        'analysis_id': serializers.IntegerField(),
-        'repo': serializers.CharField(),
-        'revision': serializers.CharField(),
-        'summary': serializers.JSONField(),
-        'cached': serializers.BooleanField(),
+        'analysis_id': serializers.IntegerField(help_text='요약 대상 분석 run ID입니다.'),
+        'repo': serializers.CharField(help_text='요약 대상 owner/repo입니다.'),
+        'revision': serializers.CharField(help_text='요약 대상 git commit SHA입니다.'),
+        'summary': serializers.JSONField(help_text='LLM이 생성한 요약 결과입니다.'),
+        'cached': serializers.BooleanField(help_text='true면 기존 저장된 요약을 반환한 것입니다. false면 이번 요청에서 생성했습니다.'),
     },
 )
 
 
 @extend_schema(
+    description=_SUMMARY_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='analysis_id', description='분석 run ID', required=True, type=int),
-        OpenApiParameter(name='kind', description='repo_overview 또는 onboarding_guide', required=False, type=str),
+        OpenApiParameter(name='analysis_id', description='필수. `/api/analysis/` 응답의 analysis_id.', required=True, type=int),
+        OpenApiParameter(name='kind', description='선택. repo_overview 또는 onboarding_guide. 생략하면 repo_overview.', required=False, type=str),
     ],
     responses=_SUMMARY_RESPONSE_SCHEMA,
 )
@@ -766,9 +880,10 @@ def summary(request):
 
 
 @extend_schema(
+    description=_NODE_SUMMARY_DESCRIPTION,
     parameters=[
-        OpenApiParameter(name='analysis_id', description='분석 run ID', required=True, type=int),
-        OpenApiParameter(name='node_id', description='요약할 graph node ID', required=True, type=str),
+        OpenApiParameter(name='analysis_id', description='필수. `/api/analysis/` 응답의 analysis_id.', required=True, type=int),
+        OpenApiParameter(name='node_id', description='필수. `/api/graph/` 응답의 nodes[].id.', required=True, type=str),
     ],
     responses=_SUMMARY_RESPONSE_SCHEMA,
 )
@@ -789,16 +904,17 @@ def node_summary(request):
 
 
 @extend_schema(
+    description=_QA_DESCRIPTION,
     request=inline_serializer(
         name='QARequest',
         fields={
-            'repo_url': serializers.CharField(),
-            'question': serializers.CharField(),
-            'revision': serializers.CharField(required=False),
-            'analysis_id': serializers.IntegerField(required=False, min_value=1),
-            'selected_node_id': serializers.CharField(required=False),
-            'selected_file_path': serializers.CharField(required=False),
-            'max_context_files': serializers.IntegerField(required=False, min_value=1, max_value=10),
+            'repo_url': serializers.CharField(required=False, help_text='analysis_id가 없을 때 필요한 GitHub 레포 URL입니다.'),
+            'question': serializers.CharField(help_text='레포에 대해 물어볼 질문입니다.'),
+            'revision': serializers.CharField(required=False, help_text='repo_url 방식에서 특정 revision을 고정할 때 사용합니다.'),
+            'analysis_id': serializers.IntegerField(required=False, min_value=1, help_text='/api/analysis/ 응답의 analysis_id입니다. 있으면 repo_url보다 우선 사용합니다.'),
+            'selected_node_id': serializers.CharField(required=False, help_text='/api/graph/ 응답의 nodes[].id입니다. 선택 노드 중심으로 답변할 때 사용합니다.'),
+            'selected_file_path': serializers.CharField(required=False, help_text='선택 파일 중심으로 답변할 때 사용합니다.'),
+            'max_context_files': serializers.IntegerField(required=False, min_value=1, max_value=10, help_text='답변에 사용할 최대 context 파일 수입니다. 기본값 4.'),
         }
     ),
     responses=inline_serializer(
