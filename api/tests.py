@@ -2204,6 +2204,16 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertIn('app.py', svg_text)
         self.assertNotIn('return "v1"', svg_text)
 
+        accept_response = cast(
+            HttpResponse,
+            self.client.get(
+                f'/api/share/{create_payload["share_id"]}/graph.svg',
+                HTTP_ACCEPT='image/svg+xml',
+            ),
+        )
+        self.assertEqual(accept_response.status_code, 200)
+        self.assertIn('image/svg+xml', accept_response.headers.get('Content-Type', ''))
+
         head_response = cast(HttpResponse, self.client.head(f'/api/share/{create_payload["share_id"]}/graph.svg'))
         self.assertEqual(head_response.status_code, 200)
         self.assertIn('image/svg+xml', head_response.headers.get('Content-Type', ''))
@@ -2226,6 +2236,17 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertIn('repo URL input', svg_text)
         self.assertNotIn('return "v1"', svg_text)
         self.assertEqual(ShareLink.objects.count(), 0)
+
+        accept_response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/readme-graph.svg',
+                {'url': 'https://github.com/owner/repo'},
+                HTTP_ACCEPT='image/svg+xml',
+            ),
+        )
+        self.assertEqual(accept_response.status_code, 200)
+        self.assertIn('image/svg+xml', accept_response.headers.get('Content-Type', ''))
 
         head_response = cast(HttpResponse, self.client.head('/api/readme-graph.svg', {'url': 'https://github.com/owner/repo'}))
         self.assertEqual(head_response.status_code, 200)
