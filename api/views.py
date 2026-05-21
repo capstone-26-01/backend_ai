@@ -8,7 +8,9 @@ from django.conf import settings
 from django.http import HttpResponse
 from django.views.decorators.clickjacking import xframe_options_exempt
 from rest_framework.decorators import api_view
+from rest_framework.decorators import renderer_classes
 from rest_framework.decorators import throttle_classes
+from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
@@ -29,6 +31,7 @@ from .readme_svg import (
     normalize_svg_options,
     render_share_graph_svg,
 )
+from .renderers import SvgRenderer
 from .throttles import ShareCreateRateThrottle
 from .serializers import (
     AnalysisDiffRequestSerializer,
@@ -556,6 +559,7 @@ def share(request):
     responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
 )
 @api_view(['GET', 'HEAD'])
+@renderer_classes([JSONRenderer, SvgRenderer])
 def readme_graph_svg(request):
     request_data = {'repo_url': request.GET.get('url') or request.GET.get('repo_url')}
     if request.GET.get('revision') is not None:
@@ -632,6 +636,7 @@ def share_detail(request, share_id: str):
     responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
 )
 @api_view(['GET', 'HEAD'])
+@renderer_classes([JSONRenderer, SvgRenderer])
 def share_graph_svg(request, share_id: str):
     if not is_safe_share_id(share_id):
         return Response({'error': 'share를 찾을 수 없습니다'}, status=404)
