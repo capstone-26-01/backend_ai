@@ -178,3 +178,101 @@ class NodeSummaryRequestSerializer(serializers.Serializer):
         if not is_safe_graph_id(value):
             raise serializers.ValidationError('올바른 node_id가 아닙니다')
         return value
+
+
+class IssueListRequestSerializer(RepoUrlSerializer):
+    page = serializers.IntegerField(required=False, min_value=1, default=1)
+    per_page = serializers.IntegerField(required=False, min_value=1, max_value=100, default=30)
+    state = serializers.ChoiceField(choices=('open',), required=False, default='open')
+
+
+class IssueRelatedNodesRequestSerializer(serializers.Serializer):
+    analysis_id = serializers.IntegerField(min_value=1)
+    issue_number = serializers.IntegerField(min_value=1)
+    max_nodes = serializers.IntegerField(required=False, min_value=1, max_value=20, default=8)
+
+
+class IssueAuthorSerializer(serializers.Serializer):
+    login = serializers.CharField(help_text='GitHub 사용자 login입니다.')
+    avatar_url = serializers.URLField(help_text='사용자 avatar 이미지 URL입니다.')
+    html_url = serializers.URLField(help_text='GitHub 사용자 프로필 URL입니다.')
+
+
+class IssueLabelSerializer(serializers.Serializer):
+    name = serializers.CharField(help_text='GitHub issue label 이름입니다.')
+    color = serializers.CharField(help_text='GitHub label 색상 hex 값입니다. # 없이 내려옵니다.')
+    description = serializers.CharField(allow_blank=True, help_text='GitHub label 설명입니다. 없으면 빈 문자열입니다.')
+
+
+class IssueListItemSerializer(serializers.Serializer):
+    key = serializers.CharField(help_text='프런트엔드 list key로 쓰기 좋은 안정 식별자입니다. 형식: github:{owner}/{repo}#{number}')
+    number = serializers.IntegerField(help_text='GitHub issue 번호입니다. 관련 노드 추천 API의 issue_number로 그대로 넘깁니다.')
+    title = serializers.CharField(help_text='Issue 제목입니다.')
+    state = serializers.CharField(help_text='현재는 open issue만 반환합니다.')
+    html_url = serializers.URLField(help_text='GitHub issue 페이지 URL입니다.')
+    author = IssueAuthorSerializer(help_text='Issue 작성자 정보입니다.')
+    labels = IssueLabelSerializer(many=True, help_text='Issue label 목록입니다.')
+    assignees = IssueAuthorSerializer(many=True, help_text='Issue assignee 목록입니다.')
+    comments_count = serializers.IntegerField(help_text='Issue comment 수입니다.')
+    created_at = serializers.DateTimeField(help_text='Issue 생성 시각입니다.')
+    updated_at = serializers.DateTimeField(help_text='Issue 마지막 수정 시각입니다.')
+    body_excerpt = serializers.CharField(help_text='목록 화면 preview용 본문 요약입니다. 전체 body가 아닙니다.')
+    is_pull_request = serializers.BooleanField(help_text='항상 false입니다. 실제 구현에서도 PR은 제외하고 issue만 반환합니다.')
+
+
+class IssueListResponseSerializer(serializers.Serializer):
+    repo = serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.')
+    provider = serializers.CharField(help_text='현재 provider입니다. GitHub repo만 지원하므로 github입니다.')
+    source = serializers.CharField(help_text='현재 데이터 출처입니다. mock이면 실제 GitHub 조회가 아닙니다.')
+    mock = serializers.BooleanField(help_text='true면 프런트엔드 선작업용 mock 응답입니다.')
+    state = serializers.CharField(help_text='조회한 issue 상태입니다. 현재는 open만 지원합니다.')
+    page = serializers.IntegerField(help_text='현재 페이지 번호입니다.')
+    per_page = serializers.IntegerField(help_text='페이지당 issue 수입니다.')
+    has_next_page = serializers.BooleanField(help_text='다음 페이지 존재 여부입니다.')
+    next_page = serializers.IntegerField(allow_null=True, help_text='다음 페이지 번호입니다. 없으면 null입니다.')
+    issues = IssueListItemSerializer(many=True, help_text='Open issue 목록입니다.')
+
+
+class IssueRefSerializer(serializers.Serializer):
+    key = serializers.CharField(help_text='Issue 안정 식별자입니다. 형식: github:{owner}/{repo}#{number}')
+    number = serializers.IntegerField(help_text='GitHub issue 번호입니다.')
+    title = serializers.CharField(help_text='Issue 제목입니다.')
+    html_url = serializers.URLField(help_text='GitHub issue 페이지 URL입니다.')
+
+
+class IssueRelatedNodeSerializer(serializers.Serializer):
+    id = serializers.CharField(help_text='Graph node ID입니다. /api/graph/ 응답의 nodes[].id와 같습니다.')
+    kind = serializers.CharField(allow_blank=True, help_text='file, module, class, function, method, external 등 node 종류입니다.')
+    label = serializers.CharField(allow_blank=True, help_text='화면에 표시하기 좋은 node 이름입니다.')
+    path = serializers.CharField(allow_null=True, help_text='연결된 repo 내부 파일 경로입니다. 없으면 null입니다.')
+    start_line = serializers.IntegerField(allow_null=True, help_text='파일 내 시작 줄입니다. 알 수 없으면 null입니다.')
+    end_line = serializers.IntegerField(allow_null=True, help_text='파일 내 끝 줄입니다. 알 수 없으면 null입니다.')
+    metadata = serializers.JSONField(help_text='Graph node 원본 metadata입니다.')
+
+
+class IssueRelatedEvidenceSerializer(serializers.Serializer):
+    type = serializers.CharField(help_text='근거 종류입니다. mock 응답에서는 mock 또는 graph_metadata입니다.')
+    message = serializers.CharField(help_text='프런트엔드에서 표시할 수 있는 짧은 근거 설명입니다.')
+
+
+class IssueRelatedNodeCandidateSerializer(serializers.Serializer):
+    rank = serializers.IntegerField(help_text='추천 순위입니다. 1부터 시작합니다.')
+    score = serializers.FloatField(help_text='0-1 범위의 관련도 점수입니다. mock에서는 deterministic placeholder입니다.')
+    node_id = serializers.CharField(help_text='추천된 graph node ID입니다.')
+    node = IssueRelatedNodeSerializer(help_text='프런트엔드 표시용 node 요약입니다.')
+    reason = serializers.CharField(help_text='왜 이 node가 추천되었는지에 대한 짧은 설명입니다.')
+    evidence = IssueRelatedEvidenceSerializer(many=True, help_text='추천 근거 목록입니다.')
+
+
+class IssueRelatedNodesResponseSerializer(serializers.Serializer):
+    analysis_id = serializers.IntegerField(help_text='추천 기준 분석 run ID입니다.')
+    repo = serializers.CharField(help_text='분석 run이 속한 owner/repo입니다.')
+    revision = serializers.CharField(help_text='분석 run의 git commit SHA입니다.')
+    provider = serializers.CharField(help_text='현재 provider입니다. GitHub repo만 지원하므로 github입니다.')
+    source = serializers.CharField(help_text='현재 데이터 출처입니다. mock이면 실제 GitHub issue/LLM 조회가 아닙니다.')
+    mock = serializers.BooleanField(help_text='true면 프런트엔드 선작업용 mock 응답입니다.')
+    issue = IssueRefSerializer(help_text='프런트엔드가 선택한 issue 정보입니다.')
+    selected_node_ids = serializers.ListField(child=serializers.CharField(), help_text='그래프에서 바로 highlight할 node ID 목록입니다.')
+    candidates = IssueRelatedNodeCandidateSerializer(many=True, help_text='관련도가 높다고 판단된 graph node 후보 목록입니다.')
+    limits = serializers.JSONField(help_text='요청에서 적용된 max_nodes 등 제한값입니다.')
+    warnings = serializers.JSONField(help_text='추천 생성 중 발생한 경고 목록입니다.')

@@ -1469,6 +1469,136 @@ class AnalysisEndpointReuseTests(TestCase):
         self.assertIn('selected_file_path', payload)
 
 
+class IssueMockEndpointTests(TestCase):
+    def _create_analysis_run(self) -> AnalysisRun:
+        repository = Repository.objects.create(
+            provider='github',
+            owner='owner',
+            name='repo',
+            full_name='owner/repo',
+            clone_url='https://github.com/owner/repo.git',
+        )
+        analysis_run = AnalysisRun.objects.create(
+            repository=repository,
+            ref='HEAD',
+            revision='abc123',
+            status=AnalysisRun.STATUS_SUCCEEDED,
+            finished_at=timezone.now(),
+        )
+        payload = build_graph_artifact(
+            repo_path='owner/repo',
+            revision='abc123',
+            graph={
+                'tree': [],
+                'nodes': [
+                    {
+                        'id': 'api/services.py::get_repo_analysis',
+                        'type': 'function',
+                        'label': 'get_repo_analysis',
+                        'file': 'api/services.py',
+                        'start_line': 250,
+                        'end_line': 280,
+                    },
+                    {
+                        'id': 'parser/services.py::parse_repo',
+                        'type': 'function',
+                        'label': 'parse_repo',
+                        'file': 'parser/services.py',
+                        'start_line': 700,
+                        'end_line': 740,
+                    },
+                    {
+                        'id': 'api/views.py::analysis',
+                        'type': 'function',
+                        'label': 'analysis',
+                        'file': 'api/views.py',
+                        'start_line': 330,
+                        'end_line': 360,
+                    },
+                ],
+                'edges': [],
+            },
+            entrypoints=[],
+            key_modules=[
+                {'id': 'api/services.py::get_repo_analysis', 'path': 'api/services.py', 'score': 10},
+            ],
+        )
+        AnalysisArtifact.objects.create(
+            analysis_run=analysis_run,
+            schema_version=GRAPH_ARTIFACT_SCHEMA_VERSION,
+            payload=payload,
+            node_count=len(payload['nodes']),
+            edge_count=len(payload['edges']),
+            warning_count=0,
+        )
+        return analysis_run
+
+    def test_issues_endpoint_returns_mock_open_issue_list(self):
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+        issues = cast(list[dict[str, object]], payload['issues'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['repo'], 'owner/repo')
+        self.assertEqual(payload['source'], 'mock')
+        self.assertTrue(payload['mock'])
+        self.assertEqual(payload['state'], 'open')
+        self.assertGreater(len(issues), 0)
+        self.assertEqual(issues[0]['key'], 'github:owner/repo#42')
+        self.assertFalse(issues[0]['is_pull_request'])
+
+    def test_issues_endpoint_rejects_invalid_repo_url(self):
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://example.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('repo_url', payload)
+
+    def test_issue_related_nodes_returns_real_graph_node_ids_from_mock_issue(self):
+        analysis_run = self._create_analysis_run()
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/issues/related-nodes/',
+                data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 2},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        selected_node_ids = cast(list[str], payload['selected_node_ids'])
+        candidates = cast(list[dict[str, object]], payload['candidates'])
+        known_node_ids = {
+            'api/services.py::get_repo_analysis',
+            'parser/services.py::parse_repo',
+            'api/views.py::analysis',
+        }
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['analysis_id'], analysis_run.id)
+        self.assertEqual(payload['repo'], 'owner/repo')
+        self.assertEqual(payload['revision'], 'abc123')
+        self.assertEqual(payload['source'], 'mock')
+        self.assertTrue(payload['mock'])
+        self.assertLessEqual(len(selected_node_ids), 2)
+        self.assertTrue(set(selected_node_ids).issubset(known_node_ids))
+        self.assertEqual(candidates[0]['node_id'], selected_node_ids[0])
+
+    def test_issue_related_nodes_returns_404_for_unknown_mock_issue(self):
+        analysis_run = self._create_analysis_run()
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/issues/related-nodes/',
+                data={'analysis_id': analysis_run.id, 'issue_number': 999},
+                content_type='application/json',
+            ),
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+
 @override_settings(
     TEMP_DIR=settings.BASE_DIR / 'temp' / 'analysis-endpoint-tests',
     PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'analysis-endpoint-tests' / 'playground',
@@ -2344,6 +2474,10 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('분석 캐시는 `/api/analysis/`, `/api/graph/`, `/api/qa/`와 공유됩니다', schema_text)
         self.assertIn('/api/graph/', schema_text)
         self.assertIn('응답의 `nodes[].id`는 `/api/node-summary/`', schema_text)
+        self.assertIn('/api/issues/', schema_text)
+        self.assertIn('/api/issues/related-nodes/', schema_text)
+        self.assertIn('프런트엔드 선작업용 GitHub open issue 목록 mock API입니다', schema_text)
+        self.assertIn('응답의 `selected_node_ids`는 graph highlight에 바로 쓰고', schema_text)
         self.assertIn('/api/summary/', schema_text)
         self.assertIn('/api/node-summary/', schema_text)
         self.assertIn('/api/qa/', schema_text)

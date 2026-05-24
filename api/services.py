@@ -20,6 +20,7 @@ from github_repo.services import (
     get_repo_snapshot_at_revision_or_raise as get_repo_snapshot_at_revision,
     get_repo_snapshot_or_raise as get_repo_snapshot,
 )
+from llm.context_selection import rank_nodes
 from llm.summaries import (
     SUMMARY_KIND_NODE,
     SUMMARY_KIND_ONBOARDING,
@@ -34,6 +35,62 @@ from parser.services import parse_repo
 
 class ShareInputError(ValueError):
     pass
+
+
+MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
+    {
+        'number': 42,
+        'title': 'Repository analysis fails on large Python projects',
+        'labels': [
+            {'name': 'bug', 'color': 'd73a4a', 'description': 'Something is not working'},
+            {'name': 'analysis', 'color': '1d76db', 'description': 'Repository analysis flow'},
+        ],
+        'comments_count': 3,
+        'created_at': '2026-05-20T10:00:00Z',
+        'updated_at': '2026-05-23T12:30:00Z',
+        'body_excerpt': 'Repository analysis fails when the project has many Python files or the parser exceeds configured limits.',
+        'search_text': 'repository analysis parse parser python files limits timeout ingestion graph artifact',
+    },
+    {
+        'number': 77,
+        'title': 'Graph view misses function call relationships',
+        'labels': [
+            {'name': 'graph', 'color': '5319e7', 'description': 'Code graph and relationship rendering'},
+            {'name': 'enhancement', 'color': 'a2eeef', 'description': 'New feature or request'},
+        ],
+        'comments_count': 5,
+        'created_at': '2026-05-18T08:15:00Z',
+        'updated_at': '2026-05-22T16:45:00Z',
+        'body_excerpt': 'The graph should expose function calls and imports clearly enough for the frontend to highlight related code.',
+        'search_text': 'graph nodes edges function calls imports relationships parser services highlight',
+    },
+    {
+        'number': 103,
+        'title': 'Swagger docs are unclear for frontend integration',
+        'labels': [
+            {'name': 'documentation', 'color': '0075ca', 'description': 'Improvements or additions to documentation'},
+            {'name': 'frontend', 'color': 'fbca04', 'description': 'Frontend integration support'},
+        ],
+        'comments_count': 2,
+        'created_at': '2026-05-17T13:20:00Z',
+        'updated_at': '2026-05-21T09:10:00Z',
+        'body_excerpt': 'Frontend developers need concise request and response examples for analysis, graph, summary, and issue-related APIs.',
+        'search_text': 'swagger docs api views serializers frontend schema request response examples',
+    },
+    {
+        'number': 128,
+        'title': 'QA should focus on the selected graph node',
+        'labels': [
+            {'name': 'qa', 'color': '0e8a16', 'description': 'Question answering behavior'},
+            {'name': 'llm', 'color': 'bfdadc', 'description': 'LLM-backed workflow'},
+        ],
+        'comments_count': 4,
+        'created_at': '2026-05-16T11:40:00Z',
+        'updated_at': '2026-05-22T18:05:00Z',
+        'body_excerpt': 'When the user selects a node in the graph, QA should prioritize that node and nearby code context.',
+        'search_text': 'qa selected graph node context files llm answer question neighbors',
+    },
+]
 
 
 def _analysis_parts(repo_path: str) -> tuple[str, str]:
@@ -279,6 +336,164 @@ def _get_succeeded_artifact_record_by_id(analysis_id: int) -> tuple[AnalysisRun,
         return analysis_run, analysis_run.artifact
     except AnalysisArtifact.DoesNotExist:
         return None
+
+
+def _mock_github_user(login: str) -> dict[str, str]:
+    return {
+        'login': login,
+        'avatar_url': f'https://github.com/{login}.png',
+        'html_url': f'https://github.com/{login}',
+    }
+
+
+def _issue_key(repo_path: str, issue_number: int) -> str:
+    return f'github:{repo_path}#{issue_number}'
+
+
+def _mock_issue_payload(repo_path: str, template: dict[str, Any]) -> dict[str, Any]:
+    issue_number = int(template['number'])
+    return {
+        'key': _issue_key(repo_path, issue_number),
+        'number': issue_number,
+        'title': template['title'],
+        'state': 'open',
+        'html_url': f'https://github.com/{repo_path}/issues/{issue_number}',
+        'author': _mock_github_user('octocat'),
+        'labels': template['labels'],
+        'assignees': [],
+        'comments_count': template['comments_count'],
+        'created_at': template['created_at'],
+        'updated_at': template['updated_at'],
+        'body_excerpt': template['body_excerpt'],
+        'is_pull_request': False,
+    }
+
+
+def _mock_issue_template(issue_number: int) -> dict[str, Any] | None:
+    for template in MOCK_ISSUE_TEMPLATES:
+        if int(template['number']) == issue_number:
+            return template
+    return None
+
+
+def get_mock_issue_list_response(repo_path: str, *, page: int = 1, per_page: int = 30) -> dict[str, Any]:
+    page = max(1, page)
+    per_page = max(1, min(per_page, 100))
+    start = (page - 1) * per_page
+    end = start + per_page
+    issues = [_mock_issue_payload(repo_path, template) for template in MOCK_ISSUE_TEMPLATES]
+    paged_issues = issues[start:end]
+    has_next_page = end < len(issues)
+    return {
+        'repo': repo_path,
+        'provider': 'github',
+        'source': 'mock',
+        'mock': True,
+        'state': 'open',
+        'page': page,
+        'per_page': per_page,
+        'has_next_page': has_next_page,
+        'next_page': page + 1 if has_next_page else None,
+        'issues': paged_issues,
+    }
+
+
+def _node_display_payload(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'id': str(node.get('id', '')),
+        'kind': str(node.get('kind') or node.get('type') or ''),
+        'label': str(node.get('label') or node.get('symbol') or node.get('id') or ''),
+        'path': node.get('path') or node.get('file'),
+        'start_line': node.get('start_line'),
+        'end_line': node.get('end_line'),
+        'metadata': dict(node.get('metadata') or {}),
+    }
+
+
+def _fallback_ranked_node_ids(analysis: dict[str, Any], *, max_nodes: int) -> list[str]:
+    nodes = [
+        node
+        for node in analysis.get('nodes', [])
+        if isinstance(node, dict) and node.get('id')
+    ]
+    nodes.sort(key=lambda node: (str(node.get('path') or node.get('file') or ''), str(node.get('id'))))
+    return [str(node['id']) for node in nodes[:max_nodes]]
+
+
+def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *, max_nodes: int = 8) -> dict[str, Any] | None:
+    record = _get_succeeded_artifact_record_by_id(analysis_id)
+    if record is None:
+        return None
+
+    issue_template = _mock_issue_template(issue_number)
+    if issue_template is None:
+        return None
+
+    analysis_run, artifact = record
+    analysis = dict(artifact.payload)
+    repo_path = analysis_run.repository.full_name
+    issue = _mock_issue_payload(repo_path, issue_template)
+    issue_query = f'{issue["title"]} {issue["body_excerpt"]} {issue_template["search_text"]}'
+    max_nodes = max(1, min(max_nodes, 20))
+    ranked_node_ids, warnings = rank_nodes(analysis, issue_query, max_nodes=max_nodes)
+    nodes_by_id = {
+        str(node.get('id')): dict(node)
+        for node in analysis.get('nodes', [])
+        if isinstance(node, dict) and node.get('id')
+    }
+
+    if not ranked_node_ids:
+        ranked_node_ids = _fallback_ranked_node_ids(analysis, max_nodes=max_nodes)
+        warnings.append({'code': 'mock_related_nodes_fallback', 'message': 'Issue text와 일치하는 graph node가 없어 앞쪽 graph node를 mock으로 반환했습니다.'})
+
+    candidates = []
+    for index, node_id in enumerate(ranked_node_ids[:max_nodes], start=1):
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            continue
+        display_node = _node_display_payload(node)
+        evidence = [
+            {
+                'type': 'mock',
+                'message': '프런트엔드 graph highlight 연동을 위한 임시 추천입니다.',
+            }
+        ]
+        if display_node['path']:
+            evidence.append(
+                {
+                    'type': 'graph_metadata',
+                    'message': f'Graph node path: {display_node["path"]}',
+                }
+            )
+        candidates.append(
+            {
+                'rank': index,
+                'score': round(max(0.1, 1.0 - ((index - 1) * 0.08)), 2),
+                'node_id': node_id,
+                'node': display_node,
+                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 smolagents 기반 graph 탐색을 사용합니다.',
+                'evidence': evidence,
+            }
+        )
+
+    return {
+        'analysis_id': analysis_run.id,
+        'repo': repo_path,
+        'revision': analysis_run.revision,
+        'provider': 'github',
+        'source': 'mock',
+        'mock': True,
+        'issue': {
+            'key': issue['key'],
+            'number': issue['number'],
+            'title': issue['title'],
+            'html_url': issue['html_url'],
+        },
+        'selected_node_ids': [candidate['node_id'] for candidate in candidates],
+        'candidates': candidates,
+        'limits': {'max_nodes': max_nodes},
+        'warnings': warnings,
+    }
 
 
 def _summary_response(analysis_run: AnalysisRun, summary: dict[str, Any], *, cached: bool) -> dict[str, Any]:
