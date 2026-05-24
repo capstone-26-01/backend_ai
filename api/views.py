@@ -13,7 +13,7 @@ from rest_framework.decorators import throttle_classes
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
+from drf_spectacular.utils import OpenApiExample, extend_schema, OpenApiParameter, inline_serializer
 from rest_framework import serializers
 
 from github_repo.services import RepoIngestionError, get_file_tree_or_raise
@@ -443,6 +443,171 @@ _ISSUE_RELATED_NODES_DESCRIPTION = '''
 
 주요 실패: 400 잘못된 body, 404 분석 결과 또는 mock issue 번호 없음.
 '''
+_ISSUES_LIST_RESPONSE_EXAMPLE = {
+    'repo': 'owner/repo',
+    'provider': 'github',
+    'source': 'mock',
+    'mock': True,
+    'state': 'open',
+    'page': 1,
+    'per_page': 30,
+    'has_next_page': False,
+    'next_page': None,
+    'issues': [
+        {
+            'key': 'github:owner/repo#42',
+            'number': 42,
+            'title': 'Repository analysis fails on large Python projects',
+            'state': 'open',
+            'html_url': 'https://github.com/owner/repo/issues/42',
+            'author': {
+                'login': 'octocat',
+                'avatar_url': 'https://github.com/octocat.png',
+                'html_url': 'https://github.com/octocat',
+            },
+            'labels': [
+                {'name': 'bug', 'color': 'd73a4a', 'description': 'Something is not working'},
+                {'name': 'analysis', 'color': '1d76db', 'description': 'Repository analysis flow'},
+            ],
+            'assignees': [
+                {
+                    'login': 'hubot',
+                    'avatar_url': 'https://github.com/hubot.png',
+                    'html_url': 'https://github.com/hubot',
+                }
+            ],
+            'comments_count': 3,
+            'created_at': '2026-05-20T10:00:00Z',
+            'updated_at': '2026-05-23T12:30:00Z',
+            'body_excerpt': 'Repository analysis fails when the project has many Python files or the parser exceeds configured limits.',
+            'body_truncated': True,
+            'locked': False,
+            'is_pull_request': False,
+        },
+        {
+            'key': 'github:owner/repo#156',
+            'number': 156,
+            'title': 'Empty state should work when an issue has no labels',
+            'state': 'open',
+            'html_url': 'https://github.com/owner/repo/issues/156',
+            'author': {
+                'login': 'minimal-reporter',
+                'avatar_url': 'https://github.com/minimal-reporter.png',
+                'html_url': 'https://github.com/minimal-reporter',
+            },
+            'labels': [],
+            'assignees': [],
+            'comments_count': 0,
+            'created_at': '2026-05-14T07:30:00Z',
+            'updated_at': '2026-05-14T07:30:00Z',
+            'body_excerpt': '',
+            'body_truncated': False,
+            'locked': False,
+            'is_pull_request': False,
+        },
+        {
+            'key': 'github:owner/repo#181',
+            'number': 181,
+            'title': 'Deleted author issue should not crash rendering',
+            'state': 'open',
+            'html_url': 'https://github.com/owner/repo/issues/181',
+            'author': None,
+            'labels': [
+                {'name': 'edge-case', 'color': 'ededed', 'description': 'Mock data for nullable GitHub fields'},
+            ],
+            'assignees': [],
+            'comments_count': 1,
+            'created_at': '2026-05-10T03:05:00Z',
+            'updated_at': '2026-05-15T19:25:00Z',
+            'body_excerpt': 'GitHub can return nullable user-like data in some historical or deleted-user cases.',
+            'body_truncated': False,
+            'locked': False,
+            'is_pull_request': False,
+        },
+        {
+            'key': 'github:owner/repo#209',
+            'number': 209,
+            'title': 'Locked conversation still needs related node suggestions',
+            'state': 'open',
+            'html_url': 'https://github.com/owner/repo/issues/209',
+            'author': {
+                'login': 'security-reviewer',
+                'avatar_url': 'https://github.com/security-reviewer.png',
+                'html_url': 'https://github.com/security-reviewer',
+            },
+            'labels': [
+                {'name': 'security', 'color': 'ee0701', 'description': 'Security-sensitive behavior'},
+                {'name': 'backend', 'color': '0052cc', 'description': 'Backend implementation'},
+            ],
+            'assignees': [
+                {
+                    'login': 'backend-owner',
+                    'avatar_url': 'https://github.com/backend-owner.png',
+                    'html_url': 'https://github.com/backend-owner',
+                }
+            ],
+            'comments_count': 8,
+            'created_at': '2026-05-08T14:00:00Z',
+            'updated_at': '2026-05-24T06:55:00Z',
+            'body_excerpt': 'Locked issues should remain selectable, but the frontend may show a lock badge while still requesting related nodes.',
+            'body_truncated': False,
+            'locked': True,
+            'is_pull_request': False,
+        },
+    ],
+}
+_ISSUE_RELATED_NODES_REQUEST_EXAMPLE = {
+    'analysis_id': 123,
+    'issue_number': 42,
+    'max_nodes': 8,
+}
+_ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
+    'analysis_id': 123,
+    'repo': 'owner/repo',
+    'revision': 'abc123',
+    'provider': 'github',
+    'source': 'mock',
+    'mock': True,
+    'issue': {
+        'key': 'github:owner/repo#42',
+        'number': 42,
+        'title': 'Repository analysis fails on large Python projects',
+        'state': 'open',
+        'html_url': 'https://github.com/owner/repo/issues/42',
+        'labels': [
+            {'name': 'bug', 'color': 'd73a4a', 'description': 'Something is not working'},
+            {'name': 'analysis', 'color': '1d76db', 'description': 'Repository analysis flow'},
+        ],
+        'comments_count': 3,
+        'updated_at': '2026-05-23T12:30:00Z',
+        'body_excerpt': 'Repository analysis fails when the project has many Python files or the parser exceeds configured limits.',
+    },
+    'selected_node_ids': ['api/views.py::analysis', 'api/services.py::get_repo_analysis'],
+    'candidates': [
+        {
+            'rank': 1,
+            'score': 1.0,
+            'node_id': 'api/views.py::analysis',
+            'node': {
+                'id': 'api/views.py::analysis',
+                'kind': 'function',
+                'label': 'analysis',
+                'path': 'api/views.py',
+                'start_line': 180,
+                'end_line': 220,
+                'metadata': {},
+            },
+            'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 smolagents 기반 graph 탐색을 사용합니다.',
+            'evidence': [
+                {'type': 'mock', 'message': '프런트엔드 graph highlight 연동을 위한 임시 추천입니다.'},
+                {'type': 'graph_metadata', 'message': 'Graph node path: api/views.py'},
+                {'type': 'node_kind_priority', 'message': 'function node를 file node보다 우선 추천했습니다.'},
+            ],
+        }
+    ],
+    'limits': {'max_nodes': 8},
+    'warnings': [],
+}
 
 
 @extend_schema(
@@ -918,6 +1083,13 @@ def get_repo_graph(request):
         OpenApiParameter(name='state', description='선택. 현재는 open만 지원합니다. 생략하면 open입니다.', required=False, type=str),
     ],
     responses=IssueListResponseSerializer,
+    examples=[
+        OpenApiExample(
+            'Mock open issues response',
+            value=_ISSUES_LIST_RESPONSE_EXAMPLE,
+            response_only=True,
+        ),
+    ],
 )
 @api_view(['GET'])
 def issues(request):
@@ -943,6 +1115,18 @@ def issues(request):
     description=_ISSUE_RELATED_NODES_DESCRIPTION,
     request=IssueRelatedNodesRequestSerializer,
     responses=IssueRelatedNodesResponseSerializer,
+    examples=[
+        OpenApiExample(
+            'Related nodes request',
+            value=_ISSUE_RELATED_NODES_REQUEST_EXAMPLE,
+            request_only=True,
+        ),
+        OpenApiExample(
+            'Mock related nodes response',
+            value=_ISSUE_RELATED_NODES_RESPONSE_EXAMPLE,
+            response_only=True,
+        ),
+    ],
 )
 @api_view(['POST'])
 def issue_related_nodes(request):

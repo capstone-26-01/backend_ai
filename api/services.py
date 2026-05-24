@@ -41,6 +41,8 @@ MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
     {
         'number': 42,
         'title': 'Repository analysis fails on large Python projects',
+        'author': 'octocat',
+        'assignees': ['hubot'],
         'labels': [
             {'name': 'bug', 'color': 'd73a4a', 'description': 'Something is not working'},
             {'name': 'analysis', 'color': '1d76db', 'description': 'Repository analysis flow'},
@@ -49,11 +51,15 @@ MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
         'created_at': '2026-05-20T10:00:00Z',
         'updated_at': '2026-05-23T12:30:00Z',
         'body_excerpt': 'Repository analysis fails when the project has many Python files or the parser exceeds configured limits.',
+        'body_truncated': True,
+        'locked': False,
         'search_text': 'repository analysis parse parser python files limits timeout ingestion graph artifact',
     },
     {
         'number': 77,
         'title': 'Graph view misses function call relationships',
+        'author': 'graph-reviewer',
+        'assignees': [],
         'labels': [
             {'name': 'graph', 'color': '5319e7', 'description': 'Code graph and relationship rendering'},
             {'name': 'enhancement', 'color': 'a2eeef', 'description': 'New feature or request'},
@@ -62,11 +68,15 @@ MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
         'created_at': '2026-05-18T08:15:00Z',
         'updated_at': '2026-05-22T16:45:00Z',
         'body_excerpt': 'The graph should expose function calls and imports clearly enough for the frontend to highlight related code.',
+        'body_truncated': False,
+        'locked': False,
         'search_text': 'graph nodes edges function calls imports relationships parser services highlight',
     },
     {
         'number': 103,
         'title': 'Swagger docs are unclear for frontend integration',
+        'author': 'frontend-dev',
+        'assignees': ['api-maintainer'],
         'labels': [
             {'name': 'documentation', 'color': '0075ca', 'description': 'Improvements or additions to documentation'},
             {'name': 'frontend', 'color': 'fbca04', 'description': 'Frontend integration support'},
@@ -75,11 +85,15 @@ MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
         'created_at': '2026-05-17T13:20:00Z',
         'updated_at': '2026-05-21T09:10:00Z',
         'body_excerpt': 'Frontend developers need concise request and response examples for analysis, graph, summary, and issue-related APIs.',
+        'body_truncated': False,
+        'locked': False,
         'search_text': 'swagger docs api views serializers frontend schema request response examples',
     },
     {
         'number': 128,
         'title': 'QA should focus on the selected graph node',
+        'author': 'qa-user',
+        'assignees': ['llm-owner', 'backend-owner'],
         'labels': [
             {'name': 'qa', 'color': '0e8a16', 'description': 'Question answering behavior'},
             {'name': 'llm', 'color': 'bfdadc', 'description': 'LLM-backed workflow'},
@@ -88,9 +102,76 @@ MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
         'created_at': '2026-05-16T11:40:00Z',
         'updated_at': '2026-05-22T18:05:00Z',
         'body_excerpt': 'When the user selects a node in the graph, QA should prioritize that node and nearby code context.',
+        'body_truncated': False,
+        'locked': False,
         'search_text': 'qa selected graph node context files llm answer question neighbors',
     },
+    {
+        'number': 156,
+        'title': 'Empty state should work when an issue has no labels',
+        'author': 'minimal-reporter',
+        'assignees': [],
+        'labels': [],
+        'comments_count': 0,
+        'created_at': '2026-05-14T07:30:00Z',
+        'updated_at': '2026-05-14T07:30:00Z',
+        'body_excerpt': '',
+        'body_truncated': False,
+        'locked': False,
+        'search_text': 'empty state labels issue list frontend card',
+    },
+    {
+        'number': 164,
+        'title': 'Long issue title should wrap without breaking the issue picker layout on narrow mobile screens',
+        'author': 'mobile-tester',
+        'assignees': ['frontend-dev'],
+        'labels': [
+            {'name': 'ui', 'color': 'c5def5', 'description': None},
+        ],
+        'comments_count': 11,
+        'created_at': '2026-05-12T22:10:00Z',
+        'updated_at': '2026-05-23T21:45:00Z',
+        'body_excerpt': 'A deliberately longer preview helps frontend developers verify wrapping, truncation, and spacing in the issue selection UI.',
+        'body_truncated': True,
+        'locked': False,
+        'search_text': 'frontend mobile layout issue picker long title wrap truncation',
+    },
+    {
+        'number': 181,
+        'title': 'Deleted author issue should not crash rendering',
+        'author': None,
+        'assignees': [],
+        'labels': [
+            {'name': 'edge-case', 'color': 'ededed', 'description': 'Mock data for nullable GitHub fields'},
+        ],
+        'comments_count': 1,
+        'created_at': '2026-05-10T03:05:00Z',
+        'updated_at': '2026-05-15T19:25:00Z',
+        'body_excerpt': 'GitHub can return nullable user-like data in some historical or deleted-user cases.',
+        'body_truncated': False,
+        'locked': False,
+        'search_text': 'nullable author deleted user issue rendering edge case',
+    },
+    {
+        'number': 209,
+        'title': 'Locked conversation still needs related node suggestions',
+        'author': 'security-reviewer',
+        'assignees': ['backend-owner'],
+        'labels': [
+            {'name': 'security', 'color': 'ee0701', 'description': 'Security-sensitive behavior'},
+            {'name': 'backend', 'color': '0052cc', 'description': 'Backend implementation'},
+        ],
+        'comments_count': 8,
+        'created_at': '2026-05-08T14:00:00Z',
+        'updated_at': '2026-05-24T06:55:00Z',
+        'body_excerpt': 'Locked issues should remain selectable, but the frontend may show a lock badge while still requesting related nodes.',
+        'body_truncated': False,
+        'locked': True,
+        'search_text': 'locked security backend issue related nodes permissions validation',
+    },
 ]
+
+PREFERRED_RELATED_NODE_KINDS = {'function', 'method', 'class', 'module'}
 
 
 def _analysis_parts(repo_path: str) -> tuple[str, str]:
@@ -346,6 +427,12 @@ def _mock_github_user(login: str) -> dict[str, str]:
     }
 
 
+def _mock_github_user_or_none(login: str | None) -> dict[str, str] | None:
+    if login is None:
+        return None
+    return _mock_github_user(login)
+
+
 def _issue_key(repo_path: str, issue_number: int) -> str:
     return f'github:{repo_path}#{issue_number}'
 
@@ -358,13 +445,15 @@ def _mock_issue_payload(repo_path: str, template: dict[str, Any]) -> dict[str, A
         'title': template['title'],
         'state': 'open',
         'html_url': f'https://github.com/{repo_path}/issues/{issue_number}',
-        'author': _mock_github_user('octocat'),
+        'author': _mock_github_user_or_none(template.get('author')),
         'labels': template['labels'],
-        'assignees': [],
+        'assignees': [_mock_github_user(str(login)) for login in template.get('assignees', [])],
         'comments_count': template['comments_count'],
         'created_at': template['created_at'],
         'updated_at': template['updated_at'],
         'body_excerpt': template['body_excerpt'],
+        'body_truncated': template['body_truncated'],
+        'locked': template['locked'],
         'is_pull_request': False,
     }
 
@@ -410,6 +499,33 @@ def _node_display_payload(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _node_kind(node: dict[str, Any]) -> str:
+    return str(node.get('kind') or node.get('type') or '')
+
+
+def _prioritize_related_node_ids(ranked_node_ids: list[str], nodes_by_id: dict[str, dict[str, Any]], *, max_nodes: int) -> list[str]:
+    preferred_nodes = []
+    fallback_nodes = []
+    seen = set()
+    for original_rank, node_id in enumerate(ranked_node_ids):
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            continue
+        node_kind = _node_kind(node)
+        item = (original_rank, node_id)
+        if node_kind in PREFERRED_RELATED_NODE_KINDS:
+            preferred_nodes.append(item)
+        else:
+            fallback_nodes.append(item)
+
+    ordered_nodes = [node_id for _rank, node_id in preferred_nodes]
+    ordered_nodes.extend(node_id for _rank, node_id in fallback_nodes)
+    return ordered_nodes[:max_nodes]
+
+
 def _fallback_ranked_node_ids(analysis: dict[str, Any], *, max_nodes: int) -> list[str]:
     nodes = [
         node
@@ -435,12 +551,14 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
     issue = _mock_issue_payload(repo_path, issue_template)
     issue_query = f'{issue["title"]} {issue["body_excerpt"]} {issue_template["search_text"]}'
     max_nodes = max(1, min(max_nodes, 20))
-    ranked_node_ids, warnings = rank_nodes(analysis, issue_query, max_nodes=max_nodes)
+    ranking_pool_size = max(max_nodes * 6, 50)
+    ranked_node_ids, warnings = rank_nodes(analysis, issue_query, max_nodes=ranking_pool_size)
     nodes_by_id = {
         str(node.get('id')): dict(node)
         for node in analysis.get('nodes', [])
         if isinstance(node, dict) and node.get('id')
     }
+    ranked_node_ids = _prioritize_related_node_ids(ranked_node_ids, nodes_by_id, max_nodes=max_nodes)
 
     if not ranked_node_ids:
         ranked_node_ids = _fallback_ranked_node_ids(analysis, max_nodes=max_nodes)
@@ -465,6 +583,13 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
                     'message': f'Graph node path: {display_node["path"]}',
                 }
             )
+        if display_node['kind'] in PREFERRED_RELATED_NODE_KINDS:
+            evidence.append(
+                {
+                    'type': 'node_kind_priority',
+                    'message': f'{display_node["kind"]} node를 file node보다 우선 추천했습니다.',
+                }
+            )
         candidates.append(
             {
                 'rank': index,
@@ -487,7 +612,12 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
             'key': issue['key'],
             'number': issue['number'],
             'title': issue['title'],
+            'state': issue['state'],
             'html_url': issue['html_url'],
+            'labels': issue['labels'],
+            'comments_count': issue['comments_count'],
+            'updated_at': issue['updated_at'],
+            'body_excerpt': issue['body_excerpt'],
         },
         'selected_node_ids': [candidate['node_id'] for candidate in candidates],
         'candidates': candidates,
