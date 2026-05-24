@@ -37,6 +37,10 @@ from .serializers import (
     AnalysisDiffRequestSerializer,
     AnalysisRequestSerializer,
     DiffRequestSerializer,
+    IssueListRequestSerializer,
+    IssueListResponseSerializer,
+    IssueRelatedNodesRequestSerializer,
+    IssueRelatedNodesResponseSerializer,
     NodeSummaryRequestSerializer,
     RepoUrlSerializer,
     QASerializer,
@@ -80,6 +84,14 @@ def get_or_create_summary_response(analysis_id: int, kind: str):
 
 def get_or_create_node_summary_response(analysis_id: int, node_id: str):
     return api_services.get_or_create_node_summary_response(analysis_id, node_id)
+
+
+def get_mock_issue_list_response(repo_path: str, **kwargs):
+    return api_services.get_mock_issue_list_response(repo_path, **kwargs)
+
+
+def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, **kwargs):
+    return api_services.get_mock_issue_related_nodes_response(analysis_id, issue_number, **kwargs)
 
 
 def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None):
@@ -382,6 +394,54 @@ GitHub 레포의 파일 경로 목록만 빠르게 반환합니다.
 
 코드 그래프/요약이 필요 없는 단순 파일 목록 UI에 사용합니다.
 구조 분석이 필요한 화면에서는 `/api/tree/` 또는 `/api/analysis/`를 사용하세요.
+'''
+_ISSUES_LIST_DESCRIPTION = '''
+프런트엔드 선작업용 GitHub open issue 목록 mock API입니다.
+
+프런트엔드 권장 흐름:
+1. 사용자가 GitHub URL을 입력하면 `/api/analysis/`로 먼저 분석을 만들고 `analysis_id`를 보관합니다.
+2. 같은 URL로 이 API를 호출해 open issue 목록을 표시합니다.
+3. 사용자가 issue를 선택하면 응답의 `number`를 `/api/issues/related-nodes/`의 `issue_number`로 보냅니다.
+
+현재 동작:
+- 실제 GitHub/MCP 호출은 아직 하지 않고, 안정적인 mock issue 목록을 반환합니다.
+- `source=mock`, `mock=true`이면 프런트엔드 개발용 응답입니다.
+- 실제 구현 전환 후에도 `key`, `number`, `title`, `labels`, `body_excerpt` 필드는 유지하는 계약입니다.
+- GitHub Pull Request는 issue 목록에서 제외하는 전제로 `is_pull_request=false`만 반환합니다.
+
+프런트엔드 예시:
+```ts
+const params = new URLSearchParams({ url: repoUrl, page: "1", per_page: "30" });
+const res = await fetch(`${API_BASE}/api/issues/?${params}`);
+```
+
+주요 실패: 400 잘못된 GitHub URL 또는 pagination 값.
+'''
+_ISSUE_RELATED_NODES_DESCRIPTION = '''
+선택한 GitHub issue를 해결하는 데 관련 있어 보이는 code graph node 후보를 반환하는 mock API입니다.
+
+프런트엔드 권장 흐름:
+1. `/api/analysis/` 응답의 `analysis_id`를 보관합니다.
+2. `/api/issues/`에서 받은 issue의 `number`를 사용자가 선택한 issue로 저장합니다.
+3. 이 API에 `analysis_id`, `issue_number`, 선택적으로 `max_nodes`를 POST합니다.
+4. 응답의 `selected_node_ids`는 graph highlight에 바로 쓰고, `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
+
+현재 동작:
+- 실제 GitHub issue 본문/comment 조회나 smolagents 추론은 아직 하지 않습니다.
+- mock issue text와 현재 `analysis_id`의 graph artifact를 이용해 deterministic 후보를 만듭니다.
+- 따라서 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
+- 실제 구현에서는 GitHub MCP로 issue detail/comment를 읽고, smolagents 기반으로 graph 주변 노드를 탐색하는 방식으로 교체할 예정입니다.
+
+요청 예시:
+```json
+{
+  "analysis_id": 123,
+  "issue_number": 42,
+  "max_nodes": 8
+}
+```
+
+주요 실패: 400 잘못된 body, 404 분석 결과 또는 mock issue 번호 없음.
 '''
 
 
@@ -846,6 +906,59 @@ def get_repo_graph(request):
 
     analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
     return Response(build_graph_response(analysis, analysis_run))
+
+
+@extend_schema(
+    operation_id='github_issues_list',
+    description=_ISSUES_LIST_DESCRIPTION,
+    parameters=[
+        OpenApiParameter(name='url', description='필수. open issue 목록을 조회할 public GitHub 레포 URL입니다. 예: https://github.com/psf/requests', required=True, type=str),
+        OpenApiParameter(name='page', description='선택. 1부터 시작하는 페이지 번호입니다. 기본값 1.', required=False, type=int),
+        OpenApiParameter(name='per_page', description='선택. 페이지당 issue 수입니다. 1-100, 기본값 30.', required=False, type=int),
+        OpenApiParameter(name='state', description='선택. 현재는 open만 지원합니다. 생략하면 open입니다.', required=False, type=str),
+    ],
+    responses=IssueListResponseSerializer,
+)
+@api_view(['GET'])
+def issues(request):
+    request_data = {'repo_url': request.GET.get('url')}
+    for field_name in ('page', 'per_page', 'state'):
+        if request.GET.get(field_name) is not None:
+            request_data[field_name] = request.GET.get(field_name)
+    serializer = IssueListRequestSerializer(data=request_data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, Any], serializer.validated_data)
+    response = get_mock_issue_list_response(
+        str(validated_data['repo_url']),
+        page=int(validated_data['page']),
+        per_page=int(validated_data['per_page']),
+    )
+    return Response(response)
+
+
+@extend_schema(
+    operation_id='github_issue_related_nodes',
+    description=_ISSUE_RELATED_NODES_DESCRIPTION,
+    request=IssueRelatedNodesRequestSerializer,
+    responses=IssueRelatedNodesResponseSerializer,
+)
+@api_view(['POST'])
+def issue_related_nodes(request):
+    serializer = IssueRelatedNodesRequestSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=400)
+
+    validated_data = cast(dict[str, Any], serializer.validated_data)
+    response = get_mock_issue_related_nodes_response(
+        int(validated_data['analysis_id']),
+        int(validated_data['issue_number']),
+        max_nodes=int(validated_data['max_nodes']),
+    )
+    if response is None:
+        return Response({'error': '분석 결과 또는 issue를 찾을 수 없습니다'}, status=404)
+    return Response(response)
 
 
 _SUMMARY_RESPONSE_SCHEMA = inline_serializer(

@@ -15,6 +15,8 @@ urlpatterns = [
     path('repo/', views.get_repo_file),
     path('tree/', views.get_repo_tree),
     path('graph/', views.get_repo_graph),
+    path('issues/', views.issues),
+    path('issues/related-nodes/', views.issue_related_nodes),
     path('summary/', views.summary),
     path('node-summary/', views.node_summary),
     path('qa/', views.qa),
