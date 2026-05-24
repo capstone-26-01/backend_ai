@@ -201,7 +201,7 @@ class IssueAuthorSerializer(serializers.Serializer):
 class IssueLabelSerializer(serializers.Serializer):
     name = serializers.CharField(help_text='GitHub issue label 이름입니다.')
     color = serializers.CharField(help_text='GitHub label 색상 hex 값입니다. # 없이 내려옵니다.')
-    description = serializers.CharField(allow_blank=True, help_text='GitHub label 설명입니다. 없으면 빈 문자열입니다.')
+    description = serializers.CharField(allow_blank=True, allow_null=True, help_text='GitHub label 설명입니다. 없으면 null 또는 빈 문자열입니다.')
 
 
 class IssueListItemSerializer(serializers.Serializer):
@@ -210,13 +210,15 @@ class IssueListItemSerializer(serializers.Serializer):
     title = serializers.CharField(help_text='Issue 제목입니다.')
     state = serializers.CharField(help_text='현재는 open issue만 반환합니다.')
     html_url = serializers.URLField(help_text='GitHub issue 페이지 URL입니다.')
-    author = IssueAuthorSerializer(help_text='Issue 작성자 정보입니다.')
+    author = IssueAuthorSerializer(allow_null=True, help_text='Issue 작성자 정보입니다. 삭제된 사용자 등으로 알 수 없으면 null입니다.')
     labels = IssueLabelSerializer(many=True, help_text='Issue label 목록입니다.')
     assignees = IssueAuthorSerializer(many=True, help_text='Issue assignee 목록입니다.')
     comments_count = serializers.IntegerField(help_text='Issue comment 수입니다.')
     created_at = serializers.DateTimeField(help_text='Issue 생성 시각입니다.')
     updated_at = serializers.DateTimeField(help_text='Issue 마지막 수정 시각입니다.')
     body_excerpt = serializers.CharField(help_text='목록 화면 preview용 본문 요약입니다. 전체 body가 아닙니다.')
+    body_truncated = serializers.BooleanField(help_text='true면 body_excerpt가 원문 일부만 담은 preview입니다.')
+    locked = serializers.BooleanField(help_text='GitHub issue conversation 잠금 여부입니다.')
     is_pull_request = serializers.BooleanField(help_text='항상 false입니다. 실제 구현에서도 PR은 제외하고 issue만 반환합니다.')
 
 
@@ -237,7 +239,12 @@ class IssueRefSerializer(serializers.Serializer):
     key = serializers.CharField(help_text='Issue 안정 식별자입니다. 형식: github:{owner}/{repo}#{number}')
     number = serializers.IntegerField(help_text='GitHub issue 번호입니다.')
     title = serializers.CharField(help_text='Issue 제목입니다.')
+    state = serializers.CharField(help_text='Issue 상태입니다.')
     html_url = serializers.URLField(help_text='GitHub issue 페이지 URL입니다.')
+    labels = IssueLabelSerializer(many=True, help_text='선택 issue label 목록입니다.')
+    comments_count = serializers.IntegerField(help_text='선택 issue comment 수입니다.')
+    updated_at = serializers.DateTimeField(help_text='선택 issue 마지막 수정 시각입니다.')
+    body_excerpt = serializers.CharField(help_text='선택 issue preview 본문입니다.')
 
 
 class IssueRelatedNodeSerializer(serializers.Serializer):

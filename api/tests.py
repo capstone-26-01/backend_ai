@@ -1492,6 +1492,12 @@ class IssueMockEndpointTests(TestCase):
                 'tree': [],
                 'nodes': [
                     {
+                        'id': 'api/services.py',
+                        'type': 'file',
+                        'label': 'services.py',
+                        'file': 'api/services.py',
+                    },
+                    {
                         'id': 'api/services.py::get_repo_analysis',
                         'type': 'function',
                         'label': 'get_repo_analysis',
@@ -1537,15 +1543,23 @@ class IssueMockEndpointTests(TestCase):
         response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
         payload = cast(dict[str, object], json.loads(response.content))
         issues = cast(list[dict[str, object]], payload['issues'])
+        issues_by_number = {issue['number']: issue for issue in issues}
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['repo'], 'owner/repo')
         self.assertEqual(payload['source'], 'mock')
         self.assertTrue(payload['mock'])
         self.assertEqual(payload['state'], 'open')
-        self.assertGreater(len(issues), 0)
+        self.assertEqual(len(issues), 8)
         self.assertEqual(issues[0]['key'], 'github:owner/repo#42')
         self.assertFalse(issues[0]['is_pull_request'])
+        self.assertEqual(issues_by_number[156]['labels'], [])
+        self.assertEqual(issues_by_number[156]['body_excerpt'], '')
+        self.assertEqual(issues_by_number[156]['comments_count'], 0)
+        self.assertIsNone(issues_by_number[181]['author'])
+        self.assertTrue(issues_by_number[209]['locked'])
+        labels = cast(list[dict[str, object]], issues_by_number[164]['labels'])
+        self.assertIsNone(labels[0]['description'])
 
     def test_issues_endpoint_rejects_invalid_repo_url(self):
         response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://example.com/owner/repo'}))
@@ -1569,10 +1583,13 @@ class IssueMockEndpointTests(TestCase):
         selected_node_ids = cast(list[str], payload['selected_node_ids'])
         candidates = cast(list[dict[str, object]], payload['candidates'])
         known_node_ids = {
+            'api/services.py',
             'api/services.py::get_repo_analysis',
             'parser/services.py::parse_repo',
             'api/views.py::analysis',
         }
+        issue = cast(dict[str, object], payload['issue'])
+        first_node = cast(dict[str, object], candidates[0]['node'])
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['analysis_id'], analysis_run.id)
@@ -1583,6 +1600,10 @@ class IssueMockEndpointTests(TestCase):
         self.assertLessEqual(len(selected_node_ids), 2)
         self.assertTrue(set(selected_node_ids).issubset(known_node_ids))
         self.assertEqual(candidates[0]['node_id'], selected_node_ids[0])
+        self.assertNotEqual(first_node['kind'], 'file')
+        self.assertEqual(issue['comments_count'], 3)
+        self.assertEqual(issue['body_excerpt'], 'Repository analysis fails when the project has many Python files or the parser exceeds configured limits.')
+        self.assertEqual(cast(list[dict[str, object]], issue['labels'])[0]['name'], 'bug')
 
     def test_issue_related_nodes_returns_404_for_unknown_mock_issue(self):
         analysis_run = self._create_analysis_run()
@@ -2478,6 +2499,10 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('/api/issues/related-nodes/', schema_text)
         self.assertIn('프런트엔드 선작업용 GitHub open issue 목록 mock API입니다', schema_text)
         self.assertIn('응답의 `selected_node_ids`는 graph highlight에 바로 쓰고', schema_text)
+        self.assertIn('Mock open issues response', schema_text)
+        self.assertIn('body_truncated', schema_text)
+        self.assertIn('Deleted author issue should not crash rendering', schema_text)
+        self.assertIn('node_kind_priority', schema_text)
         self.assertIn('/api/summary/', schema_text)
         self.assertIn('/api/node-summary/', schema_text)
         self.assertIn('/api/qa/', schema_text)
