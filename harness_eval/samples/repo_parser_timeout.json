@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "repo_parser_timeout",
+  "task": "Analyze the provided Git repository fixture and identify the code nodes most relevant to the selected issue.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/parser_timeout_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 201,
+    "title": "Repository analysis crashes while parsing",
+    "body": "Traceback points at api/services.py::_build_and_store_analysis. The call into parser/services.py::parse_repo never returns and looks like a parser timeout.",
+    "labels": [{"name": "analysis"}, {"name": "parser"}],
+    "comments": [
+      {
+        "id": 21,
+        "body": "Please inspect _build_and_store_analysis and parse_repo. api/views.py::analysis is just the request entry point."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_repo_files",
+      "description": "List bounded Python files in the provided repository."
+    },
+    {
+      "name": "search_repo_symbols",
+      "description": "Search Python functions/classes in the repository and rank them against issue evidence."
+    },
+    {
+      "name": "read_repo_file",
+      "description": "Read bounded Python file contents from the repository."
+    }
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_parser_timeout",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo"],
+    "allowed_node_ids": ["api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo"],
+    "allowed_paths": ["api/services.py", "parser/services.py"]
+  }
+}

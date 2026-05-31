@@ -21,6 +21,7 @@ from harness_eval.evaluator import (
     evaluate_transcript,
     load_json,
     sample_paths,
+    validate_golden_alignment,
     validate_matrix,
     validate_sample,
 )
@@ -91,6 +92,48 @@ class HarnessEvalSampleTests(unittest.TestCase):
         self.assertFalse(checks['path_allowlist']['passed'])
         self.assertFalse(checks['confidence_range']['passed'])
 
+    def test_extra_node_in_allowed_path_fails_node_allowlist(self):
+        sample = {
+            'id': 'same_file_precision',
+            'expect': {
+                'required_tools': ['rank_issue_candidates', 'load_focus_graph', 'load_code_context'],
+                'forbidden_tools': ['shell', 'filesystem', 'network'],
+                'node_ids': ['api/services.py::get_repo_analysis', 'api/services.py::_build_and_store_analysis'],
+                'allowed_node_ids': ['api/services.py::get_repo_analysis', 'api/services.py::_build_and_store_analysis'],
+                'allowed_paths': ['api/services.py'],
+            },
+        }
+        transcript = {
+            'sample_id': 'same_file_precision',
+            'variant_id': 'overbroad-same-file',
+            'tool_calls': [
+                {'name': 'rank_issue_candidates', 'arguments': {}},
+                {'name': 'load_focus_graph', 'arguments': {}},
+                {'name': 'load_code_context', 'arguments': {}},
+            ],
+            'final': {
+                'hypotheses': [
+                    {'node_id': 'api/services.py::get_repo_analysis', 'confidence': 0.8},
+                    {'node_id': 'api/services.py::_build_and_store_analysis', 'confidence': 0.7},
+                    {'node_id': 'api/services.py::delete_share_token', 'confidence': 0.2},
+                ],
+                'investigation_path': [
+                    {'node_id': 'api/services.py::get_repo_analysis', 'path': 'api/services.py'},
+                    {'node_id': 'api/services.py::_build_and_store_analysis', 'path': 'api/services.py'},
+                    {'node_id': 'api/services.py::delete_share_token', 'path': 'api/services.py'},
+                ],
+                'confidence': {'score': 0.7},
+            },
+        }
+
+        report = evaluate_transcript(sample, transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertFalse(report['passed'])
+        self.assertTrue(checks['expected_nodes']['passed'])
+        self.assertTrue(checks['path_allowlist']['passed'])
+        self.assertFalse(checks['node_allowlist']['passed'])
+
     def test_chat_completion_payload_uses_raw_model_id_for_direct_api(self):
         sample = load_json(ROOT / 'samples' / 'origin_trace.json')
         variant = {
@@ -119,6 +162,23 @@ class HarnessEvalSampleTests(unittest.TestCase):
         self.assertNotIn('required_tools', rendered)
         self.assertNotIn('allowed_paths', rendered)
         self.assertIn('api/services.py::_build_and_store_analysis', rendered)
+
+    def test_repo_job_packet_sends_repo_not_precomputed_artifact(self):
+        sample = load_json(ROOT / 'samples' / 'repo_parser_timeout.json')
+
+        job = build_job_packet(sample)
+        rendered = json.dumps(job, ensure_ascii=False)
+
+        self.assertIn('repo', job)
+        self.assertNotIn('artifact', job)
+        self.assertIn('harness_eval/fixtures/repos/parser_timeout_repo', rendered)
+        self.assertNotIn('expect', rendered)
+        self.assertNotIn('allowed_node_ids', rendered)
+
+    def test_repo_samples_match_judge_consensus_golden(self):
+        checks = validate_golden_alignment(ROOT / 'samples', ROOT / 'golden' / 'repo_issue_consensus.json')
+
+        self.assertTrue(all(check.passed for check in checks), [check.__dict__ for check in checks])
 
 
 class HarnessEvalLiveGuardTests(unittest.TestCase):
@@ -353,6 +413,21 @@ class PiRunnerCommandTests(unittest.TestCase):
         self.assertEqual(payload['pi_metadata']['response_ids'], ['chatcmpl-test'])
         self.assertIn('--no-builtin-tools', kwargs['args'] if 'args' in kwargs else run.call_args.args[0])
         self.assertIn('HARNESS_EVAL_JOB', kwargs['env'])
+
+    def test_pi_runner_uses_repo_tools_for_repo_jobs(self):
+        job = build_job_packet(load_json(ROOT / 'samples' / 'repo_parser_timeout.json'))
+        args = Namespace(
+            pi_bin='npx',
+            pi_package='@earendil-works/pi-coding-agent@0.78.0',
+            extension=ROOT / 'pi' / 'issue_map_extension.ts',
+            provider='opencode',
+            model='kimi-k2.5',
+        )
+
+        command = pi_runner.build_pi_command(args, job)
+
+        self.assertIn('list_repo_files,search_repo_symbols,read_repo_file,finish_issue_map_transcript', command)
+        self.assertNotIn('rank_issue_candidates,load_focus_graph,load_code_context,finish_issue_map_transcript', command)
 
 
 if __name__ == '__main__':

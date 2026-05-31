@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-05-31T06:06:55Z",
+  "method": "Independent GPT-5.5 xhigh subagent and Kimi judge agreement over repo fixture code and issue text.",
+  "judges": [
+    {
+      "name": "gpt-5.5-xhigh-subagent",
+      "role": "independent reference judge"
+    },
+    {
+      "name": "kimi-cli",
+      "role": "independent reference judge"
+    }
+  ],
+  "samples": [
+    {
+      "sample_id": "repo_parser_timeout",
+      "node_ids": [
+        "api/services.py::_build_and_store_analysis",
+        "parser/services.py::parse_repo"
+      ],
+      "allowed_paths": [
+        "api/services.py",
+        "parser/services.py"
+      ],
+      "rationale": "Both judges selected _build_and_store_analysis as the traceback caller and parse_repo as the non-returning parser call. api/views.py::analysis is only the request entry point, and parser helpers are implementation details outside the minimal origin."
+    },
+    {
+      "sample_id": "repo_same_file_precision",
+      "node_ids": [
+        "api/services.py::get_repo_analysis",
+        "api/services.py::_build_and_store_analysis"
+      ],
+      "allowed_paths": [
+        "api/services.py"
+      ],
+      "rationale": "Both judges selected get_repo_analysis and _build_and_store_analysis as the issue path. delete_share_token is an unrelated same-file helper, while api/views.py and github_repo/services.py are explicit decoys."
+    }
+  ]
+}

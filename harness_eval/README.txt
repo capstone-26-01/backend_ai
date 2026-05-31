@@ -11,7 +11,7 @@ It covers two questions:
 1. Did a real runner command produce the right behavior for a normal issue job?
    - required bounded tools were used,
    - forbidden tools were not used,
-   - final node IDs and file paths stayed on the allowlist,
+   - final node IDs and file paths stayed on the allowlists,
    - confidence values stayed in range.
 
 2. Did OpenCode Zen actually receive a request?
@@ -24,6 +24,7 @@ Tracked Files
 -------------
 
 - `samples/*.json`: synthetic issue-map jobs. Hidden `expect` fields are used only by the deterministic evaluator.
+- `golden/repo_issue_consensus.json`: repo-fixture reference answers agreed by independent GPT-5.5 xhigh and Kimi judges.
 - `sample_transcripts/*.json`: example runner transcripts for evaluator development.
 - `harness_matrix.sample.json`: model/tool/MCP/skill comparison matrix.
 - `evaluator.py`: schema and transcript scoring logic.
@@ -39,6 +40,7 @@ Run these in normal development and CI:
 python -m unittest harness_eval.tests
 python -m harness_eval.runner validate-samples
 python -m harness_eval.runner validate-matrix
+python -m harness_eval.runner validate-golden
 python -m harness_eval.runner render-job harness_eval/samples/origin_trace.json
 python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- python harness_eval/fixtures/fake_good_harness.py
 python -m harness_eval.runner evaluate-transcript harness_eval/samples/origin_trace.json harness_eval/sample_transcripts/good_origin_trace.json
@@ -96,20 +98,23 @@ This is not a replacement for a real Pi run with tools. It tests the model/provi
 Live Pi SUT Eval
 ----------------
 
-This is the production-like live check: `run-harness` stays the deterministic judge, while `pi_runner.py` is the system under test. The Pi runner installs/uses `@earendil-works/pi-coding-agent@0.78.0` through `npx`, binds only the bounded issue-map tools from `pi/issue_map_extension.ts`, and emits the final transcript from a terminating `finish_issue_map_transcript` tool result.
+This is the production-like live check: `run-harness` stays the deterministic judge, while `pi_runner.py` is the system under test. The Pi runner installs/uses `@earendil-works/pi-coding-agent@0.78.0` through `npx`, binds only bounded repo-analysis tools from `pi/issue_map_extension.ts`, and emits the final transcript from a terminating `finish_issue_map_transcript` tool result.
 
-The terminating tool clamps final hypotheses and investigation paths to high-confidence nodes selected from the job packet's own issue/artifact evidence. It does not read hidden `expect` data, but it prevents the model from leaking low-relevance artifact nodes into the final transcript.
+For repo samples, the job packet contains a local repo fixture path and issue text, not a precomputed graph artifact. Pi must call `list_repo_files`, `search_repo_symbols`, and `read_repo_file`; the deterministic evaluator compares the final transcript against hidden `expect` values derived from `golden/repo_issue_consensus.json`. The SUT never receives that golden file or the hidden `expect` block.
+
+Repo-fixture samples include parser timeout tracing and same-file extra-node precision checks. These catch cases where the model includes every plausible node from a file instead of the specific symbols supported by the issue evidence.
 
 ```
 export OPENCODE_API_KEY=...
 export RUN_OPENCODE_LIVE_TESTS=true
-python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
+python -m harness_eval.runner run-harness harness_eval/samples/repo_parser_timeout.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
+python -m harness_eval.runner run-harness harness_eval/samples/repo_same_file_precision.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
 ```
 
 Expected result:
 
 - exit code 0,
-- required issue-map tools were called,
+- required repo-analysis tools were called,
 - forbidden filesystem/shell/network/GitHub tools were not called,
 - expected node IDs and paths passed the deterministic evaluator,
 - `pi_metadata.response_ids` and `pi_metadata.usage` are present in the transcript for API/dashboard correlation.
@@ -122,7 +127,7 @@ Evaluating Real Pi Runs
 Run the real Pi command as a black box:
 
 ```
-python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- <your-pi-command-and-args>
+python -m harness_eval.runner run-harness harness_eval/samples/repo_parser_timeout.json -- <your-pi-command-and-args>
 ```
 
 Or export a real run as a transcript shaped like:

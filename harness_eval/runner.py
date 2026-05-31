@@ -20,6 +20,7 @@ from harness_eval.evaluator import (
     sample_paths,
     transcript_paths,
     validate_matrix,
+    validate_golden_alignment,
     validate_sample,
 )
 
@@ -28,6 +29,7 @@ DEFAULT_MATRIX = Path(__file__).resolve().parent / 'harness_matrix.sample.json'
 DEFAULT_SAMPLES = Path(__file__).resolve().parent / 'samples'
 DEFAULT_TRANSCRIPTS = Path(__file__).resolve().parent / 'sample_transcripts'
 DEFAULT_OUTPUT_DIR = Path('temp') / 'harness_eval'
+DEFAULT_GOLDEN = Path(__file__).resolve().parent / 'golden' / 'repo_issue_consensus.json'
 
 
 def _utc_now_iso() -> str:
@@ -59,6 +61,12 @@ def cmd_validate_samples(args: argparse.Namespace) -> int:
 def cmd_validate_matrix(args: argparse.Namespace) -> int:
     matrix = load_json(args.matrix)
     report = _checks_payload(validate_matrix(matrix))
+    _print_json(report)
+    return 0 if report['passed'] else 1
+
+
+def cmd_validate_golden(args: argparse.Namespace) -> int:
+    report = _checks_payload(validate_golden_alignment(args.samples_dir, args.golden))
     _print_json(report)
     return 0 if report['passed'] else 1
 
@@ -368,6 +376,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_matrix = subparsers.add_parser('validate-matrix')
     validate_matrix.add_argument('--matrix', default=str(DEFAULT_MATRIX))
     validate_matrix.set_defaults(func=cmd_validate_matrix)
+
+    validate_golden = subparsers.add_parser('validate-golden')
+    validate_golden.add_argument('--samples-dir', default=str(DEFAULT_SAMPLES))
+    validate_golden.add_argument('--golden', default=str(DEFAULT_GOLDEN))
+    validate_golden.set_defaults(func=cmd_validate_golden)
 
     evaluate_transcript_parser = subparsers.add_parser('evaluate-transcript')
     evaluate_transcript_parser.add_argument('sample')

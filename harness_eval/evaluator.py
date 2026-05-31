@@ -39,13 +39,50 @@ def transcript_paths(root: str | Path | None = None) -> list[Path]:
     return sorted(base.glob('*.json'))
 
 
+def load_golden_consensus(path: str | Path) -> dict[str, dict[str, Any]]:
+    payload = load_json(path)
+    samples = payload.get('samples')
+    if not isinstance(samples, list):
+        raise ValueError(f'{path} must contain samples list')
+    result: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        if not isinstance(sample, Mapping) or not isinstance(sample.get('sample_id'), str):
+            raise ValueError(f'{path} contains an invalid golden sample')
+        result[str(sample['sample_id'])] = dict(sample)
+    return result
+
+
+def validate_golden_alignment(samples_root: str | Path, golden_path: str | Path) -> list[CheckResult]:
+    golden_by_id = load_golden_consensus(golden_path)
+    checks: list[CheckResult] = []
+    for path in sample_paths(samples_root):
+        sample = load_json(path)
+        expect = sample.get('expect') if isinstance(sample.get('expect'), Mapping) else {}
+        golden_ref = expect.get('golden_ref')
+        if not golden_ref:
+            continue
+        sample_id = str(sample.get('id'))
+        golden = golden_by_id.get(sample_id)
+        checks.append(CheckResult(f'{sample_id}_golden_exists', isinstance(golden, Mapping), 'golden sample must exist for golden_ref'))
+        if not isinstance(golden, Mapping):
+            continue
+        checks.append(CheckResult(f'{sample_id}_node_ids', list(expect.get('node_ids') or []) == list(golden.get('node_ids') or []), 'expect.node_ids must match judge consensus'))
+        checks.append(CheckResult(f'{sample_id}_allowed_node_ids', list(expect.get('allowed_node_ids') or []) == list(golden.get('node_ids') or []), 'expect.allowed_node_ids must match judge consensus node ids'))
+        checks.append(CheckResult(f'{sample_id}_allowed_paths', list(expect.get('allowed_paths') or []) == list(golden.get('allowed_paths') or []), 'expect.allowed_paths must match judge consensus'))
+    if not checks:
+        checks.append(CheckResult('golden_refs_present', False, 'at least one sample must reference a golden consensus'))
+    return checks
+
+
 def validate_sample(sample: Mapping[str, Any]) -> list[CheckResult]:
+    has_artifact = isinstance(sample.get('artifact'), Mapping)
+    has_repo = isinstance(sample.get('repo'), Mapping)
     checks = [
         CheckResult('schema_version', sample.get('schema_version') == SAMPLE_SCHEMA_VERSION, 'sample schema version must be 1'),
         CheckResult('id', isinstance(sample.get('id'), str) and bool(sample.get('id')), 'sample id is required'),
         CheckResult('task', isinstance(sample.get('task'), str) and bool(sample.get('task')), 'task text is required'),
         CheckResult('issue', isinstance(sample.get('issue'), Mapping), 'issue object is required'),
-        CheckResult('artifact', isinstance(sample.get('artifact'), Mapping), 'artifact object is required'),
+        CheckResult('input_source', has_artifact or has_repo, 'artifact or repo object is required'),
         CheckResult('tools', isinstance(sample.get('tools'), list), 'tools list is required'),
         CheckResult('expect', isinstance(sample.get('expect'), Mapping), 'expect object is required'),
     ]
@@ -115,6 +152,7 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
     required_tools = set(expect.get('required_tools') or [])
     forbidden_tools = set(expect.get('forbidden_tools') or [])
     expected_nodes = set(expect.get('node_ids') or [])
+    allowed_nodes = set(expect.get('allowed_node_ids') or expected_nodes)
     allowed_paths = set(expect.get('allowed_paths') or [])
 
     found_nodes = {str(value) for value in _collect_values(final, 'node_id') if isinstance(value, str)}
@@ -125,6 +163,7 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
         CheckResult('required_tools', required_tools.issubset(set(tool_names)), 'all required tools must be called'),
         CheckResult('forbidden_tools', not (forbidden_tools & set(tool_names)), 'forbidden tools must not be called'),
         CheckResult('expected_nodes', expected_nodes.issubset(found_nodes), 'final output must include expected node ids'),
+        CheckResult('node_allowlist', found_nodes.issubset(allowed_nodes), 'final output node ids must stay within sample allowlist'),
         CheckResult('path_allowlist', found_paths.issubset(allowed_paths), 'final output paths must stay within sample allowlist'),
         CheckResult('confidence_range', all(0.0 <= float(value) <= 1.0 for value in confidence_values), 'confidence scores must be in [0, 1]'),
     ]
@@ -142,18 +181,22 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
 
 
 def build_job_packet(sample: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    packet = {
         'schema_version': 1,
         'job_id': sample.get('id'),
         'objective': sample.get('task'),
         'issue': sample.get('issue'),
-        'artifact': sample.get('artifact'),
         'output_format': {
             'type': 'json',
             'required_top_level_fields': ['sample_id', 'tool_calls', 'final'],
             'final_fields': ['hypotheses', 'investigation_path', 'confidence'],
         },
     }
+    if isinstance(sample.get('repo'), Mapping):
+        packet['repo'] = sample.get('repo')
+    if isinstance(sample.get('artifact'), Mapping):
+        packet['artifact'] = sample.get('artifact')
+    return packet
 
 
 def build_job_prompt(sample: Mapping[str, Any]) -> str:

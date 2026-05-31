@@ -69,6 +69,17 @@ The finishing tool also clamps final nodes and paths to high-confidence
 candidates derived from the job packet's own issue/artifact evidence. It must
 not read hidden evaluator `expect` fields.
 
+Repo-fixture samples cover parser timeout tracing and same-file precision, so
+the gate fails when the SUT sprays extra nodes that happen to share an allowed
+file path.
+
+Repo-fixture expected answers come from
+`harness_eval/golden/repo_issue_consensus.json`, which records agreement between
+an independent GPT-5.5 xhigh subagent and Kimi judge over the issue text and
+fixture code. Run `python -m harness_eval.runner validate-golden` to verify that
+hidden sample `expect` fields still match that judge consensus. The SUT never
+receives the golden file or hidden `expect` block.
+
 Credential Rules
 ----------------
 
