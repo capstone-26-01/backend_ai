@@ -195,6 +195,9 @@ class IssueRelatedNodesRequestSerializer(serializers.Serializer):
     analysis_id = serializers.IntegerField(min_value=1)
     issue_number = serializers.IntegerField(min_value=1)
     max_nodes = serializers.IntegerField(required=False, min_value=1, max_value=20, default=8)
+    mock = serializers.BooleanField(required=False, default=False, help_text='true이면 live GitHub issue detail/comment 대신 기존 mock issue map을 반환합니다.')
+    include_comments = serializers.BooleanField(required=False, default=True, help_text='true이면 GitHub issue comments를 함께 읽어 ranking evidence에 반영합니다.')
+    max_context_files = serializers.IntegerField(required=False, min_value=1, max_value=10, default=4, help_text='code_context에 포함할 최대 파일 수입니다.')
 
 
 class IssueAuthorSerializer(serializers.Serializer):
@@ -304,3 +307,9 @@ class IssueRelatedNodesResponseSerializer(serializers.Serializer):
     candidates = IssueRelatedNodeCandidateSerializer(many=True, help_text='관련도가 높다고 판단된 graph node 후보 목록입니다.')
     limits = serializers.JSONField(help_text='요청에서 적용된 max_nodes 등 제한값입니다.')
     warnings = serializers.JSONField(help_text='추천 생성 중 발생한 경고 목록입니다.')
+    overview_graph = serializers.JSONField(required=False, help_text='레포 전체를 빠르게 이해하기 위한 축약 overview graph입니다.')
+    focus_graph = serializers.JSONField(required=False, help_text='선택 issue 해결에 직접 관련된 후보/주변 노드 중심 graph입니다.')
+    hypotheses = serializers.JSONField(required=False, help_text='Issue가 어디서 시작됐을 가능성이 높은지에 대한 deterministic 가설 목록입니다.')
+    investigation_path = serializers.JSONField(required=False, help_text='첫 기여자가 순서대로 확인하면 좋은 node/file 조사 경로입니다.')
+    code_context = serializers.JSONField(required=False, help_text='관련 후보 파일의 bounded code excerpt입니다.')
+    confidence = serializers.JSONField(required=False, help_text='Deterministic ranking confidence 요약입니다.')

@@ -429,26 +429,29 @@ const res = await fetch(`${API_BASE}/api/issues/?${params}`);
 주요 실패: 400 잘못된 GitHub URL 또는 pagination 값, 404 레포 없음/private, 429 GitHub rate limit, 502 upstream 오류.
 '''
 _ISSUE_RELATED_NODES_DESCRIPTION = '''
-선택한 GitHub issue를 해결하는 데 관련 있어 보이는 code graph node 후보를 반환하는 mock API입니다.
+선택한 GitHub issue를 해결하는 데 관련 있어 보이는 contributor graph와 code context를 반환합니다.
 
 프런트엔드 권장 흐름:
 1. `/api/analysis/` 응답의 `analysis_id`를 보관합니다.
 2. `/api/issues/`에서 받은 issue의 `number`를 사용자가 선택한 issue로 저장합니다.
-3. 이 API에 `analysis_id`, `issue_number`, 선택적으로 `max_nodes`를 POST합니다.
-4. 응답의 `selected_node_ids`는 graph highlight에 바로 쓰고, `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
+3. 이 API에 `analysis_id`, `issue_number`, 선택적으로 `max_nodes`, `include_comments`, `max_context_files`를 POST합니다.
+4. 응답의 `selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 바로 쓰고, `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
 
 현재 동작:
-- 실제 GitHub issue 본문/comment 조회나 smolagents 추론은 아직 하지 않습니다.
-- mock issue text와 현재 `analysis_id`의 graph artifact를 이용해 deterministic 후보를 만듭니다.
-- 따라서 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
-- 실제 구현에서는 GitHub MCP로 issue detail/comment를 읽고, smolagents 기반으로 graph 주변 노드를 탐색하는 방식으로 교체할 예정입니다.
+- 기본값은 live GitHub issue detail/comment를 읽고 deterministic evidence/ranking으로 후보를 만듭니다.
+- LLM 또는 smolagents를 호출하지 않습니다.
+- `mock=true`이면 기존 프런트엔드 선작업용 mock 응답을 반환합니다.
+- 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
+- 새 필드는 additive입니다: `overview_graph`, `focus_graph`, `hypotheses`, `investigation_path`, `code_context`, `confidence`.
 
 요청 예시:
 ```json
 {
   "analysis_id": 123,
   "issue_number": 42,
-  "max_nodes": 8
+  "max_nodes": 8,
+  "include_comments": true,
+  "max_context_files": 4
 }
 ```
 
@@ -571,6 +574,8 @@ _ISSUE_RELATED_NODES_REQUEST_EXAMPLE = {
     'analysis_id': 123,
     'issue_number': 42,
     'max_nodes': 8,
+    'include_comments': True,
+    'max_context_files': 4,
 }
 _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     'analysis_id': 123,
@@ -618,6 +623,12 @@ _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     ],
     'limits': {'max_nodes': 8},
     'warnings': [],
+    'overview_graph': {'nodes': [], 'edges': [], 'node_ids': [], 'limits': {'node_limit': 80}},
+    'focus_graph': {'nodes': [], 'edges': [], 'node_ids': [], 'highlight_node_ids': []},
+    'hypotheses': [],
+    'investigation_path': [],
+    'code_context': {'files': [], 'file_count': 0, 'max_context_files': 4, 'truncated': False},
+    'confidence': {'level': 'medium', 'score': 0.7, 'reasons': []},
 }
 
 
