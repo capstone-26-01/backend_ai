@@ -930,6 +930,14 @@ class IssueMapRankingEvalTests(TestCase):
         self.assertGreaterEqual(report['recall_at_3'], ISSUE_MAP_RANKING_BASELINE['recall_at_3'])
         self.assertGreaterEqual(report['recall_at_5'], ISSUE_MAP_RANKING_BASELINE['recall_at_5'])
 
+    def test_issue_ranking_eval_baseline_report_is_documented(self):
+        text = (settings.BASE_DIR / 'docs' / 'issue_map_ranking_eval_baseline.txt').read_text(encoding='utf-8')
+
+        self.assertIn(f"case_count: {ISSUE_MAP_RANKING_BASELINE['case_count']}", text)
+        self.assertIn(f"recall_at_1: {ISSUE_MAP_RANKING_BASELINE['recall_at_1']}", text)
+        self.assertIn(f"recall_at_3: {ISSUE_MAP_RANKING_BASELINE['recall_at_3']}", text)
+        self.assertIn(f"recall_at_5: {ISSUE_MAP_RANKING_BASELINE['recall_at_5']}", text)
+
     def test_issue_ranking_expected_top_nodes_do_not_regress(self):
         _results, candidates_by_case = self._ranking_results()
 
