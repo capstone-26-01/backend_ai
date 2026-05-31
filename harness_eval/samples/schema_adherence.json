@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "schema_adherence",
+  "task": "Return only the structured explanation contract and stay on allowed node IDs and paths.",
+  "issue": {
+    "number": 103,
+    "title": "services.py issue is hard to trace",
+    "body": "The user mentioned services.py and get_repo_analysis without a package path. _build_and_store_analysis may also be involved.",
+    "labels": [{"name": "analysis"}],
+    "comments": []
+  },
+  "artifact": {
+    "repo": "owner/repo",
+    "nodes": [
+      {"id": "api/services.py::get_repo_analysis", "kind": "function", "path": "api/services.py"},
+      {"id": "api/services.py::_build_and_store_analysis", "kind": "function", "path": "api/services.py"},
+      {"id": "api/views.py::analysis", "kind": "function", "path": "api/views.py"}
+    ],
+    "edges": [
+      {
+        "source": "api/services.py::get_repo_analysis",
+        "target": "api/services.py::_build_and_store_analysis",
+        "type": "calls"
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "rank_issue_candidates",
+      "description": "Return deterministic candidate nodes from the stored artifact and issue evidence."
+    },
+    {
+      "name": "load_code_context",
+      "description": "Return bounded code excerpts for selected candidate paths."
+    }
+  ],
+  "expect": {
+    "required_tools": ["rank_issue_candidates"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api"],
+    "node_ids": ["api/services.py::get_repo_analysis", "api/services.py::_build_and_store_analysis"],
+    "allowed_paths": ["api/services.py"]
+  }
+}

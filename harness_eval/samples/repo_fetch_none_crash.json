@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo_fetch_none_crash",
+  "task": "Analyze the provided Git repository fixture and identify where a GitHub import crash starts.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 204,
+    "title": "Repository import crashes before parsing starts",
+    "body": "Some imports fail with 'NoneType' object has no attribute 'get' before any parser symbols are produced. It happens when the upstream file-list response is missing.",
+    "labels": [{"name": "github"}, {"name": "ingestion"}],
+    "comments": [
+      {
+        "id": 24,
+        "body": "The parser loop is not reached for this failure."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_fetch_none_crash",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "search_repo_text", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["github_repo/services.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["github_repo/services.py::fetch_repo_files"],
+    "allowed_node_ids": ["github_repo/services.py::fetch_repo_files", "github_repo/services.py::github_client_get", "api/services.py::_build_and_store_analysis"],
+    "allowed_paths": ["github_repo/services.py", "api/services.py"]
+  }
+}

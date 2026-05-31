@@ -1,0 +1,59 @@
+{
+  "sample_id": "origin_trace",
+  "variant_id": "opencode-kimi-k25-issue-tools",
+  "tool_calls": [
+    {
+      "name": "rank_issue_candidates",
+      "arguments": {"issue_number": 42}
+    },
+    {
+      "name": "load_focus_graph",
+      "arguments": {
+        "node_ids": ["api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo"]
+      }
+    },
+    {
+      "name": "load_code_context",
+      "arguments": {
+        "paths": ["api/services.py", "parser/services.py"]
+      }
+    }
+  ],
+  "final": {
+    "hypotheses": [
+      {
+        "kind": "likely_origin",
+        "node_id": "api/services.py::_build_and_store_analysis",
+        "confidence": 0.84,
+        "rationale": "The stack frame points to the build function that calls the parser."
+      },
+      {
+        "kind": "related_area",
+        "node_id": "parser/services.py::parse_repo",
+        "confidence": 0.76,
+        "rationale": "The issue and comment both mention parse_repo as the failing parser entry."
+      }
+    ],
+    "investigation_path": [
+      {
+        "step": 1,
+        "node_id": "api/services.py::_build_and_store_analysis",
+        "path": "api/services.py",
+        "action": "inspect",
+        "why": "Start at the stack-frame origin."
+      },
+      {
+        "step": 2,
+        "node_id": "parser/services.py::parse_repo",
+        "path": "parser/services.py",
+        "action": "inspect",
+        "why": "Follow the parser call target."
+      }
+    ],
+    "confidence": {
+      "level": "high",
+      "score": 0.84,
+      "reasons": ["stack frame", "symbol mention", "bounded code context"]
+    }
+  }
+}

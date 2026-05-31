@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo_graph_label_mismatch",
+  "task": "Analyze the provided Git repository fixture and identify graph labeling code related to wrong node labels.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 206,
+    "title": "Graph nodes show file names instead of symbol labels",
+    "body": "After a successful analysis, the visual graph renders several nodes with path-like labels instead of function names. Node and edge counts are correct, but labels are wrong.",
+    "labels": [{"name": "graph"}, {"name": "frontend"}],
+    "comments": [
+      {
+        "id": 26,
+        "body": "The UI is just rendering the label field it receives from the backend."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_graph_label_mismatch",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "search_repo_text", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["graph/builders.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["graph/builders.py::attach_labels"],
+    "allowed_node_ids": ["graph/builders.py::attach_labels", "graph/builders.py::build_dependency_graph", "api/services.py::_build_and_store_analysis"],
+    "allowed_paths": ["graph/builders.py", "api/services.py"]
+  }
+}

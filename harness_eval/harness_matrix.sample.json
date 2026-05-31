@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "description": "Example variants for comparing OpenCode Zen models, tools, MCPs, and skills against issue-map harness samples.",
+  "variants": [
+    {
+      "id": "opencode-kimi-k25-review-only",
+      "model": {
+        "opencode_model_id": "opencode/kimi-k2.5",
+        "raw_model_id": "kimi-k2.5"
+      },
+      "endpoint": {
+        "provider": "opencode_zen",
+        "chat_completions_url": "https://opencode.ai/zen/v1/chat/completions"
+      },
+      "tools": [],
+      "mcp_servers": [],
+      "skills": []
+    },
+    {
+      "id": "opencode-kimi-k25-issue-tools",
+      "model": {
+        "opencode_model_id": "opencode/kimi-k2.5",
+        "raw_model_id": "kimi-k2.5"
+      },
+      "endpoint": {
+        "provider": "opencode_zen",
+        "chat_completions_url": "https://opencode.ai/zen/v1/chat/completions"
+      },
+      "tools": ["rank_issue_candidates", "load_focus_graph", "load_code_context"],
+      "mcp_servers": [],
+      "skills": []
+    },
+    {
+      "id": "opencode-kimi-k25-issue-tools-skill",
+      "model": {
+        "opencode_model_id": "opencode/kimi-k2.5",
+        "raw_model_id": "kimi-k2.5"
+      },
+      "endpoint": {
+        "provider": "opencode_zen",
+        "chat_completions_url": "https://opencode.ai/zen/v1/chat/completions"
+      },
+      "tools": ["rank_issue_candidates", "load_focus_graph", "load_code_context"],
+      "mcp_servers": [],
+      "skills": ["issue-map-contributor-explainer"]
+    },
+    {
+      "id": "opencode-kimi-k26-issue-tools",
+      "model": {
+        "opencode_model_id": "opencode/kimi-k2.6",
+        "raw_model_id": "kimi-k2.6"
+      },
+      "endpoint": {
+        "provider": "opencode_zen",
+        "chat_completions_url": "https://opencode.ai/zen/v1/chat/completions"
+      },
+      "tools": ["rank_issue_candidates", "load_focus_graph", "load_code_context"],
+      "mcp_servers": [],
+      "skills": []
+    }
+  ]
+}

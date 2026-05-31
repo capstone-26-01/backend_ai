@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "id": "origin_trace",
+  "task": "Explain where the GitHub issue most likely starts and produce a bounded investigation path.",
+  "issue": {
+    "number": 42,
+    "title": "Repository analysis crashes during build",
+    "body": "Traceback: File \"api/services.py\", line 6, in _build_and_store_analysis. parse_repo() raises a parser timeout error.",
+    "labels": [{"name": "analysis"}, {"name": "parser"}],
+    "comments": [
+      {
+        "id": 1,
+        "body": "The failing call path goes through parser/services.py::parse_repo."
+      }
+    ]
+  },
+  "artifact": {
+    "repo": "owner/repo",
+    "nodes": [
+      {"id": "api/services.py::_build_and_store_analysis", "kind": "function", "path": "api/services.py"},
+      {"id": "parser/services.py::parse_repo", "kind": "function", "path": "parser/services.py"},
+      {"id": "api/views.py::analysis", "kind": "function", "path": "api/views.py"}
+    ],
+    "edges": [
+      {
+        "source": "api/services.py::_build_and_store_analysis",
+        "target": "parser/services.py::parse_repo",
+        "type": "calls"
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "rank_issue_candidates",
+      "description": "Return deterministic candidate nodes from the stored artifact and issue evidence."
+    },
+    {
+      "name": "load_focus_graph",
+      "description": "Return the bounded focus graph for candidate node IDs."
+    },
+    {
+      "name": "load_code_context",
+      "description": "Return bounded code excerpts for selected candidate paths."
+    }
+  ],
+  "expect": {
+    "required_tools": ["rank_issue_candidates", "load_focus_graph", "load_code_context"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api"],
+    "node_ids": ["api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo"],
+    "allowed_paths": ["api/services.py", "parser/services.py"]
+  }
+}

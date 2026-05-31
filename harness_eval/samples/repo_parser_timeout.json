@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "repo_parser_timeout",
+  "task": "Analyze the provided Git repository fixture and identify the code nodes most relevant to the selected issue.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/parser_timeout_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 201,
+    "title": "Repository analysis hangs while parsing a Python repo",
+    "body": "A request to build repository analysis reaches the analysis service and then never completes once parser/services.py starts scanning files. The HTTP view only forwards the request.",
+    "labels": [{"name": "analysis"}, {"name": "parser"}],
+    "comments": [
+      {
+        "id": 21,
+        "body": "The same repo works if parser scanning is bypassed, so start from the analysis-to-parser handoff rather than the view layer."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_repo_files",
+      "description": "List bounded Python files in the provided repository."
+    },
+    {
+      "name": "search_repo_symbols",
+      "description": "Search Python functions/classes in the repository and rank them against issue evidence."
+    },
+    {
+      "name": "read_repo_file",
+      "description": "Read bounded Python file contents from the repository."
+    }
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_parser_timeout",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["api/services.py", "parser/services.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["parser/services.py::parse_repo", "parser/services.py::should_continue"],
+    "allowed_node_ids": ["api/services.py::_build_and_store_analysis", "api/services.py::get_repo_analysis", "parser/services.py::parse_repo", "parser/services.py::should_continue", "parser/services.py::parse_next_file"],
+    "allowed_paths": ["api/services.py", "parser/services.py"]
+  }
+}

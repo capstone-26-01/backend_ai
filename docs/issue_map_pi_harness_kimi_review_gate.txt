@@ -19,6 +19,67 @@ Provider
 - Endpoint: https://opencode.ai/zen/v1/chat/completions.
 - Mode: one bounded review call, no tools, no agent loop.
 
+Harness Evaluation Suite
+------------------------
+
+The reusable suite under `harness_eval/` checks whether model, tool, MCP, or
+skill changes improve a real issue-map runner command before they are trusted
+for production-like review gates. The command under test receives only a normal
+issue job packet; hidden expected nodes/tool policy stay inside the deterministic
+evaluator.
+
+Offline checks:
+
+- `python -m unittest harness_eval.tests`
+- `python -m harness_eval.runner validate-samples`
+- `python -m harness_eval.runner validate-matrix`
+- `python -m harness_eval.runner render-job harness_eval/samples/origin_trace.json`
+- `python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- <your-pi-command-and-args>`
+- `python -m harness_eval.runner evaluate-transcript harness_eval/samples/origin_trace.json harness_eval/sample_transcripts/good_origin_trace.json`
+
+Optional live OpenCode Zen smoke:
+
+- set `OPENCODE_API_KEY` in the caller environment,
+- set `RUN_OPENCODE_LIVE_TESTS=true`,
+- run `python -m harness_eval.runner live-smoke --live --model kimi-k2.5 --write-result`.
+
+The live smoke uses the raw model id `kimi-k2.5` against
+`https://opencode.ai/zen/v1/chat/completions`. The OpenCode config id remains
+`opencode/kimi-k2.5`. Keep these separate when debugging usage dashboards.
+The smoke gate fails unless the provider response includes both `usage` and a
+`response_id`; successful receipts are written under `temp/harness_eval/` with
+timestamp/model/endpoint correlation fields. This proves the provider returned
+usage metadata for the request, but it does not prove the web dashboard rendered
+the request.
+
+Production-like live Pi SUT eval:
+
+- set `OPENCODE_API_KEY` in the caller environment,
+- set `RUN_OPENCODE_LIVE_TESTS=true`,
+- run `python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5`.
+
+This keeps the deterministic evaluator outside the SUT. `pi_runner.py` invokes
+Pi with only the bounded issue-map tools from
+`harness_eval/pi/issue_map_extension.ts`, then extracts the transcript from the
+terminating `finish_issue_map_transcript` tool result. If `live-smoke` passes
+but this command fails, the provider is reachable and the failure is in the Pi
+tool loop/output contract.
+
+The finishing tool also clamps final nodes and paths to high-confidence
+candidates derived from the job packet's own issue/artifact evidence. It must
+not read hidden evaluator `expect` fields.
+
+Repo-fixture samples cover parser timeout tracing and same-file precision, so
+the gate fails when the SUT sprays extra nodes that happen to share an allowed
+file path.
+
+Repo-fixture expected answers come from
+`harness_eval/golden/repo_issue_consensus.json`, which records agreement between
+an independent GPT-5.5 xhigh subagent and Kimi judge over the issue text and
+fixture code. Run `python -m harness_eval.runner validate-golden` to verify that
+hidden sample `expect` fields still match that judge consensus. The SUT never
+receives the golden file or hidden `expect` block.
+
 Credential Rules
 ----------------
 

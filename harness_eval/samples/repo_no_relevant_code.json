@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "repo_no_relevant_code",
+  "task": "Analyze the provided Git repository fixture and return no nodes when the issue lacks actionable code evidence.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 209,
+    "title": "The app feels slower on my laptop",
+    "body": "After updating my browser, everything feels a bit slower. I do not have a stack trace, endpoint name, repository action, or reproducible behavior.",
+    "labels": [{"name": "needs-info"}],
+    "comments": [
+      {
+        "id": 29,
+        "body": "No maintainer has reproduced this yet."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_no_relevant_code",
+    "allow_empty": true,
+    "required_tools": ["list_repo_files", "search_repo_symbols"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols"],
+    "required_read_paths": [],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": [],
+    "allowed_node_ids": [],
+    "allowed_paths": []
+  }
+}

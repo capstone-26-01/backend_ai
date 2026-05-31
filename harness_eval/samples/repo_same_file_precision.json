@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "repo_same_file_precision",
+  "task": "Analyze the provided Git repository fixture and avoid unrelated same-file symbols.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/ambiguous_services_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 202,
+    "title": "Stale analysis after repository rebuild",
+    "body": "After a rebuild is triggered through api/services.py, the service still returns a stale analysis object. Do not include delete_share_token: that share-token cleanup helper appears in logs from a different request and should not be treated as part of this failure.",
+    "labels": [{"name": "analysis"}, {"name": "service"}],
+    "comments": [
+      {
+        "id": 22,
+        "body": "The view and repository clone helpers are only request plumbing; the bug is in the analysis service path."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_repo_files",
+      "description": "List bounded Python files in the provided repository."
+    },
+    {
+      "name": "search_repo_symbols",
+      "description": "Search Python functions/classes in the repository and rank them against issue evidence."
+    },
+    {
+      "name": "read_repo_file",
+      "description": "Read bounded Python file contents from the repository."
+    }
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_same_file_precision",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["api/services.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["api/services.py::get_repo_analysis", "api/services.py::_build_and_store_analysis"],
+    "allowed_node_ids": ["api/services.py::get_repo_analysis", "api/services.py::_build_and_store_analysis"],
+    "allowed_paths": ["api/services.py"]
+  }
+}

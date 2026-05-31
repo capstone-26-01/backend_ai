@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo_private_summary_leak",
+  "task": "Analyze the provided Git repository fixture and identify code nodes responsible for a private-repo access bug.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 203,
+    "title": "Private repository summaries are visible to non-owners",
+    "body": "A logged-in user who does not own a private repository can still load the summary endpoint. The endpoint should reject users without repository access.",
+    "labels": [{"name": "security"}, {"name": "api"}],
+    "comments": [
+      {
+        "id": 23,
+        "body": "The graph SVG endpoint is unaffected. The failure happens in the summary request path and permission decision."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_private_summary_leak",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["api/views.py", "auth/permissions.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["api/views.py::get", "auth/permissions.py::can_view"],
+    "allowed_node_ids": ["api/views.py::SummaryView", "api/views.py::get", "auth/permissions.py::RepoPermission", "auth/permissions.py::can_view"],
+    "allowed_paths": ["api/views.py", "auth/permissions.py"]
+  }
+}

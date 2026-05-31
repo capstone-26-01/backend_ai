@@ -1,0 +1,8 @@
+ACCEPT_FOR_MVP
+
+Residual non-blocking risks:
+- Golden provenance is still lightly documented: `repo_issue_consensus.json` records planted bugs, rationales, and judge names, but the checked `judge_logs` only include the audit prompt, not raw judge outputs.
+- Some allowlists are broad, especially cache/worker cases, so noisy answers can pass if they include required nodes and stay inside the allowed set.
+- Evaluator path/schema checks are permissive: missing final paths can pass because paths are only allowlist-checked when present.
+- Tool order is checked as an ordered subsequence, not strict first-use order.
+- The Pi repo tool ranks symbols against issue text internally, which is acceptable for MVP but makes the bounded tool stronger than plain repo search.

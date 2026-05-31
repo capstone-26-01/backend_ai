@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo_async_symbols_missing",
+  "task": "Analyze the provided Git repository fixture and identify parser code related to missing async functions.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 207,
+    "title": "Async functions disappear from parser symbol output",
+    "body": "Repositories with async Python endpoints parse successfully, but the parser's raw symbol list omits async functions before graph construction starts. Regular def functions from the same file are present.",
+    "labels": [{"name": "parser"}],
+    "comments": [
+      {
+        "id": 27,
+        "body": "This started after the Python symbol collector was changed."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_async_symbols_missing",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["parser/services.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["parser/services.py::visit_AsyncFunctionDef"],
+    "allowed_node_ids": ["parser/services.py::visit_AsyncFunctionDef", "parser/services.py::extract_symbols", "parser/services.py::PythonSymbolCollector", "parser/services.py::visit_FunctionDef", "parser/services.py::parse_repo", "api/services.py::_build_and_store_analysis"],
+    "allowed_paths": ["parser/services.py", "api/services.py"]
+  }
+}
