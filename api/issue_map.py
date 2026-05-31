@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
+import html
 import os
 import re
 
@@ -696,4 +697,217 @@ def build_code_context(
         'max_context_files': max_context_files,
         'max_context_chars': max_context_chars,
         'truncated': bool(truncated),
+    }, warnings
+
+
+def _inert_text(value: Any, *, max_chars: int = 600) -> str:
+    text = _string(value).replace('\x00', '').strip()
+    text = html.escape(text, quote=False)
+    return text[:max_chars]
+
+
+def _focus_node_paths(focus_graph: Mapping[str, Any]) -> dict[str, str | None]:
+    node_paths: dict[str, str | None] = {}
+    for node in focus_graph.get('nodes') or []:
+        if not isinstance(node, Mapping):
+            continue
+        node_id = _string(node.get('id'))
+        if not node_id:
+            continue
+        path = node.get('path')
+        node_paths[node_id] = path if isinstance(path, str) and path else None
+    return node_paths
+
+
+def _allowed_explanation_paths(focus_graph: Mapping[str, Any], code_context: Mapping[str, Any]) -> set[str]:
+    paths = {path for path in _focus_node_paths(focus_graph).values() if path}
+    for file_context in code_context.get('files') or []:
+        if not isinstance(file_context, Mapping):
+            continue
+        path = file_context.get('path')
+        if isinstance(path, str) and path:
+            paths.add(path)
+    return paths
+
+
+def _float_in_range(value: Any, *, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return round(min(1.0, max(0.0, number)), 3)
+
+
+def _confidence_level(score: float) -> str:
+    if score >= 0.75:
+        return 'high'
+    if score >= 0.35:
+        return 'medium'
+    return 'low'
+
+
+def _sanitize_llm_hypotheses(
+    value: Any,
+    node_paths: Mapping[str, str | None],
+    fallback: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    if not isinstance(value, list):
+        return fallback, 1, 0
+
+    result: list[dict[str, Any]] = []
+    dropped = 0
+    rewritten = 0
+    for item in value[:8]:
+        if not isinstance(item, Mapping):
+            dropped += 1
+            continue
+        node_id = _string(item.get('node_id'))
+        if node_id not in node_paths:
+            dropped += 1
+            continue
+        kind = _inert_text(item.get('kind') or ('likely_origin' if not result else 'related_area'), max_chars=40)
+        confidence = _float_in_range(item.get('confidence'), default=0.5)
+        rationale = _inert_text(item.get('rationale') or item.get('reason') or '', max_chars=800)
+        if not rationale:
+            rationale = 'LLM explanation did not include a usable rationale.'
+            rewritten += 1
+        result.append(
+            {
+                'kind': kind,
+                'node_id': node_id,
+                'confidence': confidence,
+                'rationale': rationale,
+            }
+        )
+
+    if not result:
+        return fallback, dropped + 1, rewritten
+    return result, dropped, rewritten
+
+
+def _sanitize_llm_investigation_path(
+    value: Any,
+    node_paths: Mapping[str, str | None],
+    allowed_paths: set[str],
+    fallback: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    if not isinstance(value, list):
+        return fallback, 1, 0
+
+    result: list[dict[str, Any]] = []
+    dropped = 0
+    rewritten = 0
+    for item in value[:10]:
+        if not isinstance(item, Mapping):
+            dropped += 1
+            continue
+        node_id = _string(item.get('node_id'))
+        if node_id not in node_paths:
+            dropped += 1
+            continue
+
+        path = item.get('path')
+        if not isinstance(path, str) or not path:
+            path = node_paths[node_id]
+        elif path not in allowed_paths:
+            path = node_paths[node_id]
+            rewritten += 1
+
+        result.append(
+            {
+                'step': len(result) + 1,
+                'node_id': node_id,
+                'path': path,
+                'action': _inert_text(item.get('action') or 'inspect', max_chars=80),
+                'why': _inert_text(item.get('why') or item.get('rationale') or '', max_chars=800),
+            }
+        )
+
+    if not result:
+        return fallback, dropped + 1, rewritten
+    return result, dropped, rewritten
+
+
+def _sanitize_llm_confidence(
+    value: Any,
+    fallback: dict[str, Any],
+) -> tuple[dict[str, Any], int, int]:
+    if not isinstance(value, Mapping):
+        return fallback, 1, 0
+
+    fallback_score = _float_in_range(fallback.get('score'), default=0.0)
+    score = _float_in_range(value.get('score'), default=fallback_score)
+    level = _inert_text(value.get('level') or '', max_chars=20).lower()
+    rewritten = 0
+    if level not in {'high', 'medium', 'low'}:
+        level = _confidence_level(score)
+        rewritten += 1
+
+    reasons = [
+        _inert_text(reason, max_chars=500)
+        for reason in (value.get('reasons') or [])
+        if _inert_text(reason, max_chars=500)
+    ][:5]
+    if not reasons:
+        reasons = [_inert_text(reason, max_chars=500) for reason in fallback.get('reasons', []) if _inert_text(reason, max_chars=500)][:5]
+        rewritten += 1
+
+    return (
+        {
+            'level': level,
+            'score': score,
+            'reasons': reasons,
+            'warning_codes': list(fallback.get('warning_codes') or []),
+            'source': 'llm',
+        },
+        0,
+        rewritten,
+    )
+
+
+def sanitize_issue_explanation_output(
+    output: Mapping[str, Any],
+    *,
+    focus_graph: Mapping[str, Any],
+    code_context: Mapping[str, Any],
+    fallback_hypotheses: list[dict[str, Any]],
+    fallback_investigation_path: list[dict[str, Any]],
+    fallback_confidence: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    node_paths = _focus_node_paths(focus_graph)
+    allowed_paths = _allowed_explanation_paths(focus_graph, code_context)
+    warnings: list[dict[str, Any]] = []
+
+    hypotheses, dropped_hypotheses, rewritten_hypotheses = _sanitize_llm_hypotheses(
+        output.get('hypotheses'),
+        node_paths,
+        fallback_hypotheses,
+    )
+    investigation_path, dropped_steps, rewritten_steps = _sanitize_llm_investigation_path(
+        output.get('investigation_path'),
+        node_paths,
+        allowed_paths,
+        fallback_investigation_path,
+    )
+    confidence, dropped_confidence, rewritten_confidence = _sanitize_llm_confidence(
+        output.get('confidence'),
+        fallback_confidence,
+    )
+
+    dropped = dropped_hypotheses + dropped_steps + dropped_confidence
+    rewritten = rewritten_hypotheses + rewritten_steps + rewritten_confidence
+    if dropped or rewritten:
+        warnings.append(
+            {
+                'code': 'llm_output_sanitized',
+                'message': 'LLM explanation에서 허용되지 않은 node/path 또는 잘못된 필드를 제거하거나 보정했습니다.',
+                'dropped_items': dropped,
+                'rewritten_items': rewritten,
+            }
+        )
+
+    return {
+        'hypotheses': hypotheses,
+        'investigation_path': investigation_path,
+        'confidence': confidence,
     }, warnings

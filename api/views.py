@@ -449,7 +449,8 @@ _ISSUE_RELATED_NODES_DESCRIPTION = '''
 
 현재 동작:
 - 기본값은 live GitHub issue detail/comment를 읽고 deterministic evidence/ranking으로 후보를 만듭니다.
-- LLM 또는 smolagents를 호출하지 않습니다.
+- `ISSUE_MAP_LLM_ENABLED=true`일 때만 bounded LLM explanation을 한 번 호출하며, 실패하면 deterministic explanation으로 폴백합니다.
+- smolagents나 agent loop는 호출하지 않습니다.
 - `mock=true`이면 기존 프런트엔드 선작업용 mock 응답을 반환합니다.
 - 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
 - 새 필드는 additive입니다: `overview_graph`, `focus_graph`, `hypotheses`, `investigation_path`, `code_context`, `confidence`.
@@ -623,7 +624,7 @@ _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
                 'end_line': 220,
                 'metadata': {},
             },
-            'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 smolagents 기반 graph 탐색을 사용합니다.',
+            'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 deterministic graph ranking 및 bounded LLM explanation을 사용합니다.',
             'evidence': [
                 {'type': 'mock', 'message': '프런트엔드 graph highlight 연동을 위한 임시 추천입니다.'},
                 {'type': 'graph_metadata', 'message': 'Graph node path: api/views.py'},
