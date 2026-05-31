@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Callable, Mapping
 import shutil
 import subprocess
+from unittest.mock import patch
+from urllib.parse import urlencode
+
+import requests
+
+from api.artifacts import build_graph_artifact
 
 
 GIT_USER_NAME = 'Test User'
@@ -27,12 +34,323 @@ class GoldenFixtureRepo:
     rubric_tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class IssueMapFixture:
+    repo_path: str
+    revision: str
+    files: Mapping[str, str]
+    expected_node_ids: tuple[str, ...]
+    expected_entrypoint_ids: tuple[str, ...]
+    expected_key_module_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MockGithubHttpResponse:
+    payload: Any
+    status_code: int = 200
+    headers: Mapping[str, str] = field(default_factory=dict)
+    url: str = 'https://api.github.com/repos/owner/repo/issues'
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status_code < 400
+
+    @property
+    def text(self) -> str:
+        return '' if self.payload is None else str(self.payload)
+
+    def json(self) -> Any:
+        return self.payload
+
+    def raise_for_status(self) -> None:
+        if not self.ok:
+            raise requests.HTTPError(f'{self.status_code} response for {self.url}', response=self)
+
+
+@dataclass
+class IssueLlmCallRecorder:
+    response: Mapping[str, Any]
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        self.calls.append((args, kwargs))
+        return dict(self.response)
+
+
 EVAL_RUBRIC = {
     'graph_node_recall': 'Expected modules, files, classes, and functions from a fixture must appear in the graph.',
     'edge_correctness': 'Expected contains, imports, inherits, and calls edges must point to the intended source and target.',
     'entrypoint_correctness': 'Entrypoint-like symbols should be identifiable by graph metadata or deterministic hints.',
     'qa_citation_correctness': 'Q&A should cite the files that contain the code evidence used for the answer.',
 }
+
+
+ISSUE_MAP_FIXTURE = IssueMapFixture(
+    repo_path='owner/repo',
+    revision='abc123',
+    files={
+        'api/views.py': (
+            'from api.services import get_repo_analysis\n\n'
+            'def analysis(request):\n'
+            '    return get_repo_analysis("owner/repo")\n'
+        ),
+        'api/services.py': (
+            'from parser.services import parse_repo\n\n'
+            'def get_repo_analysis(repo_path):\n'
+            '    return _build_and_store_analysis(repo_path)\n\n'
+            'def _build_and_store_analysis(repo_path):\n'
+            '    return parse_repo({})\n'
+        ),
+        'parser/services.py': (
+            'def parse_repo(files):\n'
+            '    return {"nodes": [], "edges": []}\n'
+        ),
+    },
+    expected_node_ids=(
+        'api/views.py',
+        'api/views.py::analysis',
+        'api/services.py',
+        'api/services.py::get_repo_analysis',
+        'api/services.py::_build_and_store_analysis',
+        'parser/services.py::parse_repo',
+    ),
+    expected_entrypoint_ids=('api/views.py::analysis',),
+    expected_key_module_ids=('api/services.py::get_repo_analysis', 'parser/services.py::parse_repo'),
+)
+
+
+def build_issue_map_analysis_artifact(
+    *,
+    repo_path: str = ISSUE_MAP_FIXTURE.repo_path,
+    revision: str = ISSUE_MAP_FIXTURE.revision,
+) -> dict[str, Any]:
+    graph = {
+        'tree': [],
+        'nodes': [
+            {'id': 'api/views.py', 'type': 'file', 'label': 'views.py', 'file': 'api/views.py'},
+            {
+                'id': 'api/views.py::analysis',
+                'type': 'function',
+                'label': 'analysis',
+                'file': 'api/views.py',
+                'start_line': 3,
+                'end_line': 4,
+            },
+            {'id': 'api/services.py', 'type': 'file', 'label': 'services.py', 'file': 'api/services.py'},
+            {
+                'id': 'api/services.py::get_repo_analysis',
+                'type': 'function',
+                'label': 'get_repo_analysis',
+                'file': 'api/services.py',
+                'start_line': 3,
+                'end_line': 4,
+            },
+            {
+                'id': 'api/services.py::_build_and_store_analysis',
+                'type': 'function',
+                'label': '_build_and_store_analysis',
+                'file': 'api/services.py',
+                'start_line': 6,
+                'end_line': 7,
+            },
+            {
+                'id': 'parser/services.py::parse_repo',
+                'type': 'function',
+                'label': 'parse_repo',
+                'file': 'parser/services.py',
+                'start_line': 1,
+                'end_line': 2,
+            },
+        ],
+        'edges': [
+            {'source': 'api/views.py', 'target': 'api/views.py::analysis', 'type': 'contains', 'file': 'api/views.py'},
+            {'source': 'api/services.py', 'target': 'api/services.py::get_repo_analysis', 'type': 'contains', 'file': 'api/services.py'},
+            {'source': 'api/services.py', 'target': 'api/services.py::_build_and_store_analysis', 'type': 'contains', 'file': 'api/services.py'},
+            {
+                'source': 'api/views.py::analysis',
+                'target': 'api/services.py::get_repo_analysis',
+                'type': 'calls',
+                'file': 'api/views.py',
+            },
+            {
+                'source': 'api/services.py::get_repo_analysis',
+                'target': 'api/services.py::_build_and_store_analysis',
+                'type': 'calls',
+                'file': 'api/services.py',
+            },
+            {
+                'source': 'api/services.py::_build_and_store_analysis',
+                'target': 'parser/services.py::parse_repo',
+                'type': 'calls',
+                'file': 'api/services.py',
+            },
+        ],
+    }
+    return build_graph_artifact(
+        repo_path=repo_path,
+        revision=revision,
+        graph=graph,
+        file_contents=ISSUE_MAP_FIXTURE.files,
+        entrypoints=[
+            {
+                'id': 'api/views.py::analysis',
+                'kind': 'django_view',
+                'label': 'analysis',
+                'path': 'api/views.py',
+                'confidence': 0.9,
+                'reason': 'API view fixture',
+            }
+        ],
+        key_modules=[
+            {'id': 'api/services.py::get_repo_analysis', 'path': 'api/services.py', 'score': 20},
+            {'id': 'parser/services.py::parse_repo', 'path': 'parser/services.py', 'score': 15},
+        ],
+    )
+
+
+def create_issue_map_fixture_repo(repo_dir: Path) -> GitFixtureRepo:
+    return create_git_fixture_repo(repo_dir, ISSUE_MAP_FIXTURE.files, commit_message='issue-map fixture')
+
+
+def github_issue_user(login: str = 'octocat') -> dict[str, str]:
+    return {
+        'login': login,
+        'avatar_url': f'https://github.com/{login}.png',
+        'html_url': f'https://github.com/{login}',
+    }
+
+
+def github_issue_label(name: str = 'bug', color: str = 'd73a4a', description: str | None = 'Something is not working') -> dict[str, str | None]:
+    return {'name': name, 'color': color, 'description': description}
+
+
+def github_issue_payload(
+    *,
+    repo_path: str = ISSUE_MAP_FIXTURE.repo_path,
+    number: int = 42,
+    title: str = 'Repository analysis fails on parser limits',
+    body: str = 'Trace points at api/services.py::_build_and_store_analysis and parser/services.py.',
+    labels: list[dict[str, Any]] | None = None,
+    comments: int = 2,
+    pull_request: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        'number': number,
+        'title': title,
+        'state': 'open',
+        'html_url': f'https://github.com/{repo_path}/issues/{number}',
+        'user': github_issue_user(),
+        'labels': labels if labels is not None else [github_issue_label(), github_issue_label('analysis', '1d76db', 'Analysis flow')],
+        'assignees': [github_issue_user('backend-owner')],
+        'comments': comments,
+        'created_at': '2026-05-20T10:00:00Z',
+        'updated_at': '2026-05-23T12:30:00Z',
+        'body': body,
+        'locked': False,
+    }
+    if pull_request:
+        payload['pull_request'] = {'url': f'https://api.github.com/repos/{repo_path}/pulls/{number}'}
+    return payload
+
+
+def github_issue_comments_payload(*, count: int = 2) -> list[dict[str, Any]]:
+    return [
+        {
+            'id': index,
+            'user': github_issue_user(f'commenter-{index}'),
+            'body': f'Comment {index}: check api/services.py and parse_repo.',
+            'created_at': f'2026-05-2{index}T10:00:00Z',
+            'updated_at': f'2026-05-2{index}T10:30:00Z',
+            'html_url': f'https://github.com/owner/repo/issues/42#issuecomment-{index}',
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+def github_issue_link_header(repo_path: str = ISSUE_MAP_FIXTURE.repo_path, *, page: int = 1, per_page: int = 30, state: str = 'open') -> str:
+    query = urlencode({'state': state, 'page': page + 1, 'per_page': per_page})
+    return f'<https://api.github.com/repos/{repo_path}/issues?{query}>; rel="next"'
+
+
+def mock_github_issue_list_response(
+    *,
+    repo_path: str = ISSUE_MAP_FIXTURE.repo_path,
+    include_pull_request: bool = True,
+    has_next_page: bool = True,
+) -> MockGithubHttpResponse:
+    payload = [
+        github_issue_payload(repo_path=repo_path, number=42),
+        github_issue_payload(repo_path=repo_path, number=77, title='Graph view misses call relationships'),
+    ]
+    if include_pull_request:
+        payload.append(github_issue_payload(repo_path=repo_path, number=88, title='Draft PR should be filtered', pull_request=True))
+    headers = {'Link': github_issue_link_header(repo_path)} if has_next_page else {}
+    return MockGithubHttpResponse(payload=payload, headers=headers, url=f'https://api.github.com/repos/{repo_path}/issues')
+
+
+def mock_github_issue_detail_response(*, repo_path: str = ISSUE_MAP_FIXTURE.repo_path, issue_number: int = 42) -> MockGithubHttpResponse:
+    return MockGithubHttpResponse(
+        payload=github_issue_payload(repo_path=repo_path, number=issue_number),
+        url=f'https://api.github.com/repos/{repo_path}/issues/{issue_number}',
+    )
+
+
+def mock_github_issue_comments_response(*, repo_path: str = ISSUE_MAP_FIXTURE.repo_path, issue_number: int = 42, count: int = 2) -> MockGithubHttpResponse:
+    return MockGithubHttpResponse(
+        payload=github_issue_comments_payload(count=count),
+        url=f'https://api.github.com/repos/{repo_path}/issues/{issue_number}/comments',
+    )
+
+
+def make_issue_llm_stub(response: Mapping[str, Any] | None = None) -> IssueLlmCallRecorder:
+    return IssueLlmCallRecorder(
+        response=response
+        or {
+            'hypotheses': [
+                {
+                    'kind': 'likely_origin',
+                    'node_id': 'api/services.py::_build_and_store_analysis',
+                    'confidence': 0.8,
+                    'rationale': 'Deterministic issue LLM test response.',
+                }
+            ],
+            'investigation_path': [
+                {
+                    'step': 1,
+                    'node_id': 'api/services.py::_build_and_store_analysis',
+                    'path': 'api/services.py',
+                    'action': 'inspect',
+                    'why': 'Fixture response for tests.',
+                }
+            ],
+            'confidence': {'level': 'medium', 'score': 0.8, 'reasons': ['fixture']},
+        }
+    )
+
+
+class ExternalHttpBlockedMixin:
+    """Blocks requests-based HTTP calls in tests that must stay offline."""
+
+    _external_http_patcher: Any
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._external_http_patcher = patch('requests.sessions.Session.request', side_effect=self._blocked_external_http_request)
+        self._external_http_patcher.start()
+
+    def tearDown(self) -> None:
+        self._external_http_patcher.stop()
+        super().tearDown()
+
+    @staticmethod
+    def _blocked_external_http_request(*args: Any, **kwargs: Any) -> None:
+        method = args[1] if len(args) > 1 else kwargs.get('method', 'GET')
+        url = args[2] if len(args) > 2 else kwargs.get('url', '<unknown>')
+        raise AssertionError(f'External HTTP request blocked in offline issue test: {method} {url}')
+
+
+def assert_uses_issue_llm_stub(stub: Callable[..., Mapping[str, Any]]) -> Mapping[str, Any]:
+    return stub({'issue': {'number': 42}}, candidates=['api/services.py::_build_and_store_analysis'])
 
 
 GOLDEN_FIXTURE_REPOS: dict[str, GoldenFixtureRepo] = {
