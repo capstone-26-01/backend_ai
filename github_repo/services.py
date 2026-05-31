@@ -5,16 +5,19 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 import fcntl
+import os
 import re
 import shutil
 import subprocess
 
 from django.conf import settings
+import requests
 
 
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 MAX_STDERR_CHARS = 1200
+MAX_GITHUB_ERROR_BODY_CHARS = 1200
 
 
 class RepoIngestionError(Exception):
@@ -43,6 +46,39 @@ class RepoIngestionError(Exception):
             payload['command_category'] = self.command_category
         if self.metadata:
             payload['metadata'] = self.metadata
+        return payload
+
+
+class GithubIssueApiError(Exception):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 502,
+        upstream_status: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        rate_limit: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.upstream_status = upstream_status
+        self.metadata = metadata or {}
+        self.rate_limit = rate_limit
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            'code': self.code,
+            'message': self.message,
+        }
+        if self.upstream_status is not None:
+            payload['upstream_status'] = self.upstream_status
+        if self.metadata:
+            payload['metadata'] = self.metadata
+        if self.rate_limit is not None:
+            payload['rate_limit'] = self.rate_limit
         return payload
 
 
