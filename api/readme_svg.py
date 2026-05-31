@@ -456,6 +456,23 @@ def _build_overview_cards(
     return [*entry_cards, *flow_cards, *domain_cards, *support_cards], scores
 
 
+def select_overview_cards(
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    edges: list[Mapping[str, Any]],
+    entrypoints: list[Mapping[str, Any]],
+    key_modules: list[Mapping[str, Any]],
+    *,
+    node_limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    return _build_overview_cards(
+        nodes_by_id,
+        edges,
+        entrypoints,
+        key_modules,
+        node_limit=node_limit,
+    )
+
+
 def _layout_cards(
     cards: list[dict[str, Any]],
     *,
@@ -773,7 +790,7 @@ def render_share_graph_svg(
     graph_y = 154
     graph_width = width - graph_x - 36
     graph_height = height - graph_y - 50
-    cards, _scores = _build_overview_cards(nodes_by_id, edges, entrypoints, key_modules, node_limit=node_limit)
+    cards, _scores = select_overview_cards(nodes_by_id, edges, entrypoints, key_modules, node_limit=node_limit)
     card_positions, columns = _layout_cards(cards, x=graph_x, y=graph_y, width=graph_width, height=graph_height)
     visible_cards = [card for card in cards if str(card['id']) in card_positions]
     visible_edges = _overview_edges(visible_cards, card_positions, nodes_by_id, edges, limit=7)
