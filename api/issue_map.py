@@ -507,3 +507,92 @@ def build_overview_graph_projection(
         'node_ids': selected_ids,
         'limits': {'node_limit': node_limit, 'node_count': len(selected_ids), 'edge_count': len(selected_edges)},
     }
+
+
+def _container_ids(node_id: str, node: Mapping[str, Any], nodes_by_id: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    containers: list[str] = []
+    parent_id = node.get('parent_id') or node.get('parent')
+    if isinstance(parent_id, str) and parent_id in nodes_by_id:
+        containers.append(parent_id)
+    path = _node_path(node)
+    if path and path in nodes_by_id and path != node_id:
+        containers.append(path)
+    if '::' in node_id:
+        ancestor = node_id.rsplit('::', 1)[0]
+        if ancestor in nodes_by_id:
+            containers.append(ancestor)
+    result: list[str] = []
+    for container_id in containers:
+        if container_id not in result:
+            result.append(container_id)
+    return result
+
+
+def build_focus_graph_projection(
+    analysis: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    max_focus_nodes: int = 48,
+    max_selected_nodes: int = 8,
+) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
+    warnings: list[dict[str, Any]] = []
+    nodes_by_id = _nodes_by_id(analysis)
+    edges = [cast(Mapping[str, Any], edge) for edge in analysis.get('edges', []) if isinstance(edge, Mapping)]
+    max_focus_nodes = max(6, min(max_focus_nodes, 80))
+    max_selected_nodes = max(1, min(max_selected_nodes, 20))
+
+    ordered_ids = [
+        str(candidate.get('node_id'))
+        for candidate in candidates
+        if candidate.get('node_id') in nodes_by_id
+    ]
+    included: list[str] = []
+
+    def include(node_id: str) -> None:
+        if node_id in nodes_by_id and node_id not in included and len(included) < max_focus_nodes:
+            included.append(node_id)
+
+    for node_id in ordered_ids:
+        include(node_id)
+        for container_id in _container_ids(node_id, nodes_by_id[node_id], nodes_by_id):
+            include(container_id)
+        if len(included) >= max_focus_nodes:
+            break
+
+    included_set = set(included)
+    for edge in edges:
+        if len(included) >= max_focus_nodes:
+            break
+        source = _edge_source(edge)
+        target = _edge_target(edge)
+        if source in included_set and target in nodes_by_id:
+            include(target)
+            included_set.add(target)
+        if target in included_set and source in nodes_by_id:
+            include(source)
+            included_set.add(source)
+
+    included_set = set(included)
+    projected_edges = [
+        _display_edge(edge)
+        for edge in edges
+        if _edge_source(edge) in included_set and _edge_target(edge) in included_set
+    ]
+    selected_node_ids = [node_id for node_id in ordered_ids if node_id in included_set][:max_selected_nodes]
+    if ordered_ids and not selected_node_ids:
+        warnings.append({'code': 'no_focus_highlights', 'message': 'Ranked candidates could not be highlighted in the focus graph.'})
+    if len(set(ordered_ids)) > len(selected_node_ids):
+        warnings.append({'code': 'focus_graph_truncated', 'message': 'Focus graph node cap excluded some ranked candidates.', 'max_focus_nodes': max_focus_nodes})
+
+    focus_graph = {
+        'nodes': [_display_node(nodes_by_id[node_id]) for node_id in included],
+        'edges': projected_edges,
+        'node_ids': included,
+        'highlight_node_ids': selected_node_ids,
+        'limits': {
+            'max_focus_nodes': max_focus_nodes,
+            'node_count': len(included),
+            'edge_count': len(projected_edges),
+        },
+    }
+    return focus_graph, selected_node_ids, warnings
