@@ -396,7 +396,7 @@ GitHub 레포의 파일 경로 목록만 빠르게 반환합니다.
 구조 분석이 필요한 화면에서는 `/api/tree/` 또는 `/api/analysis/`를 사용하세요.
 '''
 _ISSUES_LIST_DESCRIPTION = '''
-프런트엔드 선작업용 GitHub open issue 목록 mock API입니다.
+GitHub open issue 목록 API입니다.
 
 프런트엔드 권장 흐름:
 1. 사용자가 GitHub URL을 입력하면 `/api/analysis/`로 먼저 분석을 만들고 `analysis_id`를 보관합니다.
@@ -404,10 +404,12 @@ _ISSUES_LIST_DESCRIPTION = '''
 3. 사용자가 issue를 선택하면 응답의 `number`를 `/api/issues/related-nodes/`의 `issue_number`로 보냅니다.
 
 현재 동작:
-- 실제 GitHub/MCP 호출은 아직 하지 않고, 안정적인 mock issue 목록을 반환합니다.
-- `source=mock`, `mock=true`이면 프런트엔드 개발용 응답입니다.
-- 실제 구현 전환 후에도 `key`, `number`, `title`, `labels`, `body_excerpt` 필드는 유지하는 계약입니다.
-- GitHub Pull Request는 issue 목록에서 제외하는 전제로 `is_pull_request=false`만 반환합니다.
+- 기본값은 live GitHub REST API 조회입니다.
+- `mock=true`이면 안정적인 프런트엔드/테스트용 mock issue 목록을 반환합니다.
+- `source=github`, `mock=false`이면 live GitHub 응답입니다.
+- `key`, `number`, `title`, `labels`, `assignees`, `body_excerpt`, `body_truncated`, `locked` 필드는 유지하는 계약입니다.
+- live 응답에는 `repository`, `rate_limit`, `warnings`가 추가될 수 있습니다.
+- GitHub Pull Request는 issue 목록에서 제외하므로 `is_pull_request=false`만 반환합니다.
 
 프런트엔드 예시:
 ```ts
@@ -415,7 +417,7 @@ const params = new URLSearchParams({ url: repoUrl, page: "1", per_page: "30" });
 const res = await fetch(`${API_BASE}/api/issues/?${params}`);
 ```
 
-주요 실패: 400 잘못된 GitHub URL 또는 pagination 값.
+주요 실패: 400 잘못된 GitHub URL 또는 pagination 값, 404 레포 없음/private, 429 GitHub rate limit, 502 upstream 오류.
 '''
 _ISSUE_RELATED_NODES_DESCRIPTION = '''
 선택한 GitHub issue를 해결하는 데 관련 있어 보이는 code graph node 후보를 반환하는 mock API입니다.
@@ -1081,6 +1083,7 @@ def get_repo_graph(request):
         OpenApiParameter(name='page', description='선택. 1부터 시작하는 페이지 번호입니다. 기본값 1.', required=False, type=int),
         OpenApiParameter(name='per_page', description='선택. 페이지당 issue 수입니다. 1-100, 기본값 30.', required=False, type=int),
         OpenApiParameter(name='state', description='선택. 현재는 open만 지원합니다. 생략하면 open입니다.', required=False, type=str),
+        OpenApiParameter(name='mock', description='선택. true이면 live GitHub 대신 mock issue 목록을 반환합니다.', required=False, type=bool),
     ],
     responses=IssueListResponseSerializer,
     examples=[

@@ -184,6 +184,11 @@ class IssueListRequestSerializer(RepoUrlSerializer):
     page = serializers.IntegerField(required=False, min_value=1, default=1)
     per_page = serializers.IntegerField(required=False, min_value=1, max_value=100, default=30)
     state = serializers.ChoiceField(choices=('open',), required=False, default='open')
+    mock = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text='true이면 live GitHub 대신 프런트엔드/테스트용 mock issue 목록을 반환합니다.',
+    )
 
 
 class IssueRelatedNodesRequestSerializer(serializers.Serializer):
@@ -222,17 +227,33 @@ class IssueListItemSerializer(serializers.Serializer):
     is_pull_request = serializers.BooleanField(help_text='항상 false입니다. 실제 구현에서도 PR은 제외하고 issue만 반환합니다.')
 
 
+class IssueRepositorySerializer(serializers.Serializer):
+    full_name = serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.')
+    html_url = serializers.URLField(help_text='GitHub 레포 웹 URL입니다.')
+    api_url = serializers.URLField(help_text='GitHub REST API 레포 URL입니다.')
+
+
+class IssueRateLimitSerializer(serializers.Serializer):
+    limit = serializers.IntegerField(allow_null=True, required=False, help_text='GitHub REST API rate limit 한도입니다.')
+    remaining = serializers.IntegerField(allow_null=True, required=False, help_text='현재 남은 GitHub REST API 요청 수입니다.')
+    reset = serializers.IntegerField(allow_null=True, required=False, help_text='GitHub rate limit reset epoch timestamp입니다.')
+    used = serializers.IntegerField(allow_null=True, required=False, help_text='현재 window에서 사용한 요청 수입니다.')
+
+
 class IssueListResponseSerializer(serializers.Serializer):
     repo = serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.')
+    repository = IssueRepositorySerializer(required=False, help_text='live GitHub 응답에서 제공되는 레포 metadata입니다.')
     provider = serializers.CharField(help_text='현재 provider입니다. GitHub repo만 지원하므로 github입니다.')
-    source = serializers.CharField(help_text='현재 데이터 출처입니다. mock이면 실제 GitHub 조회가 아닙니다.')
-    mock = serializers.BooleanField(help_text='true면 프런트엔드 선작업용 mock 응답입니다.')
+    source = serializers.CharField(help_text='현재 데이터 출처입니다. github이면 live GitHub, mock이면 실제 GitHub 조회가 아닙니다.')
+    mock = serializers.BooleanField(help_text='true면 프런트엔드/테스트용 mock 응답입니다.')
     state = serializers.CharField(help_text='조회한 issue 상태입니다. 현재는 open만 지원합니다.')
     page = serializers.IntegerField(help_text='현재 페이지 번호입니다.')
     per_page = serializers.IntegerField(help_text='페이지당 issue 수입니다.')
     has_next_page = serializers.BooleanField(help_text='다음 페이지 존재 여부입니다.')
     next_page = serializers.IntegerField(allow_null=True, help_text='다음 페이지 번호입니다. 없으면 null입니다.')
     issues = IssueListItemSerializer(many=True, help_text='Open issue 목록입니다.')
+    rate_limit = IssueRateLimitSerializer(allow_null=True, required=False, help_text='live GitHub 응답의 rate limit header 요약입니다.')
+    warnings = serializers.JSONField(required=False, help_text='비치명적 경고 목록입니다. 현재 기본값은 빈 배열입니다.')
 
 
 class IssueRefSerializer(serializers.Serializer):
