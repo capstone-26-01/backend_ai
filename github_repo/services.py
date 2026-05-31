@@ -149,6 +149,149 @@ def _git_timeout() -> int:
     return _setting_int('GITHUB_REPO_GIT_TIMEOUT_SECONDS', 30)
 
 
+def _github_api_timeout() -> int:
+    return _setting_int('GITHUB_API_TIMEOUT_SECONDS', 10)
+
+
+def _github_api_base_url() -> str:
+    return str(getattr(settings, 'GITHUB_API_BASE_URL', 'https://api.github.com')).rstrip('/')
+
+
+def _github_token() -> str:
+    return str(getattr(settings, 'GITHUB_TOKEN', '') or os.getenv('GITHUB_TOKEN', '')).strip()
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+    }
+    token = _github_token()
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
+def _response_header(response: Any, name: str) -> str:
+    headers = getattr(response, 'headers', {}) or {}
+    if hasattr(headers, 'get'):
+        value = headers.get(name) or headers.get(name.lower()) or headers.get(name.upper())
+        if value is not None:
+            return str(value)
+    lowered_name = name.lower()
+    for key, value in dict(headers).items():
+        if str(key).lower() == lowered_name:
+            return str(value)
+    return ''
+
+
+def _int_response_header(response: Any, name: str) -> int | None:
+    value = _response_header(response, name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _github_rate_limit(response: Any) -> dict[str, int | None] | None:
+    rate_limit = {
+        'limit': _int_response_header(response, 'X-RateLimit-Limit'),
+        'remaining': _int_response_header(response, 'X-RateLimit-Remaining'),
+        'reset': _int_response_header(response, 'X-RateLimit-Reset'),
+        'used': _int_response_header(response, 'X-RateLimit-Used'),
+    }
+    if all(value is None for value in rate_limit.values()):
+        return None
+    return rate_limit
+
+
+def _response_error_body(response: Any) -> str:
+    text = str(getattr(response, 'text', '') or '')
+    return text[:MAX_GITHUB_ERROR_BODY_CHARS]
+
+
+def _github_error_from_response(response: Any, repo_path: str) -> GithubIssueApiError:
+    upstream_status = int(getattr(response, 'status_code', 0) or 0)
+    rate_limit = _github_rate_limit(response)
+    metadata = {'repo': repo_path, 'response_body': _response_error_body(response)}
+
+    if upstream_status == 404:
+        return GithubIssueApiError(
+            'repo_not_found',
+            '레포를 찾을 수 없거나 private repository입니다.',
+            status_code=404,
+            upstream_status=upstream_status,
+            metadata=metadata,
+            rate_limit=rate_limit,
+        )
+    if upstream_status == 403 and rate_limit and rate_limit.get('remaining') == 0:
+        return GithubIssueApiError(
+            'github_rate_limited',
+            'GitHub API rate limit이 초과되었습니다.',
+            status_code=429,
+            upstream_status=upstream_status,
+            metadata=metadata,
+            rate_limit=rate_limit,
+        )
+    if upstream_status in {401, 403}:
+        return GithubIssueApiError(
+            'private_repo',
+            '레포 접근 권한이 없거나 private repository입니다.',
+            status_code=403,
+            upstream_status=upstream_status,
+            metadata=metadata,
+            rate_limit=rate_limit,
+        )
+    return GithubIssueApiError(
+        'github_issue_api_error',
+        'GitHub issue API 호출 중 오류가 발생했습니다.',
+        status_code=502,
+        upstream_status=upstream_status,
+        metadata=metadata,
+        rate_limit=rate_limit,
+    )
+
+
+def _github_get_json(path: str, *, repo_path: str, params: dict[str, Any] | None = None) -> tuple[Any, Any]:
+    url = f'{_github_api_base_url()}{path}'
+    try:
+        response = requests.get(url, headers=_github_headers(), params=params, timeout=_github_api_timeout())
+    except requests.RequestException as exc:
+        raise GithubIssueApiError(
+            'github_issue_api_unavailable',
+            'GitHub issue API 호출 중 네트워크 오류가 발생했습니다.',
+            status_code=502,
+            metadata={'repo': repo_path, 'error': str(exc)[:MAX_GITHUB_ERROR_BODY_CHARS]},
+        ) from exc
+
+    if not getattr(response, 'ok', False):
+        raise _github_error_from_response(response, repo_path)
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise GithubIssueApiError(
+            'github_issue_api_error',
+            'GitHub issue API 응답을 해석할 수 없습니다.',
+            status_code=502,
+            upstream_status=int(getattr(response, 'status_code', 0) or 0),
+            metadata={'repo': repo_path},
+            rate_limit=_github_rate_limit(response),
+        ) from exc
+    return payload, response
+
+
+def fetch_github_issue_list_page(repo_path: str, *, page: int = 1, per_page: int = 30, state: str = 'open') -> tuple[Any, Any]:
+    owner, repo = _repo_parts(repo_path)
+    return _github_get_json(
+        f'/repos/{owner}/{repo}/issues',
+        repo_path=repo_path,
+        params={'state': state, 'page': page, 'per_page': per_page},
+    )
+
+
 def _sanitize_stderr(stderr: str) -> str:
     sanitized = re.sub(r'https://[^@\s]+@github\.com/', 'https://github.com/', stderr)
     return sanitized[:MAX_STDERR_CHARS]
