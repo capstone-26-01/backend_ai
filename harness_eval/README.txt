@@ -28,6 +28,7 @@ Tracked Files
 - `harness_matrix.sample.json`: model/tool/MCP/skill comparison matrix.
 - `evaluator.py`: schema and transcript scoring logic.
 - `runner.py`: CLI for validation, transcript evaluation, dry-run matrix expansion, and optional live OpenCode calls.
+- `pi_runner.py` and `pi/issue_map_extension.ts`: real Pi/OpenCode SUT adapter with bounded issue-map tools.
 
 Offline Commands
 ----------------
@@ -75,7 +76,7 @@ Expected result:
 Live Sample Eval
 ----------------
 
-This sends a normal synthetic issue job to OpenCode Zen and evaluates the returned JSON as a runner transcript:
+This sends a normal synthetic issue job directly to OpenCode Zen and evaluates the returned JSON as a runner transcript:
 
 ```
 export OPENCODE_API_KEY=...
@@ -91,6 +92,29 @@ This is not a replacement for a real Pi run with tools. It tests the model/provi
 - `content_json_valid`: provider output parsed as a JSON object,
 - `json_parse_error`: parser failure when the model ignored JSON-only instructions,
 - `eval_passed`: deterministic transcript checks passed.
+
+Live Pi SUT Eval
+----------------
+
+This is the production-like live check: `run-harness` stays the deterministic judge, while `pi_runner.py` is the system under test. The Pi runner installs/uses `@earendil-works/pi-coding-agent@0.78.0` through `npx`, binds only the bounded issue-map tools from `pi/issue_map_extension.ts`, and emits the final transcript from a terminating `finish_issue_map_transcript` tool result.
+
+The terminating tool clamps final hypotheses and investigation paths to high-confidence nodes selected from the job packet's own issue/artifact evidence. It does not read hidden `expect` data, but it prevents the model from leaking low-relevance artifact nodes into the final transcript.
+
+```
+export OPENCODE_API_KEY=...
+export RUN_OPENCODE_LIVE_TESTS=true
+python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
+```
+
+Expected result:
+
+- exit code 0,
+- required issue-map tools were called,
+- forbidden filesystem/shell/network/GitHub tools were not called,
+- expected node IDs and paths passed the deterministic evaluator,
+- `pi_metadata.response_ids` and `pi_metadata.usage` are present in the transcript for API/dashboard correlation.
+
+If this fails while `live-smoke` passes, the provider is reachable but the Pi tool loop/output contract is broken.
 
 Evaluating Real Pi Runs
 -----------------------

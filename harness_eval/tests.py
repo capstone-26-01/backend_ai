@@ -11,6 +11,8 @@ import sys
 import unittest
 
 from harness_eval.runner import _ensure_live_enabled, cmd_live_sample, cmd_live_smoke
+from harness_eval import pi_runner
+from harness_eval.pi_runner import extract_transcript_from_pi_jsonl
 from harness_eval.evaluator import (
     DEFAULT_RAW_MODEL_ID,
     OPENCODE_ZEN_CHAT_COMPLETIONS_ENDPOINT,
@@ -249,6 +251,108 @@ class HarnessEvalBlackBoxRunnerTests(unittest.TestCase):
         self.assertFalse(checks['forbidden_tools']['passed'])
         self.assertFalse(checks['expected_nodes']['passed'])
         self.assertFalse(checks['path_allowlist']['passed'])
+
+
+class PiRunnerEventParserTests(unittest.TestCase):
+    def test_extracts_finish_tool_result_details_from_pi_jsonl(self):
+        transcript = load_json(ROOT / 'sample_transcripts' / 'good_origin_trace.json')
+        event = {
+            'type': 'message_update',
+            'message': {
+                'responseId': 'chatcmpl-test',
+                'usage': {'input': 10, 'output': 20, 'totalTokens': 30},
+                'content': [
+                    {
+                        'role': 'toolResult',
+                        'toolName': 'finish_issue_map_transcript',
+                        'details': transcript,
+                    }
+                ],
+            },
+        }
+
+        parsed, metadata = extract_transcript_from_pi_jsonl(json.dumps(event))
+
+        self.assertEqual(parsed['sample_id'], 'origin_trace')
+        self.assertEqual(parsed['final']['confidence']['score'], 0.84)
+        self.assertEqual(metadata['response_ids'], ['chatcmpl-test'])
+        self.assertEqual(metadata['usage']['totalTokens'], 30)
+
+    def test_extracts_finish_tool_result_from_text_content(self):
+        transcript = load_json(ROOT / 'sample_transcripts' / 'good_origin_trace.json')
+        event = {
+            'type': 'message_update',
+            'message': {
+                'content': [
+                    {
+                        'role': 'toolResult',
+                        'toolName': 'finish_issue_map_transcript',
+                        'content': [{'type': 'text', 'text': json.dumps(transcript)}],
+                    }
+                ],
+            },
+        }
+
+        parsed, metadata = extract_transcript_from_pi_jsonl('not-json\n' + json.dumps(event))
+
+        self.assertEqual(parsed['sample_id'], 'origin_trace')
+        self.assertIn('non_json_line_preview', metadata)
+
+    def test_extracts_finish_tool_result_from_pi_tool_results_array(self):
+        transcript = load_json(ROOT / 'sample_transcripts' / 'good_origin_trace.json')
+        event = {
+            'type': 'message_update',
+            'message': {'content': [{'type': 'toolCall', 'name': 'finish_issue_map_transcript'}]},
+            'toolResults': [
+                {
+                    'role': 'toolResult',
+                    'toolName': 'finish_issue_map_transcript',
+                    'details': transcript,
+                }
+            ],
+        }
+
+        parsed, _metadata = extract_transcript_from_pi_jsonl(json.dumps(event))
+
+        self.assertEqual(parsed['sample_id'], 'origin_trace')
+        self.assertEqual(parsed['tool_calls'][0]['name'], 'rank_issue_candidates')
+
+
+class PiRunnerCommandTests(unittest.TestCase):
+    def test_pi_runner_emits_transcript_from_finish_tool_result(self):
+        job = build_job_packet(load_json(ROOT / 'samples' / 'origin_trace.json'))
+        transcript = load_json(ROOT / 'sample_transcripts' / 'good_origin_trace.json')
+        event = {
+            'type': 'message_update',
+            'message': {
+                'responseId': 'chatcmpl-test',
+                'usage': {'input': 10, 'output': 20, 'totalTokens': 30},
+            },
+            'toolResults': [
+                {
+                    'role': 'toolResult',
+                    'toolName': 'finish_issue_map_transcript',
+                    'details': transcript,
+                }
+            ],
+        }
+        completed = subprocess.CompletedProcess(args=['npx'], returncode=0, stdout=json.dumps(event), stderr='')
+        stream = io.StringIO()
+
+        with patch.dict('os.environ', {'RUN_OPENCODE_LIVE_TESTS': 'true', 'OPENCODE_API_KEY': 'test-key'}, clear=False):
+            with patch('sys.stdin', io.StringIO(json.dumps(job))):
+                with patch('harness_eval.pi_runner.subprocess.run', return_value=completed) as run:
+                    with redirect_stdout(stream):
+                        code = pi_runner.main(['--live'])
+
+        payload = json.loads(stream.getvalue())
+        _command, kwargs = run.call_args
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload['sample_id'], 'origin_trace')
+        self.assertEqual(payload['pi_metadata']['response_ids'], ['chatcmpl-test'])
+        self.assertIn('--no-builtin-tools', kwargs['args'] if 'args' in kwargs else run.call_args.args[0])
+        self.assertIn('HARNESS_EVAL_JOB', kwargs['env'])
 
 
 if __name__ == '__main__':

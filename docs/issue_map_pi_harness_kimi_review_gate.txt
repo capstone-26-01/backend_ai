@@ -52,6 +52,23 @@ timestamp/model/endpoint correlation fields. This proves the provider returned
 usage metadata for the request, but it does not prove the web dashboard rendered
 the request.
 
+Production-like live Pi SUT eval:
+
+- set `OPENCODE_API_KEY` in the caller environment,
+- set `RUN_OPENCODE_LIVE_TESTS=true`,
+- run `python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5`.
+
+This keeps the deterministic evaluator outside the SUT. `pi_runner.py` invokes
+Pi with only the bounded issue-map tools from
+`harness_eval/pi/issue_map_extension.ts`, then extracts the transcript from the
+terminating `finish_issue_map_transcript` tool result. If `live-smoke` passes
+but this command fails, the provider is reachable and the failure is in the Pi
+tool loop/output contract.
+
+The finishing tool also clamps final nodes and paths to high-confidence
+candidates derived from the job packet's own issue/artifact evidence. It must
+not read hidden evaluator `expect` fields.
+
 Credential Rules
 ----------------
 
