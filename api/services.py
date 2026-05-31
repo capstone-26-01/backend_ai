@@ -18,6 +18,7 @@ from api.issue_map import (
     build_overview_graph_projection,
     extract_issue_evidence,
     rank_issue_candidates,
+    sanitize_issue_explanation_output,
 )
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import is_safe_revision, _is_safe_repo_segment
@@ -32,6 +33,7 @@ from github_repo.services import (
     get_repo_snapshot_or_raise as get_repo_snapshot,
 )
 from llm.context_selection import rank_nodes
+from llm import issue_explanation as issue_llm
 from llm.summaries import (
     SUMMARY_KIND_NODE,
     SUMMARY_KIND_ONBOARDING,
@@ -662,7 +664,7 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
                 'score': round(max(0.1, 1.0 - ((index - 1) * 0.08)), 2),
                 'node_id': node_id,
                 'node': display_node,
-                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 smolagents 기반 graph 탐색을 사용합니다.',
+                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 deterministic graph ranking 및 bounded LLM explanation을 사용합니다.',
                 'evidence': evidence,
             }
         )
@@ -758,6 +760,20 @@ def _comments_unavailable_warning(error: GithubIssueApiError) -> dict[str, Any]:
     }
 
 
+def _llm_disabled_warning() -> dict[str, Any]:
+    return {
+        'code': 'llm_disabled',
+        'message': 'Issue-map LLM explanation flag가 꺼져 있어 deterministic explanation을 반환했습니다.',
+    }
+
+
+def _llm_fallback_warning(error: issue_llm.IssueExplanationUnavailable) -> dict[str, Any]:
+    return {
+        'code': error.code,
+        'message': error.message or 'Issue-map LLM explanation을 사용할 수 없어 deterministic explanation을 반환했습니다.',
+    }
+
+
 def get_issue_map_response(
     analysis_id: int,
     issue_number: int,
@@ -798,6 +814,44 @@ def get_issue_map_response(
         max_context_files=max_context_files,
     )
     warnings.extend(code_warnings)
+    hypotheses = _issue_hypotheses(candidates)
+    investigation_path = _issue_investigation_path(candidates)
+    confidence = _issue_confidence(candidates, warnings)
+    limits = {
+        'max_nodes': max_nodes,
+        'include_comments': include_comments,
+        'max_context_files': max_context_files,
+        'max_candidates': max(12, max_nodes * 3),
+        'llm_enabled': bool(getattr(settings, 'ISSUE_MAP_LLM_ENABLED', False)),
+    }
+
+    if bool(getattr(settings, 'ISSUE_MAP_LLM_ENABLED', False)):
+        limits['llm_model'] = issue_llm.issue_explanation_model_metadata()
+        try:
+            llm_output = issue_llm.generate_issue_explanation(
+                issue,
+                comments,
+                evidence,
+                candidates,
+                focus_graph,
+                code_context,
+            )
+            llm_fields, llm_warnings = sanitize_issue_explanation_output(
+                llm_output,
+                focus_graph=focus_graph,
+                code_context=code_context,
+                fallback_hypotheses=hypotheses,
+                fallback_investigation_path=investigation_path,
+                fallback_confidence=confidence,
+            )
+            hypotheses = llm_fields['hypotheses']
+            investigation_path = llm_fields['investigation_path']
+            confidence = llm_fields['confidence']
+            warnings.extend(llm_warnings)
+        except issue_llm.IssueExplanationUnavailable as error:
+            warnings.append(_llm_fallback_warning(error))
+    else:
+        warnings.append(_llm_disabled_warning())
 
     return {
         'analysis_id': analysis_run.id,
@@ -811,18 +865,15 @@ def get_issue_map_response(
         'candidates': candidates,
         'overview_graph': overview_graph,
         'focus_graph': focus_graph,
-        'hypotheses': _issue_hypotheses(candidates),
-        'investigation_path': _issue_investigation_path(candidates),
+        'hypotheses': hypotheses,
+        'investigation_path': investigation_path,
         'code_context': code_context,
-        'confidence': _issue_confidence(candidates, warnings),
-        'limits': {
-            'max_nodes': max_nodes,
-            'include_comments': include_comments,
-            'max_context_files': max_context_files,
-            'max_candidates': max(12, max_nodes * 3),
-        },
+        'confidence': confidence,
+        'limits': limits,
         'warnings': warnings,
     }
+
+
 def _summary_response(analysis_run: AnalysisRun, summary: dict[str, Any], *, cached: bool) -> dict[str, Any]:
     return {
         'analysis_id': analysis_run.id,
