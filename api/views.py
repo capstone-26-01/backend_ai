@@ -16,7 +16,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiExample, extend_schema, OpenApiParameter, inline_serializer
 from rest_framework import serializers
 
-from github_repo.services import RepoIngestionError, get_file_tree_or_raise
+from github_repo.services import GithubIssueApiError, RepoIngestionError, get_file_tree_or_raise
 from llm.services import answer_question
 from .readme_svg import (
     DEFAULT_NODE_LIMIT,
@@ -90,6 +90,10 @@ def get_mock_issue_list_response(repo_path: str, **kwargs):
     return api_services.get_mock_issue_list_response(repo_path, **kwargs)
 
 
+def get_live_issue_list_response(repo_path: str, **kwargs):
+    return api_services.get_live_issue_list_response(repo_path, **kwargs)
+
+
 def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, **kwargs):
     return api_services.get_mock_issue_related_nodes_response(analysis_id, issue_number, **kwargs)
 
@@ -130,6 +134,11 @@ def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
         },
         status=status_by_code.get(error.code, 502),
     )
+
+
+def _github_issue_api_error_response(error: GithubIssueApiError) -> Response:
+    logger.warning('GitHub issue API failed: %s', error.as_dict())
+    return Response(error.as_dict(), status=error.status_code)
 
 
 def _summary_error_response(error: Exception) -> Response:
@@ -1097,7 +1106,7 @@ def get_repo_graph(request):
 @api_view(['GET'])
 def issues(request):
     request_data = {'repo_url': request.GET.get('url')}
-    for field_name in ('page', 'per_page', 'state'):
+    for field_name in ('page', 'per_page', 'state', 'mock'):
         if request.GET.get(field_name) is not None:
             request_data[field_name] = request.GET.get(field_name)
     serializer = IssueListRequestSerializer(data=request_data)
@@ -1105,11 +1114,22 @@ def issues(request):
         return Response(serializer.errors, status=400)
 
     validated_data = cast(dict[str, Any], serializer.validated_data)
-    response = get_mock_issue_list_response(
-        str(validated_data['repo_url']),
-        page=int(validated_data['page']),
-        per_page=int(validated_data['per_page']),
-    )
+    repo_path = str(validated_data['repo_url'])
+    page = int(validated_data['page'])
+    per_page = int(validated_data['per_page'])
+    if bool(validated_data.get('mock')) or bool(getattr(settings, 'ISSUES_USE_MOCK', False)):
+        response = get_mock_issue_list_response(repo_path, page=page, per_page=per_page)
+        return Response(response)
+
+    try:
+        response = get_live_issue_list_response(
+            repo_path,
+            page=page,
+            per_page=per_page,
+            state=str(validated_data['state']),
+        )
+    except GithubIssueApiError as error:
+        return _github_issue_api_error_response(error)
     return Response(response)
 
 

@@ -15,8 +15,10 @@ from api.diff import GraphDiffInputError, compare_graph_artifacts
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import is_safe_revision, _is_safe_repo_segment
 from github_repo.services import (
+    GithubIssueApiError,
     RepoIngestionError,
     get_file_content_or_raise,
+    get_github_issue_list_response,
     get_repo_snapshot_at_revision_or_raise as get_repo_snapshot_at_revision,
     get_repo_snapshot_or_raise as get_repo_snapshot,
 )
@@ -485,6 +487,18 @@ def get_mock_issue_list_response(repo_path: str, *, page: int = 1, per_page: int
         'next_page': page + 1 if has_next_page else None,
         'issues': paged_issues,
     }
+
+
+def get_live_issue_list_response(repo_path: str, *, page: int = 1, per_page: int = 30, state: str = 'open') -> dict[str, Any]:
+    try:
+        return get_github_issue_list_response(repo_path, page=page, per_page=per_page, state=state)
+    except ValueError as exc:
+        raise GithubIssueApiError(
+            'invalid_repo_path',
+            '올바른 repo 경로가 아닙니다.',
+            status_code=400,
+            metadata={'repo': repo_path},
+        ) from exc
 
 
 def _node_display_payload(node: dict[str, Any]) -> dict[str, Any]:
