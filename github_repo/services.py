@@ -18,6 +18,7 @@ REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 MAX_STDERR_CHARS = 1200
 MAX_GITHUB_ERROR_BODY_CHARS = 1200
+MAX_GITHUB_ISSUE_BODY_EXCERPT_CHARS = 240
 
 
 class RepoIngestionError(Exception):
@@ -290,6 +291,89 @@ def fetch_github_issue_list_page(repo_path: str, *, page: int = 1, per_page: int
         repo_path=repo_path,
         params={'state': state, 'page': page, 'per_page': per_page},
     )
+
+
+def _string(value: Any) -> str:
+    if value is None:
+        return ''
+    return str(value)
+
+
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_github_user(user: Any) -> dict[str, str] | None:
+    if not isinstance(user, dict):
+        return None
+    return {
+        'login': _string(user.get('login')),
+        'avatar_url': _string(user.get('avatar_url')),
+        'html_url': _string(user.get('html_url')),
+    }
+
+
+def _normalize_github_label(label: Any) -> dict[str, str | None]:
+    if not isinstance(label, dict):
+        return {'name': '', 'color': '', 'description': None}
+    description = label.get('description')
+    return {
+        'name': _string(label.get('name')),
+        'color': _string(label.get('color')),
+        'description': None if description is None else str(description),
+    }
+
+
+def _normalize_github_user_list(users: Any) -> list[dict[str, str]]:
+    if not isinstance(users, list):
+        return []
+    normalized = [_normalize_github_user(user) for user in users]
+    return [user for user in normalized if user is not None]
+
+
+def _normalize_github_label_list(labels: Any) -> list[dict[str, str | None]]:
+    if not isinstance(labels, list):
+        return []
+    return [_normalize_github_label(label) for label in labels]
+
+
+def _body_excerpt(body: Any) -> tuple[str, bool]:
+    body_text = _string(body)
+    excerpt = body_text[:MAX_GITHUB_ISSUE_BODY_EXCERPT_CHARS]
+    return excerpt, len(body_text) > MAX_GITHUB_ISSUE_BODY_EXCERPT_CHARS
+
+
+def normalize_github_issue(repo_path: str, issue: Any) -> dict[str, Any]:
+    if not isinstance(issue, dict):
+        raise GithubIssueApiError(
+            'github_issue_api_error',
+            'GitHub issue API 응답 형식이 올바르지 않습니다.',
+            status_code=502,
+            metadata={'repo': repo_path, 'payload_type': type(issue).__name__},
+        )
+
+    number = _int(issue.get('number'))
+    body_excerpt, body_truncated = _body_excerpt(issue.get('body'))
+    return {
+        'key': f'github:{repo_path}#{number}',
+        'number': number,
+        'title': _string(issue.get('title')),
+        'state': _string(issue.get('state') or 'open'),
+        'html_url': _string(issue.get('html_url') or f'https://github.com/{repo_path}/issues/{number}'),
+        'author': _normalize_github_user(issue.get('user')),
+        'labels': _normalize_github_label_list(issue.get('labels')),
+        'assignees': _normalize_github_user_list(issue.get('assignees')),
+        'comments_count': _int(issue.get('comments')),
+        'created_at': _string(issue.get('created_at')),
+        'updated_at': _string(issue.get('updated_at')),
+        'body_excerpt': body_excerpt,
+        'body_truncated': body_truncated,
+        'locked': bool(issue.get('locked')),
+        'is_pull_request': isinstance(issue.get('pull_request'), dict),
+    }
 
 
 def _sanitize_stderr(stderr: str) -> str:
