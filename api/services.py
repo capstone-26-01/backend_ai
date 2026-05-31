@@ -624,6 +624,72 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
         for node in analysis.get('nodes', [])
         if isinstance(node, dict) and node.get('id')
     }
+    ranked_node_ids = _prioritize_related_node_ids(ranked_node_ids, nodes_by_id, max_nodes=max_nodes)
+
+    if not ranked_node_ids:
+        ranked_node_ids = _fallback_ranked_node_ids(analysis, max_nodes=max_nodes)
+        warnings.append({'code': 'mock_related_nodes_fallback', 'message': 'Issue text와 일치하는 graph node가 없어 앞쪽 graph node를 mock으로 반환했습니다.'})
+
+    candidates = []
+    for index, node_id in enumerate(ranked_node_ids[:max_nodes], start=1):
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            continue
+        display_node = _node_display_payload(node)
+        evidence = [
+            {
+                'type': 'mock',
+                'message': '프런트엔드 graph highlight 연동을 위한 임시 추천입니다.',
+            }
+        ]
+        if display_node['path']:
+            evidence.append(
+                {
+                    'type': 'graph_metadata',
+                    'message': f'Graph node path: {display_node["path"]}',
+                }
+            )
+        if display_node['kind'] in PREFERRED_RELATED_NODE_KINDS:
+            evidence.append(
+                {
+                    'type': 'node_kind_priority',
+                    'message': f'{display_node["kind"]} node를 file node보다 우선 추천했습니다.',
+                }
+            )
+        candidates.append(
+            {
+                'rank': index,
+                'score': round(max(0.1, 1.0 - ((index - 1) * 0.08)), 2),
+                'node_id': node_id,
+                'node': display_node,
+                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 smolagents 기반 graph 탐색을 사용합니다.',
+                'evidence': evidence,
+            }
+        )
+
+    return {
+        'analysis_id': analysis_run.id,
+        'repo': repo_path,
+        'revision': analysis_run.revision,
+        'provider': 'github',
+        'source': 'mock',
+        'mock': True,
+        'issue': {
+            'key': issue['key'],
+            'number': issue['number'],
+            'title': issue['title'],
+            'state': issue['state'],
+            'html_url': issue['html_url'],
+            'labels': issue['labels'],
+            'comments_count': issue['comments_count'],
+            'updated_at': issue['updated_at'],
+            'body_excerpt': issue['body_excerpt'],
+        },
+        'selected_node_ids': [candidate['node_id'] for candidate in candidates],
+        'candidates': candidates,
+        'limits': {'max_nodes': max_nodes},
+        'warnings': warnings,
+    }
 
 
 def _issue_ref_payload(issue: dict[str, Any]) -> dict[str, Any]:
@@ -757,74 +823,6 @@ def get_issue_map_response(
         },
         'warnings': warnings,
     }
-    ranked_node_ids = _prioritize_related_node_ids(ranked_node_ids, nodes_by_id, max_nodes=max_nodes)
-
-    if not ranked_node_ids:
-        ranked_node_ids = _fallback_ranked_node_ids(analysis, max_nodes=max_nodes)
-        warnings.append({'code': 'mock_related_nodes_fallback', 'message': 'Issue text와 일치하는 graph node가 없어 앞쪽 graph node를 mock으로 반환했습니다.'})
-
-    candidates = []
-    for index, node_id in enumerate(ranked_node_ids[:max_nodes], start=1):
-        node = nodes_by_id.get(node_id)
-        if node is None:
-            continue
-        display_node = _node_display_payload(node)
-        evidence = [
-            {
-                'type': 'mock',
-                'message': '프런트엔드 graph highlight 연동을 위한 임시 추천입니다.',
-            }
-        ]
-        if display_node['path']:
-            evidence.append(
-                {
-                    'type': 'graph_metadata',
-                    'message': f'Graph node path: {display_node["path"]}',
-                }
-            )
-        if display_node['kind'] in PREFERRED_RELATED_NODE_KINDS:
-            evidence.append(
-                {
-                    'type': 'node_kind_priority',
-                    'message': f'{display_node["kind"]} node를 file node보다 우선 추천했습니다.',
-                }
-            )
-        candidates.append(
-            {
-                'rank': index,
-                'score': round(max(0.1, 1.0 - ((index - 1) * 0.08)), 2),
-                'node_id': node_id,
-                'node': display_node,
-                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 smolagents 기반 graph 탐색을 사용합니다.',
-                'evidence': evidence,
-            }
-        )
-
-    return {
-        'analysis_id': analysis_run.id,
-        'repo': repo_path,
-        'revision': analysis_run.revision,
-        'provider': 'github',
-        'source': 'mock',
-        'mock': True,
-        'issue': {
-            'key': issue['key'],
-            'number': issue['number'],
-            'title': issue['title'],
-            'state': issue['state'],
-            'html_url': issue['html_url'],
-            'labels': issue['labels'],
-            'comments_count': issue['comments_count'],
-            'updated_at': issue['updated_at'],
-            'body_excerpt': issue['body_excerpt'],
-        },
-        'selected_node_ids': [candidate['node_id'] for candidate in candidates],
-        'candidates': candidates,
-        'limits': {'max_nodes': max_nodes},
-        'warnings': warnings,
-    }
-
-
 def _summary_response(analysis_run: AnalysisRun, summary: dict[str, Any], *, cached: bool) -> dict[str, Any]:
     return {
         'analysis_id': analysis_run.id,

@@ -309,7 +309,7 @@ def _apply_file_boosts(
                     scores,
                     evidence_by_node,
                     node_id,
-                    320,
+                    700,
                     evidence_type='stack_frame',
                     message=f'{mentioned_path}:{mentioned_line} stack trace line matches this node.',
                 )
