@@ -30,6 +30,13 @@ class QaContext:
     warnings: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class RankedNodeScore:
+    node_id: str
+    score: int
+    file_path: str
+
+
 def identifier_tokens(value: str) -> set[str]:
     normalized = value.lower().replace('/', '_').replace('.', '_').replace('-', '_').replace(':', '_')
     tokens = {token for token in re.split(r'[^0-9A-Za-z가-힣_]+|_+', normalized) if len(token) > 1}
@@ -236,14 +243,13 @@ def _summary_text_scores(
     return summary_scores
 
 
-def rank_nodes(
+def score_nodes(
     analysis: Mapping[str, Any],
     question: str,
     *,
     selected_node_id: str | None = None,
     selected_file_path: str | None = None,
-    max_nodes: int = 24,
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[dict[str, RankedNodeScore], list[dict[str, Any]]]:
     warnings: list[dict[str, Any]] = []
     nodes_by_id = _nodes_by_id(analysis)
     tokens = question_tokens(question)
@@ -284,7 +290,33 @@ def rank_nodes(
             if node_id in nodes_by_id:
                 scores[node_id] = 10
 
-    ranked = sorted(scores, key=lambda node_id: (-scores[node_id], _node_file(nodes_by_id[node_id]) or '', node_id))
+    scored_nodes = {
+        node_id: RankedNodeScore(
+            node_id=node_id,
+            score=score,
+            file_path=_node_file(nodes_by_id[node_id]) or '',
+        )
+        for node_id, score in scores.items()
+        if node_id in nodes_by_id
+    }
+    return scored_nodes, warnings
+
+
+def rank_nodes(
+    analysis: Mapping[str, Any],
+    question: str,
+    *,
+    selected_node_id: str | None = None,
+    selected_file_path: str | None = None,
+    max_nodes: int = 24,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    scores, warnings = score_nodes(
+        analysis,
+        question,
+        selected_node_id=selected_node_id,
+        selected_file_path=selected_file_path,
+    )
+    ranked = sorted(scores, key=lambda node_id: (-scores[node_id].score, scores[node_id].file_path, node_id))
     return ranked[:max_nodes], warnings
 
 
