@@ -19,6 +19,34 @@ Provider
 - Endpoint: https://opencode.ai/zen/v1/chat/completions.
 - Mode: one bounded review call, no tools, no agent loop.
 
+Harness Evaluation Suite
+------------------------
+
+The reusable suite under `harness_eval/` checks whether model, tool, MCP, or
+skill changes improve a real issue-map runner command before they are trusted
+for production-like review gates. The command under test receives only a normal
+issue job packet; hidden expected nodes/tool policy stay inside the deterministic
+evaluator.
+
+Offline checks:
+
+- `python -m unittest harness_eval.tests`
+- `python -m harness_eval.runner validate-samples`
+- `python -m harness_eval.runner validate-matrix`
+- `python -m harness_eval.runner render-job harness_eval/samples/origin_trace.json`
+- `python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- <your-pi-command-and-args>`
+- `python -m harness_eval.runner evaluate-transcript harness_eval/samples/origin_trace.json harness_eval/sample_transcripts/good_origin_trace.json`
+
+Optional live OpenCode Zen smoke:
+
+- set `OPENCODE_API_KEY` in the caller environment,
+- set `RUN_OPENCODE_LIVE_TESTS=true`,
+- run `python -m harness_eval.runner live-smoke --live --model kimi-k2.5 --write-result`.
+
+The live smoke uses the raw model id `kimi-k2.5` against
+`https://opencode.ai/zen/v1/chat/completions`. The OpenCode config id remains
+`opencode/kimi-k2.5`. Keep these separate when debugging usage dashboards.
+
 Credential Rules
 ----------------
 
