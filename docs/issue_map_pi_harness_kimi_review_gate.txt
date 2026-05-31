@@ -1,0 +1,87 @@
+Issue Map Pi Harness Kimi Review Gate
+=====================================
+
+Purpose
+-------
+
+Phase 0 adds this runbook for the post-test AI review gate described in
+ROADMAP.md. The gate is a release-quality review step after deterministic tests
+pass. It is not part of the Django test runner, not application code, and not a
+runtime issue-map dependency.
+
+Provider
+--------
+
+- Harness: Pi harness review runner.
+- Provider style: OpenAI-compatible.
+- Model: opencode/kimi-k2.5.
+- OpenCode Zen model id: kimi-k2.5.
+- Endpoint: https://opencode.ai/zen/v1/chat/completions.
+- Mode: one bounded review call, no tools, no agent loop.
+
+Credential Rules
+----------------
+
+- Store OpenCode Zen credentials only in the CI or reviewer environment.
+- Do not put review credentials in Django settings, repo .env files, app code,
+  fixtures, or test-runner configuration loaded by Django.
+- Before enabling the gate in CI, record OpenCode Zen's retention/training
+  policy. If that policy is unknown, treat every submission as permanently
+  retained by an external provider.
+
+Allowed Review Packet
+---------------------
+
+Send only a canonical review packet assembled from approved synthetic or
+sanitized data:
+
+- deterministic test summary,
+- schema diff,
+- representative synthetic /api/issues/ fixtures,
+- representative synthetic /api/issues/related-nodes/ fixtures,
+- graph invariant summary,
+- ranking/eval summary,
+- LLM fallback/sanitization summary,
+- relevant PLAN.md and ROADMAP.md excerpts.
+
+Forbidden Inputs
+----------------
+
+Never send:
+
+- secrets,
+- .env contents,
+- raw credentials,
+- production data,
+- private repository contents,
+- live GitHub responses,
+- proprietary analyzed-repository code,
+- real code_context excerpts from third-party repositories.
+
+Only synthetic fixtures explicitly approved for third-party disclosure may be
+included. Treat anything sent to OpenCode Zen as externally disclosed.
+
+Run-Or-Waive Policy
+-------------------
+
+The Kimi review is advisory and must not mutate deterministic test results. It
+is run when OpenCode Zen and the Pi harness are available. If the review is
+unavailable for any reason, record an explicit human waiver in the phase merge
+notes with the reason and timestamp.
+
+Review Prompt Template
+----------------------
+
+Ask the reviewer to check the phase implementation against ROADMAP.md and
+PLAN.md. The reviewer should focus on:
+
+- phase-scope alignment,
+- endpoint compatibility,
+- no live network in automated tests,
+- no issue-path caching,
+- test fixture disclosure safety,
+- schema/documentation coverage,
+- workspace hygiene,
+- whether the phase is safe to merge to dev.
+
+The desired final line is either ACCEPT or a short list of material blockers.

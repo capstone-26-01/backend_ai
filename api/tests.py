@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 import importlib
 import json
+import requests
 import subprocess
 import shutil
 
@@ -36,10 +37,19 @@ from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is
 from api.services import get_artifact_by_revision, get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
+    ISSUE_MAP_FIXTURE,
     GOLDEN_FIXTURE_REPOS,
+    ExternalHttpBlockedMixin,
+    assert_uses_issue_llm_stub,
+    build_issue_map_analysis_artifact,
     commit_all,
     create_git_fixture_repo,
+    create_issue_map_fixture_repo,
     create_named_fixture_repo,
+    make_issue_llm_stub,
+    mock_github_issue_comments_response,
+    mock_github_issue_detail_response,
+    mock_github_issue_list_response,
     run_git,
     write_files,
 )
@@ -804,6 +814,68 @@ class FoundationEvalFixtureTests(TestCase):
             self.assertTrue(fixture.rubric_tags)
 
 
+@override_settings(
+    TEMP_DIR=settings.BASE_DIR / 'temp' / 'issue-map-foundation-tests',
+    PLAYGROUND_DIR=settings.BASE_DIR / 'temp' / 'issue-map-foundation-tests' / 'playground',
+)
+class IssueMapTestFoundationTests(ExternalHttpBlockedMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        settings.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        settings.PLAYGROUND_DIR.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
+        super().tearDown()
+
+    def test_issue_map_fixture_repo_helper_loads_expected_files(self):
+        repo = create_issue_map_fixture_repo(settings.TEMP_DIR / 'source-repo')
+
+        self.assertEqual(repo.files, ISSUE_MAP_FIXTURE.files)
+        self.assertTrue((repo.path / 'api/services.py').is_file())
+        self.assertEqual(run_git(repo.path, 'rev-parse', 'HEAD'), repo.revision)
+
+    def test_issue_map_analysis_artifact_fixture_has_expected_contract(self):
+        artifact = build_issue_map_analysis_artifact()
+        node_ids = {str(node['id']) for node in artifact['nodes']}
+        entrypoint_ids = {str(entrypoint['id']) for entrypoint in artifact['entrypoints']}
+        key_module_ids = {str(module['id']) for module in artifact['key_modules']}
+
+        validate_graph_artifact(artifact)
+        self.assertEqual(artifact['repo'], ISSUE_MAP_FIXTURE.repo_path)
+        self.assertTrue(set(ISSUE_MAP_FIXTURE.expected_node_ids).issubset(node_ids))
+        self.assertTrue(set(ISSUE_MAP_FIXTURE.expected_entrypoint_ids).issubset(entrypoint_ids))
+        self.assertTrue(set(ISSUE_MAP_FIXTURE.expected_key_module_ids).issubset(key_module_ids))
+        self.assertIn('api/services.py', artifact['file_contents'])
+
+    def test_mock_github_issue_responses_cover_list_detail_and_comments(self):
+        list_response = mock_github_issue_list_response()
+        detail_response = mock_github_issue_detail_response(issue_number=42)
+        comments_response = mock_github_issue_comments_response(issue_number=42, count=2)
+
+        list_payload = list_response.json()
+        self.assertEqual(list_response.status_code, 200)
+        self.assertIn('rel="next"', list_response.headers['Link'])
+        self.assertEqual(list_payload[0]['number'], 42)
+        self.assertIn('pull_request', list_payload[-1])
+        self.assertEqual(detail_response.json()['html_url'], 'https://github.com/owner/repo/issues/42')
+        self.assertEqual(len(comments_response.json()), 2)
+        self.assertEqual(comments_response.json()[0]['user']['login'], 'commenter-1')
+
+    def test_issue_llm_stub_returns_deterministic_output_and_records_calls(self):
+        stub = make_issue_llm_stub({'hypotheses': [], 'investigation_path': [], 'confidence': {'score': 0.1}})
+        response = assert_uses_issue_llm_stub(stub)
+
+        self.assertEqual(response['confidence']['score'], 0.1)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.calls[0][1]['candidates'], ['api/services.py::_build_and_store_analysis'])
+
+    def test_issue_network_guard_blocks_requests_based_live_http(self):
+        with self.assertRaisesMessage(AssertionError, 'External HTTP request blocked in offline issue test'):
+            requests.get('https://api.github.com/repos/owner/repo/issues')
+
+
 class GraphArtifactContractTests(TestCase):
     def _legacy_graph(self):
         return {
@@ -1469,7 +1541,7 @@ class AnalysisEndpointReuseTests(TestCase):
         self.assertIn('selected_file_path', payload)
 
 
-class IssueMockEndpointTests(TestCase):
+class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
     def _create_analysis_run(self) -> AnalysisRun:
         repository = Repository.objects.create(
             provider='github',
