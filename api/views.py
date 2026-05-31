@@ -98,6 +98,10 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
     return api_services.get_mock_issue_related_nodes_response(analysis_id, issue_number, **kwargs)
 
 
+def get_issue_map_response(analysis_id: int, issue_number: int, **kwargs):
+    return api_services.get_issue_map_response(analysis_id, issue_number, **kwargs)
+
+
 def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None):
     return api_services.get_diff_response(repo_path, base_revision, head_revision)
 
@@ -139,6 +143,12 @@ def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
 def _github_issue_api_error_response(error: GithubIssueApiError) -> Response:
     logger.warning('GitHub issue API failed: %s', error.as_dict())
     return Response(error.as_dict(), status=error.status_code)
+
+
+def _issue_map_error_response(error: Exception) -> Response:
+    if isinstance(error, api_services.IssueMapResponseError):
+        return Response(error.as_dict(), status=error.status_code)
+    raise error
 
 
 def _summary_error_response(error: Exception) -> Response:
@@ -429,26 +439,29 @@ const res = await fetch(`${API_BASE}/api/issues/?${params}`);
 주요 실패: 400 잘못된 GitHub URL 또는 pagination 값, 404 레포 없음/private, 429 GitHub rate limit, 502 upstream 오류.
 '''
 _ISSUE_RELATED_NODES_DESCRIPTION = '''
-선택한 GitHub issue를 해결하는 데 관련 있어 보이는 code graph node 후보를 반환하는 mock API입니다.
+선택한 GitHub issue를 해결하는 데 관련 있어 보이는 contributor graph와 code context를 반환합니다.
 
 프런트엔드 권장 흐름:
 1. `/api/analysis/` 응답의 `analysis_id`를 보관합니다.
 2. `/api/issues/`에서 받은 issue의 `number`를 사용자가 선택한 issue로 저장합니다.
-3. 이 API에 `analysis_id`, `issue_number`, 선택적으로 `max_nodes`를 POST합니다.
-4. 응답의 `selected_node_ids`는 graph highlight에 바로 쓰고, `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
+3. 이 API에 `analysis_id`, `issue_number`, 선택적으로 `max_nodes`, `include_comments`, `max_context_files`를 POST합니다.
+4. 응답의 `selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 바로 쓰고, `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
 
 현재 동작:
-- 실제 GitHub issue 본문/comment 조회나 smolagents 추론은 아직 하지 않습니다.
-- mock issue text와 현재 `analysis_id`의 graph artifact를 이용해 deterministic 후보를 만듭니다.
-- 따라서 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
-- 실제 구현에서는 GitHub MCP로 issue detail/comment를 읽고, smolagents 기반으로 graph 주변 노드를 탐색하는 방식으로 교체할 예정입니다.
+- 기본값은 live GitHub issue detail/comment를 읽고 deterministic evidence/ranking으로 후보를 만듭니다.
+- LLM 또는 smolagents를 호출하지 않습니다.
+- `mock=true`이면 기존 프런트엔드 선작업용 mock 응답을 반환합니다.
+- 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
+- 새 필드는 additive입니다: `overview_graph`, `focus_graph`, `hypotheses`, `investigation_path`, `code_context`, `confidence`.
 
 요청 예시:
 ```json
 {
   "analysis_id": 123,
   "issue_number": 42,
-  "max_nodes": 8
+  "max_nodes": 8,
+  "include_comments": true,
+  "max_context_files": 4
 }
 ```
 
@@ -571,6 +584,8 @@ _ISSUE_RELATED_NODES_REQUEST_EXAMPLE = {
     'analysis_id': 123,
     'issue_number': 42,
     'max_nodes': 8,
+    'include_comments': True,
+    'max_context_files': 4,
 }
 _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     'analysis_id': 123,
@@ -618,6 +633,12 @@ _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     ],
     'limits': {'max_nodes': 8},
     'warnings': [],
+    'overview_graph': {'nodes': [], 'edges': [], 'node_ids': [], 'limits': {'node_limit': 80}},
+    'focus_graph': {'nodes': [], 'edges': [], 'node_ids': [], 'highlight_node_ids': []},
+    'hypotheses': [],
+    'investigation_path': [],
+    'code_context': {'files': [], 'file_count': 0, 'max_context_files': 4, 'truncated': False},
+    'confidence': {'level': 'medium', 'score': 0.7, 'reasons': []},
 }
 
 
@@ -1158,13 +1179,27 @@ def issue_related_nodes(request):
         return Response(serializer.errors, status=400)
 
     validated_data = cast(dict[str, Any], serializer.validated_data)
-    response = get_mock_issue_related_nodes_response(
-        int(validated_data['analysis_id']),
-        int(validated_data['issue_number']),
-        max_nodes=int(validated_data['max_nodes']),
-    )
-    if response is None:
-        return Response({'error': '분석 결과 또는 issue를 찾을 수 없습니다'}, status=404)
+    analysis_id = int(validated_data['analysis_id'])
+    issue_number = int(validated_data['issue_number'])
+    max_nodes = int(validated_data['max_nodes'])
+    if bool(validated_data.get('mock')) or bool(getattr(settings, 'ISSUES_USE_MOCK', False)):
+        response = get_mock_issue_related_nodes_response(analysis_id, issue_number, max_nodes=max_nodes)
+        if response is None:
+            return Response({'error': '분석 결과 또는 issue를 찾을 수 없습니다'}, status=404)
+        return Response(response)
+
+    try:
+        response = get_issue_map_response(
+            analysis_id,
+            issue_number,
+            max_nodes=max_nodes,
+            include_comments=bool(validated_data['include_comments']),
+            max_context_files=int(validated_data['max_context_files']),
+        )
+    except GithubIssueApiError as error:
+        return _github_issue_api_error_response(error)
+    except Exception as error:
+        return _issue_map_error_response(error)
     return Response(response)
 
 

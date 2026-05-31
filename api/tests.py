@@ -32,6 +32,12 @@ from api.artifacts import (
     validate_graph_artifact,
 )
 from api.diff import compare_graph_artifacts
+from api.issue_map import (
+    build_code_context,
+    build_focus_graph_projection,
+    extract_issue_evidence,
+    rank_issue_candidates,
+)
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision, is_safe_share_id
 from api.services import get_artifact_by_revision, get_repo_analysis
@@ -1660,7 +1666,7 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
             HttpResponse,
             self.client.post(
                 '/api/issues/related-nodes/',
-                data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 2},
+                data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 2, 'mock': True},
                 content_type='application/json',
             ),
         )
@@ -1697,7 +1703,7 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
             HttpResponse,
             self.client.post(
                 '/api/issues/related-nodes/',
-                data={'analysis_id': analysis_run.id, 'issue_number': 999},
+                data={'analysis_id': analysis_run.id, 'issue_number': 999, 'mock': True},
                 content_type='application/json',
             ),
         )
@@ -1829,6 +1835,264 @@ class IssueLiveEndpointTests(ExternalHttpBlockedMixin, TestCase):
             response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
 
         self.assertEqual(response.status_code, 200)
+
+
+class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
+    def _create_analysis_run(
+        self,
+        *,
+        status: str = AnalysisRun.STATUS_SUCCEEDED,
+        payload: dict[str, object] | None = None,
+        error_code: str = '',
+        error_message: str = '',
+        create_artifact: bool = True,
+    ) -> AnalysisRun:
+        repository, _created = Repository.objects.get_or_create(
+            provider='github',
+            full_name='owner/repo',
+            defaults={
+                'owner': 'owner',
+                'name': 'repo',
+                'clone_url': 'https://github.com/owner/repo.git',
+            },
+        )
+        revision = f'abc123-{AnalysisRun.objects.count() + 1}'
+        analysis_run = AnalysisRun.objects.create(
+            repository=repository,
+            ref='HEAD',
+            revision=revision,
+            status=status,
+            finished_at=timezone.now() if status != AnalysisRun.STATUS_STARTED else None,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        if payload is not None:
+            AnalysisArtifact.objects.create(
+                analysis_run=analysis_run,
+                schema_version=GRAPH_ARTIFACT_SCHEMA_VERSION,
+                payload=payload,
+                node_count=len(payload.get('nodes', [])) if isinstance(payload.get('nodes'), list) else 0,
+                edge_count=len(payload.get('edges', [])) if isinstance(payload.get('edges'), list) else 0,
+                warning_count=0,
+            )
+        elif status == AnalysisRun.STATUS_SUCCEEDED and create_artifact:
+            artifact = build_issue_map_analysis_artifact()
+            AnalysisArtifact.objects.create(
+                analysis_run=analysis_run,
+                schema_version=GRAPH_ARTIFACT_SCHEMA_VERSION,
+                payload=artifact,
+                node_count=len(artifact['nodes']),
+                edge_count=len(artifact['edges']),
+                warning_count=0,
+            )
+        return analysis_run
+
+    def test_extract_issue_evidence_treats_issue_and_comment_text_as_data(self):
+        issue = github_issue_payload(
+            body=(
+                'Traceback (most recent call last):\n'
+                '  File "api/services.py", line 6, in _build_and_store_analysis\n'
+                '`parse_repo()` failed with "Parser timeout error"\n'
+                'See api/views.py:3 too.'
+            ),
+            labels=[github_issue_label('parser', '1d76db', 'Parser area')],
+        )
+        comments = [{'id': 1, 'body': 'I also see parser/services.py:1:in parse_repo and rm -rf / should be ignored as text.'}]
+
+        evidence = extract_issue_evidence(issue, comments)
+
+        file_paths = {item['path'] for item in cast(list[dict[str, object]], evidence['file_mentions'])}
+        symbols = {item['symbol'] for item in cast(list[dict[str, object]], evidence['symbol_mentions'])}
+        quoted_errors = cast(list[dict[str, object]], evidence['quoted_errors'])
+        labels = cast(list[dict[str, object]], evidence['labels'])
+
+        self.assertIn('api/services.py', file_paths)
+        self.assertIn('api/views.py', file_paths)
+        self.assertIn('parser/services.py', file_paths)
+        self.assertIn('_build_and_store_analysis', symbols)
+        self.assertIn('parse_repo', symbols)
+        self.assertEqual(labels[0]['name'], 'parser')
+        self.assertTrue(any('Parser timeout error' in str(item['text']) for item in quoted_errors))
+        self.assertIn('rm -rf / should be ignored as text', cast(list[dict[str, object]], evidence['comments'])[0]['body'])
+
+    def test_rank_issue_candidates_uses_exact_file_symbol_label_and_comment_evidence(self):
+        analysis = build_issue_map_analysis_artifact()
+        issue = github_issue_payload(
+            body='Traceback File "api/services.py", line 6, in _build_and_store_analysis. parser/services.py parse_repo() fails.',
+            labels=[github_issue_label('parser', '1d76db', 'Parser area')],
+        )
+        evidence = extract_issue_evidence(issue, [{'id': 1, 'body': 'parse_repo() in parser/services.py is the parser entry.'}])
+
+        candidates, warnings = rank_issue_candidates(analysis, evidence, max_candidates=8)
+        candidate_ids = [candidate['node_id'] for candidate in candidates]
+
+        self.assertEqual(candidates[0]['node_id'], 'api/services.py::_build_and_store_analysis')
+        self.assertIn('parser/services.py::parse_repo', candidate_ids)
+        self.assertTrue(any(item['type'] in {'stack_frame', 'symbol', 'file_path'} for item in candidates[0]['evidence']))
+        self.assertFalse(any(warning.get('code') == 'no_ranked_issue_nodes' for warning in warnings))
+
+    def test_focus_graph_projection_keeps_highlights_real_and_edges_valid(self):
+        analysis = build_issue_map_analysis_artifact()
+        evidence = extract_issue_evidence(github_issue_payload(body='api/services.py _build_and_store_analysis parse_repo()'))
+        candidates, _warnings = rank_issue_candidates(analysis, evidence, max_candidates=8)
+
+        focus_graph, selected_node_ids, warnings = build_focus_graph_projection(
+            analysis,
+            candidates,
+            max_focus_nodes=8,
+            max_selected_nodes=3,
+        )
+        node_ids = {node['id'] for node in cast(list[dict[str, object]], focus_graph['nodes'])}
+        edge_endpoints = {
+            endpoint
+            for edge in cast(list[dict[str, str]], focus_graph['edges'])
+            for endpoint in (edge['source'], edge['target'])
+        }
+
+        self.assertIn(candidates[0]['node_id'], node_ids)
+        self.assertTrue(set(selected_node_ids).issubset(node_ids))
+        self.assertEqual(selected_node_ids, focus_graph['highlight_node_ids'])
+        self.assertTrue(edge_endpoints.issubset(node_ids))
+        self.assertLessEqual(len(node_ids), 8)
+        self.assertIsInstance(warnings, list)
+
+    def test_code_context_caps_emit_truncation_warning(self):
+        analysis = build_issue_map_analysis_artifact()
+        analysis['file_contents']['api/services.py'] = '\n'.join(f'line {index} ' + ('x' * 120) for index in range(400))
+        candidates = [
+            {
+                'node_id': 'api/services.py',
+                'rank': 1,
+                'score': 1.0,
+                'node': {},
+                'reason': '',
+                'evidence': [],
+            }
+        ]
+
+        code_context, warnings = build_code_context(analysis, candidates, max_context_files=1, max_context_chars=1000)
+
+        self.assertEqual(code_context['file_count'], 1)
+        self.assertTrue(code_context['truncated'])
+        self.assertTrue(any(warning['code'] == 'code_context_truncated' for warning in warnings))
+
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_live_returns_old_fields_and_issue_graph_fields(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.side_effect = [
+            mock_github_issue_detail_response(issue_number=42),
+            mock_github_issue_comments_response(issue_number=42, count=2),
+        ]
+
+        with (
+            patch('django.core.cache.cache.get', side_effect=AssertionError('issue map must not read cache')),
+            patch('django.core.cache.cache.set', side_effect=AssertionError('issue map must not write cache')),
+            patch('api.services.get_repo_analysis', side_effect=AssertionError('issue map must use stored artifact directly')),
+        ):
+            response = cast(
+                HttpResponse,
+                self.client.post(
+                    '/api/issues/related-nodes/',
+                    data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 3, 'include_comments': True, 'max_context_files': 2},
+                    content_type='application/json',
+                ),
+            )
+        payload = cast(dict[str, object], json.loads(response.content))
+        candidates = cast(list[dict[str, object]], payload['candidates'])
+        focus_graph = cast(dict[str, object], payload['focus_graph'])
+        selected_node_ids = cast(list[str], payload['selected_node_ids'])
+        focus_node_ids = set(cast(list[str], focus_graph['node_ids']))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['source'], 'github')
+        self.assertFalse(payload['mock'])
+        self.assertEqual(payload['analysis_id'], analysis_run.id)
+        self.assertIn('issue', payload)
+        self.assertIn('limits', payload)
+        self.assertIn('warnings', payload)
+        self.assertIn('overview_graph', payload)
+        self.assertIn('focus_graph', payload)
+        self.assertIn('hypotheses', payload)
+        self.assertIn('investigation_path', payload)
+        self.assertIn('code_context', payload)
+        self.assertIn('confidence', payload)
+        self.assertGreater(len(candidates), 0)
+        self.assertTrue(set(selected_node_ids).issubset(focus_node_ids))
+        self.assertEqual(selected_node_ids, focus_graph['highlight_node_ids'])
+        self.assertEqual(requests_get.call_count, 2)
+
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_rejects_analysis_statuses_before_github_calls(self, requests_get):
+        pending_run = self._create_analysis_run(status=AnalysisRun.STATUS_STARTED, payload=None)
+        failed_run = self._create_analysis_run(status=AnalysisRun.STATUS_FAILED, payload=None, error_code='git_error')
+
+        pending_response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': pending_run.id, 'issue_number': 42}, content_type='application/json'))
+        failed_response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': failed_run.id, 'issue_number': 42}, content_type='application/json'))
+        missing_response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': 99999, 'issue_number': 42}, content_type='application/json'))
+
+        self.assertEqual(pending_response.status_code, 409)
+        self.assertEqual(json.loads(pending_response.content)['code'], 'analysis_not_ready')
+        self.assertEqual(failed_response.status_code, 409)
+        self.assertEqual(json.loads(failed_response.content)['code'], 'analysis_failed')
+        self.assertEqual(missing_response.status_code, 404)
+        self.assertEqual(json.loads(missing_response.content)['code'], 'analysis_not_found')
+        requests_get.assert_not_called()
+
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_returns_internal_errors_for_missing_or_bad_artifact(self, requests_get):
+        missing_artifact_run = self._create_analysis_run(status=AnalysisRun.STATUS_SUCCEEDED, payload=None, create_artifact=False)
+        invalid_artifact_run = self._create_analysis_run(status=AnalysisRun.STATUS_SUCCEEDED, payload={'nodes': 'bad', 'edges': []})
+
+        missing_response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': missing_artifact_run.id, 'issue_number': 42}, content_type='application/json'))
+        invalid_response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': invalid_artifact_run.id, 'issue_number': 42}, content_type='application/json'))
+
+        self.assertEqual(missing_response.status_code, 500)
+        self.assertEqual(json.loads(missing_response.content)['code'], 'analysis_artifact_missing')
+        self.assertEqual(invalid_response.status_code, 500)
+        self.assertEqual(json.loads(invalid_response.content)['code'], 'analysis_artifact_invalid')
+        requests_get.assert_not_called()
+
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_maps_issue_not_found(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.return_value = MockGithubHttpResponse(payload={'message': 'Not Found'}, status_code=404)
+
+        response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': analysis_run.id, 'issue_number': 404}, content_type='application/json'))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(payload['code'], 'issue_not_found')
+
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_comments_unavailable_is_nonfatal_warning(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.side_effect = [
+            mock_github_issue_detail_response(issue_number=42),
+            MockGithubHttpResponse(payload={'message': 'Forbidden'}, status_code=403, headers={'X-RateLimit-Remaining': '42'}),
+        ]
+
+        response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': analysis_run.id, 'issue_number': 42}, content_type='application/json'))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(warning['code'] == 'github_comments_unavailable' for warning in cast(list[dict[str, object]], payload['warnings'])))
+
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_comments_truncation_warning(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.side_effect = [
+            mock_github_issue_detail_response(issue_number=42),
+            MockGithubHttpResponse(
+                payload=mock_github_issue_comments_response(issue_number=42, count=2).payload,
+                headers={'Link': github_issue_link_header()},
+            ),
+        ]
+
+        response = cast(HttpResponse, self.client.post('/api/issues/related-nodes/', data={'analysis_id': analysis_run.id, 'issue_number': 42}, content_type='application/json'))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(warning['code'] == 'github_comments_truncated' for warning in cast(list[dict[str, object]], payload['warnings'])))
 
 
 @override_settings(
@@ -2714,7 +2978,15 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('repository', schema_text)
         self.assertIn('rate_limit', schema_text)
         self.assertIn('warnings', schema_text)
-        self.assertIn('응답의 `selected_node_ids`는 graph highlight에 바로 쓰고', schema_text)
+        self.assertIn('응답의 `selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 바로 쓰고', schema_text)
+        self.assertIn('include_comments', schema_text)
+        self.assertIn('max_context_files', schema_text)
+        self.assertIn('overview_graph', schema_text)
+        self.assertIn('focus_graph', schema_text)
+        self.assertIn('hypotheses', schema_text)
+        self.assertIn('investigation_path', schema_text)
+        self.assertIn('code_context', schema_text)
+        self.assertIn('confidence', schema_text)
         self.assertIn('Mock open issues response', schema_text)
         self.assertIn('body_truncated', schema_text)
         self.assertIn('Deleted author issue should not crash rendering', schema_text)

@@ -12,6 +12,13 @@ from django.utils import timezone
 
 from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
 from api.diff import GraphDiffInputError, compare_graph_artifacts
+from api.issue_map import (
+    build_code_context,
+    build_focus_graph_projection,
+    build_overview_graph_projection,
+    extract_issue_evidence,
+    rank_issue_candidates,
+)
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import is_safe_revision, _is_safe_repo_segment
 from github_repo.services import (
@@ -19,6 +26,8 @@ from github_repo.services import (
     RepoIngestionError,
     get_file_content_or_raise,
     get_github_issue_list_response,
+    get_github_issue_comments_response,
+    get_github_issue_detail_response,
     get_repo_snapshot_at_revision_or_raise as get_repo_snapshot_at_revision,
     get_repo_snapshot_or_raise as get_repo_snapshot,
 )
@@ -37,6 +46,21 @@ from parser.services import parse_repo
 
 class ShareInputError(ValueError):
     pass
+
+
+class IssueMapResponseError(Exception):
+    def __init__(self, code: str, message: str, *, status_code: int, metadata: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.metadata = metadata or {}
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {'code': self.code, 'message': self.message}
+        if self.metadata:
+            payload['metadata'] = self.metadata
+        return payload
 
 
 MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
@@ -421,6 +445,34 @@ def _get_succeeded_artifact_record_by_id(analysis_id: int) -> tuple[AnalysisRun,
         return None
 
 
+def _get_issue_map_artifact_record(analysis_id: int) -> tuple[AnalysisRun, dict[str, Any]]:
+    analysis_run = (
+        AnalysisRun.objects
+        .select_related('repository')
+        .filter(id=analysis_id)
+        .first()
+    )
+    if analysis_run is None:
+        raise IssueMapResponseError('analysis_not_found', '분석 결과를 찾을 수 없습니다.', status_code=404, metadata={'analysis_id': analysis_id})
+    if analysis_run.status == AnalysisRun.STATUS_STARTED:
+        raise IssueMapResponseError('analysis_not_ready', '분석이 아직 완료되지 않았습니다.', status_code=409, metadata={'analysis_id': analysis_id, 'status': analysis_run.status})
+    if analysis_run.status == AnalysisRun.STATUS_FAILED:
+        raise IssueMapResponseError(
+            'analysis_failed',
+            '분석이 실패해 issue map을 만들 수 없습니다.',
+            status_code=409,
+            metadata={'analysis_id': analysis_id, 'status': analysis_run.status, 'error_code': analysis_run.error_code},
+        )
+    try:
+        artifact = analysis_run.artifact
+    except AnalysisArtifact.DoesNotExist as exc:
+        raise IssueMapResponseError('analysis_artifact_missing', '분석 artifact를 찾을 수 없습니다.', status_code=500, metadata={'analysis_id': analysis_id}) from exc
+    payload = artifact.payload
+    if not isinstance(payload, dict) or not isinstance(payload.get('nodes'), list) or not isinstance(payload.get('edges'), list):
+        raise IssueMapResponseError('analysis_artifact_invalid', '분석 artifact 형식이 올바르지 않습니다.', status_code=500, metadata={'analysis_id': analysis_id})
+    return analysis_run, payload
+
+
 def _mock_github_user(login: str) -> dict[str, str]:
     return {
         'login': login,
@@ -640,6 +692,137 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
     }
 
 
+def _issue_ref_payload(issue: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'key': issue['key'],
+        'number': issue['number'],
+        'title': issue['title'],
+        'state': issue['state'],
+        'html_url': issue['html_url'],
+        'labels': issue['labels'],
+        'comments_count': issue['comments_count'],
+        'updated_at': issue['updated_at'],
+        'body_excerpt': issue['body_excerpt'],
+    }
+
+
+def _issue_hypotheses(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            'kind': 'likely_origin' if index == 0 else 'related_area',
+            'node_id': candidate['node_id'],
+            'confidence': candidate['score'],
+            'rationale': candidate['reason'],
+        }
+        for index, candidate in enumerate(candidates[:5])
+    ]
+
+
+def _issue_investigation_path(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            'step': index,
+            'node_id': candidate['node_id'],
+            'path': candidate['node'].get('path'),
+            'action': 'inspect',
+            'why': candidate['reason'],
+        }
+        for index, candidate in enumerate(candidates[:8], start=1)
+    ]
+
+
+def _issue_confidence(candidates: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> dict[str, Any]:
+    score = float(candidates[0]['score']) if candidates else 0.0
+    warning_codes = {str(warning.get('code')) for warning in warnings}
+    if not candidates or 'no_ranked_issue_nodes' in warning_codes:
+        level = 'low'
+    elif score >= 0.75 and 'low_confidence_issue_ranking' not in warning_codes:
+        level = 'high'
+    elif score >= 0.35:
+        level = 'medium'
+    else:
+        level = 'low'
+    return {
+        'level': level,
+        'score': round(score, 3),
+        'reasons': [candidate['reason'] for candidate in candidates[:3]],
+        'warning_codes': sorted(code for code in warning_codes if code),
+    }
+
+
+def _comments_unavailable_warning(error: GithubIssueApiError) -> dict[str, Any]:
+    return {
+        'code': 'github_comments_unavailable',
+        'message': 'GitHub issue comment를 읽지 못해 issue 본문만으로 후보를 계산했습니다.',
+        'detail': error.as_dict(),
+    }
+
+
+def get_issue_map_response(
+    analysis_id: int,
+    issue_number: int,
+    *,
+    max_nodes: int = 8,
+    include_comments: bool = True,
+    max_context_files: int = 4,
+) -> dict[str, Any]:
+    analysis_run, analysis = _get_issue_map_artifact_record(analysis_id)
+    repo_path = analysis_run.repository.full_name
+    max_nodes = max(1, min(max_nodes, 20))
+    max_context_files = max(1, min(max_context_files, 10))
+
+    issue = get_github_issue_detail_response(repo_path, issue_number)
+    comments: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    if include_comments:
+        try:
+            comments, comment_warnings = get_github_issue_comments_response(repo_path, issue_number, max_comments=20)
+            warnings.extend(comment_warnings)
+        except GithubIssueApiError as error:
+            warnings.append(_comments_unavailable_warning(error))
+
+    evidence = extract_issue_evidence(issue, comments)
+    candidates, ranking_warnings = rank_issue_candidates(analysis, evidence, max_candidates=max(12, max_nodes * 3))
+    warnings.extend(ranking_warnings)
+    overview_graph = build_overview_graph_projection(analysis)
+    focus_graph, selected_node_ids, focus_warnings = build_focus_graph_projection(
+        analysis,
+        candidates,
+        max_focus_nodes=max(24, max_nodes * 6),
+        max_selected_nodes=max_nodes,
+    )
+    warnings.extend(focus_warnings)
+    code_context, code_warnings = build_code_context(
+        analysis,
+        candidates,
+        max_context_files=max_context_files,
+    )
+    warnings.extend(code_warnings)
+
+    return {
+        'analysis_id': analysis_run.id,
+        'repo': repo_path,
+        'revision': analysis_run.revision,
+        'provider': 'github',
+        'source': 'github',
+        'mock': False,
+        'issue': _issue_ref_payload(issue),
+        'selected_node_ids': selected_node_ids,
+        'candidates': candidates,
+        'overview_graph': overview_graph,
+        'focus_graph': focus_graph,
+        'hypotheses': _issue_hypotheses(candidates),
+        'investigation_path': _issue_investigation_path(candidates),
+        'code_context': code_context,
+        'confidence': _issue_confidence(candidates, warnings),
+        'limits': {
+            'max_nodes': max_nodes,
+            'include_comments': include_comments,
+            'max_context_files': max_context_files,
+            'max_candidates': max(12, max_nodes * 3),
+        },
+        'warnings': warnings,
+    }
 def _summary_response(analysis_run: AnalysisRun, summary: dict[str, Any], *, cached: bool) -> dict[str, Any]:
     return {
         'analysis_id': analysis_run.id,
