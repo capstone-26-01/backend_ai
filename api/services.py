@@ -39,6 +39,21 @@ class ShareInputError(ValueError):
     pass
 
 
+class IssueMapResponseError(Exception):
+    def __init__(self, code: str, message: str, *, status_code: int, metadata: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.metadata = metadata or {}
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {'code': self.code, 'message': self.message}
+        if self.metadata:
+            payload['metadata'] = self.metadata
+        return payload
+
+
 MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
     {
         'number': 42,
@@ -419,6 +434,34 @@ def _get_succeeded_artifact_record_by_id(analysis_id: int) -> tuple[AnalysisRun,
         return analysis_run, analysis_run.artifact
     except AnalysisArtifact.DoesNotExist:
         return None
+
+
+def _get_issue_map_artifact_record(analysis_id: int) -> tuple[AnalysisRun, dict[str, Any]]:
+    analysis_run = (
+        AnalysisRun.objects
+        .select_related('repository')
+        .filter(id=analysis_id)
+        .first()
+    )
+    if analysis_run is None:
+        raise IssueMapResponseError('analysis_not_found', '분석 결과를 찾을 수 없습니다.', status_code=404, metadata={'analysis_id': analysis_id})
+    if analysis_run.status == AnalysisRun.STATUS_STARTED:
+        raise IssueMapResponseError('analysis_not_ready', '분석이 아직 완료되지 않았습니다.', status_code=409, metadata={'analysis_id': analysis_id, 'status': analysis_run.status})
+    if analysis_run.status == AnalysisRun.STATUS_FAILED:
+        raise IssueMapResponseError(
+            'analysis_failed',
+            '분석이 실패해 issue map을 만들 수 없습니다.',
+            status_code=409,
+            metadata={'analysis_id': analysis_id, 'status': analysis_run.status, 'error_code': analysis_run.error_code},
+        )
+    try:
+        artifact = analysis_run.artifact
+    except AnalysisArtifact.DoesNotExist as exc:
+        raise IssueMapResponseError('analysis_artifact_missing', '분석 artifact를 찾을 수 없습니다.', status_code=500, metadata={'analysis_id': analysis_id}) from exc
+    payload = artifact.payload
+    if not isinstance(payload, dict) or not isinstance(payload.get('nodes'), list) or not isinstance(payload.get('edges'), list):
+        raise IssueMapResponseError('analysis_artifact_invalid', '분석 artifact 형식이 올바르지 않습니다.', status_code=500, metadata={'analysis_id': analysis_id})
+    return analysis_run, payload
 
 
 def _mock_github_user(login: str) -> dict[str, str]:
