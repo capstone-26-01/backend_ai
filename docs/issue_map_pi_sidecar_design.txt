@@ -1,0 +1,75 @@
+Deferred Pi SDK Sidecar Design
+
+Status: deferred design only. This is not part of the MVP request path.
+
+Boundary
+--------
+
+The Python/Django backend remains the owner of:
+
+- GitHub issue API calls,
+- stored analysis artifact loading,
+- deterministic issue evidence extraction,
+- deterministic candidate ranking,
+- overview/focus graph projection,
+- bounded code context construction,
+- API response validation and schema compatibility.
+
+A future Pi SDK harness, if approved in a later plan, should run as a separate Node/TypeScript sidecar built on `@earendil-works/pi-coding-agent`. It must not replace the deterministic ranking path.
+
+Runtime Model
+-------------
+
+The sidecar should be invoked only after the backend has built a bounded issue-map payload. It receives data through an explicit request body or `ResourceLoader` equivalent:
+
+- issue title/body excerpts,
+- normalized comment excerpts,
+- deterministic candidates,
+- focus graph nodes and edges,
+- bounded code context,
+- allowed node IDs and file paths.
+
+It must return structured explanation fields only:
+
+- hypotheses,
+- investigation path wording,
+- confidence rationale.
+
+The backend validates the returned node IDs, paths, confidence, and text before sending anything to the frontend.
+
+Tool Policy
+-----------
+
+Built-in tools are disabled by default. If tools are ever enabled, they must be strictly allowlisted and expose only bounded artifact data already selected by the backend.
+
+The sidecar must not receive:
+
+- filesystem access,
+- shell access,
+- network access,
+- repository clone access,
+- GitHub credentials,
+- raw `.env` values,
+- private repo contents outside the bounded payload.
+
+Sessions
+--------
+
+Use in-memory sessions for MVP follow-up experiments. Do not introduce persistent sidecar sessions, cache entries, or replay storage until retention and debugging requirements are explicitly approved.
+
+Deployment And Secrets
+----------------------
+
+Sidecar credentials are configured outside Django settings and outside this repository's committed files. The Django app should treat the sidecar as optional and fail closed to deterministic output if it is unavailable.
+
+The testing-only Pi harness / OpenCode Kimi review gate is separate from this product sidecar. Review-gate credentials and packets must not be reused by runtime application code.
+
+Acceptance Criteria For Future Implementation
+---------------------------------------------
+
+- Existing `/api/issues/related-nodes/` request and response contracts remain backward-compatible.
+- Deterministic ranking works without the sidecar.
+- Sidecar failure returns deterministic hypotheses, investigation path, confidence, and a structured warning.
+- Returned node IDs and paths are allowlist-validated by the backend.
+- No issue-path cache is introduced.
+- Tests mock the sidecar and never call a live model.

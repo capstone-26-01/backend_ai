@@ -1,0 +1,39 @@
+Issue Map Ranking Eval Baseline
+
+Scope
+-----
+
+This baseline measures deterministic issue-to-node ranking on the synthetic issue-map fixture. It does not call GitHub, any live LLM, Pi SDK, smolagents, or cache-backed request path.
+
+Fixture
+-------
+
+Analysis artifact: `build_issue_map_analysis_artifact()`
+
+Golden cases:
+
+- `stack_trace_build_failure`
+  - expected nodes: `api/services.py::_build_and_store_analysis`, `parser/services.py::parse_repo`
+  - expected files: `api/services.py`, `parser/services.py`
+- `parser_entry_comment`
+  - expected nodes: `parser/services.py::parse_repo`
+  - expected files: `parser/services.py`
+- `view_to_service_handoff`
+  - expected nodes: `api/views.py::analysis`, `api/services.py::get_repo_analysis`
+  - expected files: `api/views.py`, `api/services.py`
+- `bare_filename_mentions`
+  - expected nodes: `api/services.py::get_repo_analysis`, `api/services.py::_build_and_store_analysis`
+  - expected files: `api/services.py`
+
+Recorded Baseline
+-----------------
+
+- case_count: 4
+- recall_at_1: 0.625
+- recall_at_3: 1.0
+- recall_at_5: 1.0
+
+Merge Guard
+-----------
+
+`api.tests.IssueMapRankingEvalTests` computes the baseline from the same fixture and asserts that future ranking changes do not regress these values. Ranking refinements may raise this baseline, but must not lower it without an explicit roadmap update.

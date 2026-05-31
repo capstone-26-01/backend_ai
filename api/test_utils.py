@@ -45,6 +45,26 @@ class IssueMapFixture:
 
 
 @dataclass(frozen=True)
+class IssueMapGoldenCase:
+    name: str
+    issue: Mapping[str, Any]
+    comments: tuple[Mapping[str, Any], ...]
+    expected_node_ids: tuple[str, ...]
+    expected_file_paths: tuple[str, ...]
+    expected_top_node_id: str | None = None
+
+
+@dataclass(frozen=True)
+class IssueRankingCaseResult:
+    name: str
+    ranked_node_ids: tuple[str, ...]
+    expected_node_ids: tuple[str, ...]
+    expected_file_paths: tuple[str, ...]
+    hits_at_k: Mapping[int, int]
+    recall_at_k: Mapping[int, float]
+
+
+@dataclass(frozen=True)
 class MockGithubHttpResponse:
     payload: Any
     status_code: int = 200
@@ -300,6 +320,131 @@ def mock_github_issue_comments_response(*, repo_path: str = ISSUE_MAP_FIXTURE.re
         payload=github_issue_comments_payload(count=count),
         url=f'https://api.github.com/repos/{repo_path}/issues/{issue_number}/comments',
     )
+
+
+ISSUE_MAP_GOLDEN_CASES: tuple[IssueMapGoldenCase, ...] = (
+    IssueMapGoldenCase(
+        name='stack_trace_build_failure',
+        issue=github_issue_payload(
+            title='Repository analysis crashes during build',
+            body='Traceback: File "api/services.py", line 6, in _build_and_store_analysis. parse_repo() raises a parser timeout error.',
+            labels=[github_issue_label('analysis', '1d76db', 'Analysis flow')],
+        ),
+        comments=(
+            {
+                'id': 1,
+                'author': 'maintainer',
+                'body': 'The failing call path goes through parser/services.py::parse_repo.',
+            },
+        ),
+        expected_node_ids=('api/services.py::_build_and_store_analysis', 'parser/services.py::parse_repo'),
+        expected_file_paths=('api/services.py', 'parser/services.py'),
+        expected_top_node_id='api/services.py::_build_and_store_analysis',
+    ),
+    IssueMapGoldenCase(
+        name='parser_entry_comment',
+        issue=github_issue_payload(
+            title='Parser returns empty graph',
+            body='The graph has no nodes after parser/services.py runs. parse_repo() returns an empty payload.',
+            labels=[github_issue_label('parser', '5319e7', 'Parser area')],
+        ),
+        comments=(
+            {
+                'id': 2,
+                'author': 'reviewer',
+                'body': 'parser/services.py:1:in parse_repo is the smallest repro.',
+            },
+        ),
+        expected_node_ids=('parser/services.py::parse_repo',),
+        expected_file_paths=('parser/services.py',),
+        expected_top_node_id='parser/services.py::parse_repo',
+    ),
+    IssueMapGoldenCase(
+        name='view_to_service_handoff',
+        issue=github_issue_payload(
+            title='Analysis endpoint does not return graph',
+            body='The api/views.py analysis view calls get_repo_analysis(), but the response is empty for users.',
+            labels=[github_issue_label('api', '0e8a16', 'API view')],
+        ),
+        comments=(),
+        expected_node_ids=('api/views.py::analysis', 'api/services.py::get_repo_analysis'),
+        expected_file_paths=('api/views.py', 'api/services.py'),
+        expected_top_node_id='api/views.py::analysis',
+    ),
+    IssueMapGoldenCase(
+        name='bare_filename_mentions',
+        issue=github_issue_payload(
+            title='services.py issue is hard to trace',
+            body='The user only mentioned services.py and get_repo_analysis without a package path.',
+            labels=[github_issue_label('analysis', '1d76db', 'Analysis flow')],
+        ),
+        comments=(
+            {
+                'id': 3,
+                'author': 'newcomer',
+                'body': 'I think _build_and_store_analysis is also involved.',
+            },
+        ),
+        expected_node_ids=('api/services.py::get_repo_analysis', 'api/services.py::_build_and_store_analysis'),
+        expected_file_paths=('api/services.py',),
+    ),
+)
+
+
+ISSUE_MAP_RANKING_BASELINE = {
+    'case_count': len(ISSUE_MAP_GOLDEN_CASES),
+    'recall_at_1': 0.625,
+    'recall_at_3': 1.0,
+    'recall_at_5': 1.0,
+}
+
+
+def issue_ranking_case_result(
+    case: IssueMapGoldenCase,
+    ranked_node_ids: list[str],
+    *,
+    k_values: tuple[int, ...] = (1, 3, 5),
+) -> IssueRankingCaseResult:
+    expected = set(case.expected_node_ids)
+    hits_at_k = {}
+    recall_at_k = {}
+    for k in k_values:
+        hits = len(set(ranked_node_ids[:k]) & expected)
+        hits_at_k[k] = hits
+        recall_at_k[k] = round(hits / len(expected), 3) if expected else 1.0
+    return IssueRankingCaseResult(
+        name=case.name,
+        ranked_node_ids=tuple(ranked_node_ids),
+        expected_node_ids=case.expected_node_ids,
+        expected_file_paths=case.expected_file_paths,
+        hits_at_k=hits_at_k,
+        recall_at_k=recall_at_k,
+    )
+
+
+def issue_ranking_recall_report(results: tuple[IssueRankingCaseResult, ...], *, k_values: tuple[int, ...] = (1, 3, 5)) -> dict[str, Any]:
+    return {
+        'case_count': len(results),
+        **{
+            f'recall_at_{k}': round(
+                sum(result.recall_at_k[k] for result in results) / len(results),
+                3,
+            )
+            if results
+            else 0.0
+            for k in k_values
+        },
+        'cases': [
+            {
+                'name': result.name,
+                'ranked_node_ids': result.ranked_node_ids,
+                'expected_node_ids': result.expected_node_ids,
+                'expected_file_paths': result.expected_file_paths,
+                'recall_at_k': dict(result.recall_at_k),
+            }
+            for result in results
+        ],
+    }
 
 
 def make_issue_llm_stub(response: Mapping[str, Any] | None = None) -> IssueLlmCallRecorder:

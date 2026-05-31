@@ -296,6 +296,7 @@ def _apply_file_boosts(
     scores: dict[str, int],
     evidence_by_node: dict[str, list[dict[str, str]]],
 ) -> None:
+    query_tokens = identifier_tokens(_string(evidence.get('query')))
     for mention in evidence.get('file_mentions', []):
         if not isinstance(mention, Mapping):
             continue
@@ -303,14 +304,16 @@ def _apply_file_boosts(
         mentioned_line = mention.get('line') if isinstance(mention.get('line'), int) else None
         for node_id, node in nodes_by_id.items():
             node_path = _node_path(node)
-            if node_path != mentioned_path and node_id != mentioned_path:
+            exact_path_match = node_path == mentioned_path or node_id == mentioned_path
+            basename_match = bool(node_path and '/' not in mentioned_path and file_basename(node_path) == mentioned_path)
+            if not exact_path_match and not basename_match:
                 continue
-            if _line_matches(node, mentioned_line):
+            if exact_path_match and _line_matches(node, mentioned_line):
                 _add_score(
                     scores,
                     evidence_by_node,
                     node_id,
-                    700,
+                    850,
                     evidence_type='stack_frame',
                     message=f'{mentioned_path}:{mentioned_line} stack trace line matches this node.',
                 )
@@ -319,18 +322,29 @@ def _apply_file_boosts(
                     scores,
                     evidence_by_node,
                     node_id,
-                    180,
-                    evidence_type='file_path',
-                    message=f'Issue mentions file path {mentioned_path}.',
+                    180 if exact_path_match else 80,
+                    evidence_type='file_path' if exact_path_match else 'file_basename',
+                    message=f'Issue mentions {"file path" if exact_path_match else "bare filename"} {mentioned_path}.',
                 )
+                node_tokens = identifier_tokens(' '.join([_node_label(node), _node_symbol(node), _final_id_segment(node_id)]))
+                matched_context = sorted(node_tokens & query_tokens)
+                if exact_path_match and matched_context:
+                    _add_score(
+                        scores,
+                        evidence_by_node,
+                        node_id,
+                        260,
+                        evidence_type='file_symbol_context',
+                        message='Issue mentions this file and matching node text: ' + ', '.join(matched_context[:4]),
+                    )
             else:
                 _add_score(
                     scores,
                     evidence_by_node,
                     node_id,
-                    240,
-                    evidence_type='file_path',
-                    message=f'Issue directly mentions file node {mentioned_path}.',
+                    240 if exact_path_match else 70,
+                    evidence_type='file_path' if exact_path_match else 'file_basename',
+                    message=f'Issue directly mentions {"file node" if exact_path_match else "bare filename"} {mentioned_path}.',
                 )
 
 

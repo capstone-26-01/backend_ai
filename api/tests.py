@@ -45,6 +45,8 @@ from api.services import get_artifact_by_revision, get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
     ISSUE_MAP_FIXTURE,
+    ISSUE_MAP_GOLDEN_CASES,
+    ISSUE_MAP_RANKING_BASELINE,
     GOLDEN_FIXTURE_REPOS,
     ExternalHttpBlockedMixin,
     MockGithubHttpResponse,
@@ -57,6 +59,8 @@ from api.test_utils import (
     github_issue_label,
     github_issue_link_header,
     github_issue_payload,
+    issue_ranking_case_result,
+    issue_ranking_recall_report,
     make_issue_llm_stub,
     mock_github_issue_comments_response,
     mock_github_issue_detail_response,
@@ -890,6 +894,70 @@ class IssueMapTestFoundationTests(ExternalHttpBlockedMixin, TestCase):
     def test_issue_network_guard_blocks_requests_based_live_http(self):
         with self.assertRaisesMessage(AssertionError, 'External HTTP request blocked in offline issue test'):
             requests.get('https://api.github.com/repos/owner/repo/issues')
+
+
+class IssueMapRankingEvalTests(TestCase):
+    def _ranking_results(self):
+        analysis = build_issue_map_analysis_artifact()
+        results = []
+        candidates_by_case = {}
+        for case in ISSUE_MAP_GOLDEN_CASES:
+            evidence = extract_issue_evidence(case.issue, case.comments)
+            candidates, _warnings = rank_issue_candidates(analysis, evidence, max_candidates=8)
+            ranked_node_ids = [candidate['node_id'] for candidate in candidates]
+            results.append(issue_ranking_case_result(case, ranked_node_ids))
+            candidates_by_case[case.name] = candidates
+        return tuple(results), candidates_by_case
+
+    def test_issue_map_golden_cases_reference_existing_fixture_nodes_and_files(self):
+        analysis = build_issue_map_analysis_artifact()
+        node_ids = {str(node['id']) for node in analysis['nodes']}
+        file_paths = set(analysis['file_contents'])
+
+        self.assertGreaterEqual(len(ISSUE_MAP_GOLDEN_CASES), 4)
+        for case in ISSUE_MAP_GOLDEN_CASES:
+            with self.subTest(case=case.name):
+                self.assertTrue(case.expected_node_ids)
+                self.assertTrue(set(case.expected_node_ids).issubset(node_ids))
+                self.assertTrue(set(case.expected_file_paths).issubset(file_paths))
+
+    def test_issue_ranking_recall_at_k_baseline_is_recorded(self):
+        results, _candidates_by_case = self._ranking_results()
+        report = issue_ranking_recall_report(results)
+
+        self.assertEqual(report['case_count'], ISSUE_MAP_RANKING_BASELINE['case_count'])
+        self.assertGreaterEqual(report['recall_at_1'], ISSUE_MAP_RANKING_BASELINE['recall_at_1'])
+        self.assertGreaterEqual(report['recall_at_3'], ISSUE_MAP_RANKING_BASELINE['recall_at_3'])
+        self.assertGreaterEqual(report['recall_at_5'], ISSUE_MAP_RANKING_BASELINE['recall_at_5'])
+
+    def test_issue_ranking_eval_baseline_report_is_documented(self):
+        text = (settings.BASE_DIR / 'docs' / 'issue_map_ranking_eval_baseline.txt').read_text(encoding='utf-8')
+
+        self.assertIn(f"case_count: {ISSUE_MAP_RANKING_BASELINE['case_count']}", text)
+        self.assertIn(f"recall_at_1: {ISSUE_MAP_RANKING_BASELINE['recall_at_1']}", text)
+        self.assertIn(f"recall_at_3: {ISSUE_MAP_RANKING_BASELINE['recall_at_3']}", text)
+        self.assertIn(f"recall_at_5: {ISSUE_MAP_RANKING_BASELINE['recall_at_5']}", text)
+
+    def test_issue_ranking_expected_top_nodes_do_not_regress(self):
+        _results, candidates_by_case = self._ranking_results()
+
+        for case in ISSUE_MAP_GOLDEN_CASES:
+            if not case.expected_top_node_id:
+                continue
+            with self.subTest(case=case.name):
+                self.assertEqual(candidates_by_case[case.name][0]['node_id'], case.expected_top_node_id)
+
+
+class IssueMapDeferredPiDesignTests(TestCase):
+    def test_deferred_pi_sidecar_doc_keeps_pi_out_of_mvp_request_path(self):
+        text = (settings.BASE_DIR / 'docs' / 'issue_map_pi_sidecar_design.txt').read_text(encoding='utf-8')
+
+        self.assertIn('deferred design only', text)
+        self.assertIn('@earendil-works/pi-coding-agent', text)
+        self.assertIn('must not replace the deterministic ranking path', text)
+        self.assertIn('filesystem access', text)
+        self.assertIn('network access', text)
+        self.assertIn('Tests mock the sidecar and never call a live model', text)
 
 
 class GraphArtifactContractTests(TestCase):
