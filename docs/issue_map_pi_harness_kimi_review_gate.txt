@@ -46,6 +46,11 @@ Optional live OpenCode Zen smoke:
 The live smoke uses the raw model id `kimi-k2.5` against
 `https://opencode.ai/zen/v1/chat/completions`. The OpenCode config id remains
 `opencode/kimi-k2.5`. Keep these separate when debugging usage dashboards.
+The smoke gate fails unless the provider response includes both `usage` and a
+`response_id`; successful receipts are written under `temp/harness_eval/` with
+timestamp/model/endpoint correlation fields. This proves the provider returned
+usage metadata for the request, but it does not prove the web dashboard rendered
+the request.
 
 Credential Rules
 ----------------

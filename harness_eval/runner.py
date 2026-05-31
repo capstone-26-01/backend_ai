@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 import json
@@ -27,6 +28,10 @@ DEFAULT_MATRIX = Path(__file__).resolve().parent / 'harness_matrix.sample.json'
 DEFAULT_SAMPLES = Path(__file__).resolve().parent / 'samples'
 DEFAULT_TRANSCRIPTS = Path(__file__).resolve().parent / 'sample_transcripts'
 DEFAULT_OUTPUT_DIR = Path('temp') / 'harness_eval'
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
 def _print_json(payload: object) -> None:
@@ -236,17 +241,28 @@ def cmd_live_smoke(args: argparse.Namespace) -> int:
         return 1
     latency_ms = round((time.monotonic() - started) * 1000)
     choices = response.get('choices') or []
-    passed = status == 200 and bool(choices)
+    usage_present = isinstance(response.get('usage'), dict)
+    response_id = response.get('id')
+    checked_at_utc = _utc_now_iso()
+    passed = status == 200 and bool(choices) and usage_present and bool(response_id)
     result = {
         'passed': passed,
         'status': status,
+        'checked_at_utc': checked_at_utc,
         'endpoint': args.endpoint,
         'raw_model_id': args.model,
         'opencode_model_id': f'opencode/{args.model}' if not args.model.startswith('opencode/') else args.model,
         'latency_ms': latency_ms,
-        'response_id': response.get('id'),
+        'response_id': response_id,
         'usage': response.get('usage'),
-        'usage_present': isinstance(response.get('usage'), dict),
+        'usage_present': usage_present,
+        'usage_receipt_present': usage_present and bool(response_id),
+        'dashboard_correlation': {
+            'response_id': response_id,
+            'checked_at_utc': checked_at_utc,
+            'raw_model_id': args.model,
+            'endpoint': args.endpoint,
+        },
         'request_headers': {
             key.lower(): value
             for key, value in headers.items()
@@ -289,20 +305,41 @@ def cmd_live_sample(args: argparse.Namespace) -> int:
     latency_ms = round((time.monotonic() - started) * 1000)
     choices = response.get('choices') or []
     raw_content = str(((choices[0] or {}).get('message') or {}).get('content') or '') if choices else ''
+    json_parse_error = None
     try:
         transcript = json.loads(raw_content)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        json_parse_error = str(exc)
         transcript = {'sample_id': sample.get('id'), 'variant_id': args.model, 'tool_calls': [], 'final': {}}
     report = evaluate_transcript(sample, transcript)
+    eval_passed = report['passed']
+    usage_present = isinstance(response.get('usage'), dict)
+    response_id = response.get('id')
+    live_call_passed = status == 200 and bool(choices) and usage_present and bool(response_id)
+    content_json_valid = json_parse_error is None and isinstance(transcript, dict)
+    checked_at_utc = _utc_now_iso()
+    report['passed'] = bool(live_call_passed and content_json_valid and eval_passed)
     report.update(
         {
+            'eval_passed': eval_passed,
+            'live_call_passed': live_call_passed,
+            'content_json_valid': content_json_valid,
+            'json_parse_error': json_parse_error,
             'status': status,
+            'checked_at_utc': checked_at_utc,
             'endpoint': args.endpoint,
             'raw_model_id': args.model,
             'latency_ms': latency_ms,
-            'response_id': response.get('id'),
+            'response_id': response_id,
             'usage': response.get('usage'),
-            'usage_present': isinstance(response.get('usage'), dict),
+            'usage_present': usage_present,
+            'usage_receipt_present': usage_present and bool(response_id),
+            'dashboard_correlation': {
+                'response_id': response_id,
+                'checked_at_utc': checked_at_utc,
+                'raw_model_id': args.model,
+                'endpoint': args.endpoint,
+            },
             'request_headers': {
                 key.lower(): value
                 for key, value in headers.items()

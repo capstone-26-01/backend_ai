@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
+import io
 import json
 import subprocess
 import sys
 import unittest
 
-from harness_eval.runner import _ensure_live_enabled
+from harness_eval.runner import _ensure_live_enabled, cmd_live_sample, cmd_live_smoke
 from harness_eval.evaluator import (
     DEFAULT_RAW_MODEL_ID,
     OPENCODE_ZEN_CHAT_COMPLETIONS_ENDPOINT,
@@ -122,6 +125,90 @@ class HarnessEvalLiveGuardTests(unittest.TestCase):
 
         self.assertFalse(enabled)
         self.assertIn('--live', reason)
+
+    def _live_args(self, **overrides):
+        values = {
+            'live': True,
+            'model': 'kimi-k2.5',
+            'endpoint': OPENCODE_ZEN_CHAT_COMPLETIONS_ENDPOINT,
+            'timeout': 10,
+            'write_result': False,
+        }
+        values.update(overrides)
+        return Namespace(**values)
+
+    def _capture_json(self, func, args):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            code = func(args)
+        return code, json.loads(stream.getvalue())
+
+    def test_live_smoke_fails_without_usage_receipt(self):
+        response = {'id': 'chatcmpl-test', 'choices': [{'message': {'content': '{"ok":true}'}}]}
+
+        with patch.dict('os.environ', {'RUN_OPENCODE_LIVE_TESTS': 'true', 'OPENCODE_API_KEY': 'test-key'}, clear=False):
+            with patch('harness_eval.runner._post_json', return_value=(200, {}, response)):
+                code, payload = self._capture_json(cmd_live_smoke, self._live_args())
+
+        self.assertEqual(code, 1)
+        self.assertFalse(payload['passed'])
+        self.assertFalse(payload['usage_present'])
+        self.assertFalse(payload['usage_receipt_present'])
+
+    def test_live_smoke_passes_with_usage_receipt(self):
+        response = {
+            'id': 'chatcmpl-test',
+            'choices': [{'message': {'content': '{"ok":true}'}}],
+            'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+        }
+
+        with patch.dict('os.environ', {'RUN_OPENCODE_LIVE_TESTS': 'true', 'OPENCODE_API_KEY': 'test-key'}, clear=False):
+            with patch('harness_eval.runner._post_json', return_value=(200, {}, response)):
+                code, payload = self._capture_json(cmd_live_smoke, self._live_args())
+
+        self.assertEqual(code, 0)
+        self.assertTrue(payload['passed'])
+        self.assertTrue(payload['usage_present'])
+        self.assertTrue(payload['usage_receipt_present'])
+        self.assertEqual(payload['dashboard_correlation']['response_id'], 'chatcmpl-test')
+
+    def test_live_sample_reports_non_json_model_output_as_parse_failure(self):
+        response = {
+            'id': 'chatcmpl-test',
+            'choices': [{'message': {'content': 'I will explain first, then maybe JSON.'}}],
+            'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+        }
+        args = self._live_args(sample=str(ROOT / 'samples' / 'origin_trace.json'))
+
+        with patch.dict('os.environ', {'RUN_OPENCODE_LIVE_TESTS': 'true', 'OPENCODE_API_KEY': 'test-key'}, clear=False):
+            with patch('harness_eval.runner._post_json', return_value=(200, {}, response)):
+                code, payload = self._capture_json(cmd_live_sample, args)
+
+        self.assertEqual(code, 1)
+        self.assertFalse(payload['passed'])
+        self.assertTrue(payload['live_call_passed'])
+        self.assertFalse(payload['content_json_valid'])
+        self.assertIsNotNone(payload['json_parse_error'])
+        self.assertTrue(payload['usage_receipt_present'])
+
+    def test_live_sample_passes_only_with_usage_json_and_eval_success(self):
+        transcript = load_json(ROOT / 'sample_transcripts' / 'good_origin_trace.json')
+        response = {
+            'id': 'chatcmpl-test',
+            'choices': [{'message': {'content': json.dumps(transcript)}}],
+            'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+        }
+        args = self._live_args(sample=str(ROOT / 'samples' / 'origin_trace.json'))
+
+        with patch.dict('os.environ', {'RUN_OPENCODE_LIVE_TESTS': 'true', 'OPENCODE_API_KEY': 'test-key'}, clear=False):
+            with patch('harness_eval.runner._post_json', return_value=(200, {}, response)):
+                code, payload = self._capture_json(cmd_live_sample, args)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(payload['passed'])
+        self.assertTrue(payload['eval_passed'])
+        self.assertTrue(payload['live_call_passed'])
+        self.assertTrue(payload['content_json_valid'])
 
 
 class HarnessEvalBlackBoxRunnerTests(unittest.TestCase):

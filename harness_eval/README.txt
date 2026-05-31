@@ -65,10 +65,12 @@ Expected result:
 - `passed: true`,
 - `raw_model_id: kimi-k2.5`,
 - `opencode_model_id: opencode/kimi-k2.5`,
-- `response_id` present when provider returns one,
-- `usage_present` shows whether token usage metadata came back in the response.
+- `response_id` present,
+- `usage_present: true`,
+- `usage_receipt_present: true`,
+- `dashboard_correlation` contains the timestamp, model, endpoint, and response ID to compare with the dashboard.
 
-If the API usage dashboard still shows nothing after a successful live smoke, preserve the generated `temp/harness_eval/live_smoke_*.json` file and compare its response ID/time with the dashboard.
+`live-smoke` now fails if OpenCode returns HTTP 200 without a usage object and response ID. If the API usage dashboard still shows nothing after a successful live smoke, preserve the generated `temp/harness_eval/live_smoke_*.json` file and compare its response ID/time with the dashboard. The CLI can prove that Zen returned usage metadata for the request; it cannot prove that the web dashboard rendered it.
 
 Live Sample Eval
 ----------------
@@ -82,6 +84,13 @@ python -m harness_eval.runner live-sample harness_eval/samples/origin_trace.json
 ```
 
 This is not a replacement for a real Pi run with tools. It tests the model/provider's ability to complete the issue job shape and makes an actual OpenCode Zen request for dashboard verification.
+
+`live-sample` fails loudly when the model output is not valid transcript JSON. The report includes:
+
+- `live_call_passed`: HTTP response, choices, response ID, and usage receipt were present,
+- `content_json_valid`: provider output parsed as a JSON object,
+- `json_parse_error`: parser failure when the model ignored JSON-only instructions,
+- `eval_passed`: deterministic transcript checks passed.
 
 Evaluating Real Pi Runs
 -----------------------
