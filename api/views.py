@@ -98,6 +98,10 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
     return api_services.get_mock_issue_related_nodes_response(analysis_id, issue_number, **kwargs)
 
 
+def get_issue_map_response(analysis_id: int, issue_number: int, **kwargs):
+    return api_services.get_issue_map_response(analysis_id, issue_number, **kwargs)
+
+
 def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None):
     return api_services.get_diff_response(repo_path, base_revision, head_revision)
 
@@ -139,6 +143,12 @@ def _repo_ingestion_error_response(error: RepoIngestionError) -> Response:
 def _github_issue_api_error_response(error: GithubIssueApiError) -> Response:
     logger.warning('GitHub issue API failed: %s', error.as_dict())
     return Response(error.as_dict(), status=error.status_code)
+
+
+def _issue_map_error_response(error: Exception) -> Response:
+    if isinstance(error, api_services.IssueMapResponseError):
+        return Response(error.as_dict(), status=error.status_code)
+    raise error
 
 
 def _summary_error_response(error: Exception) -> Response:
@@ -1169,13 +1179,27 @@ def issue_related_nodes(request):
         return Response(serializer.errors, status=400)
 
     validated_data = cast(dict[str, Any], serializer.validated_data)
-    response = get_mock_issue_related_nodes_response(
-        int(validated_data['analysis_id']),
-        int(validated_data['issue_number']),
-        max_nodes=int(validated_data['max_nodes']),
-    )
-    if response is None:
-        return Response({'error': '분석 결과 또는 issue를 찾을 수 없습니다'}, status=404)
+    analysis_id = int(validated_data['analysis_id'])
+    issue_number = int(validated_data['issue_number'])
+    max_nodes = int(validated_data['max_nodes'])
+    if bool(validated_data.get('mock')) or bool(getattr(settings, 'ISSUES_USE_MOCK', False)):
+        response = get_mock_issue_related_nodes_response(analysis_id, issue_number, max_nodes=max_nodes)
+        if response is None:
+            return Response({'error': '분석 결과 또는 issue를 찾을 수 없습니다'}, status=404)
+        return Response(response)
+
+    try:
+        response = get_issue_map_response(
+            analysis_id,
+            issue_number,
+            max_nodes=max_nodes,
+            include_comments=bool(validated_data['include_comments']),
+            max_context_files=int(validated_data['max_context_files']),
+        )
+    except GithubIssueApiError as error:
+        return _github_issue_api_error_response(error)
+    except Exception as error:
+        return _issue_map_error_response(error)
     return Response(response)
 
 
