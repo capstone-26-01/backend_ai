@@ -40,12 +40,16 @@ from api.test_utils import (
     ISSUE_MAP_FIXTURE,
     GOLDEN_FIXTURE_REPOS,
     ExternalHttpBlockedMixin,
+    MockGithubHttpResponse,
     assert_uses_issue_llm_stub,
     build_issue_map_analysis_artifact,
     commit_all,
     create_git_fixture_repo,
     create_issue_map_fixture_repo,
     create_named_fixture_repo,
+    github_issue_label,
+    github_issue_link_header,
+    github_issue_payload,
     make_issue_llm_stub,
     mock_github_issue_comments_response,
     mock_github_issue_detail_response,
@@ -1612,7 +1616,7 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
         return analysis_run
 
     def test_issues_endpoint_returns_mock_open_issue_list(self):
-        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo', 'mock': 'true'}))
         payload = cast(dict[str, object], json.loads(response.content))
         issues = cast(list[dict[str, object]], payload['issues'])
         issues_by_number = {issue['number']: issue for issue in issues}
@@ -1632,6 +1636,15 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
         self.assertTrue(issues_by_number[209]['locked'])
         labels = cast(list[dict[str, object]], issues_by_number[164]['labels'])
         self.assertIsNone(labels[0]['description'])
+
+    @override_settings(ISSUES_USE_MOCK=True)
+    def test_issues_endpoint_can_use_mock_setting(self):
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['source'], 'mock')
+        self.assertTrue(payload['mock'])
 
     def test_issues_endpoint_rejects_invalid_repo_url(self):
         response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://example.com/owner/repo'}))
@@ -1690,6 +1703,132 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
         )
 
         self.assertEqual(response.status_code, 404)
+
+
+class IssueLiveEndpointTests(ExternalHttpBlockedMixin, TestCase):
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_uses_live_github_by_default_and_filters_prs(self, requests_get):
+        requests_get.return_value = mock_github_issue_list_response()
+
+        response = cast(
+            HttpResponse,
+            self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo', 'page': '2', 'per_page': '3'}),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        issues = cast(list[dict[str, object]], payload['issues'])
+        issue_numbers = [issue['number'] for issue in issues]
+        request_kwargs = requests_get.call_args.kwargs
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['repo'], 'owner/repo')
+        self.assertEqual(payload['source'], 'github')
+        self.assertFalse(payload['mock'])
+        self.assertEqual(payload['page'], 2)
+        self.assertEqual(payload['per_page'], 3)
+        self.assertTrue(payload['has_next_page'])
+        self.assertEqual(payload['next_page'], 3)
+        self.assertEqual(issue_numbers, [42, 77])
+        self.assertNotIn(88, issue_numbers)
+        self.assertTrue(all(issue['is_pull_request'] is False for issue in issues))
+        self.assertEqual(cast(dict[str, object], payload['repository'])['full_name'], 'owner/repo')
+        self.assertEqual(payload['warnings'], [])
+        self.assertEqual(request_kwargs['params'], {'state': 'open', 'page': 2, 'per_page': 3})
+        self.assertIn('Accept', request_kwargs['headers'])
+
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_can_return_empty_issue_page_with_next_link(self, requests_get):
+        requests_get.return_value = MockGithubHttpResponse(
+            payload=[github_issue_payload(number=88, title='PR only page', pull_request=True)],
+            headers={'Link': github_issue_link_header(page=1, per_page=30)},
+        )
+
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['issues'], [])
+        self.assertTrue(payload['has_next_page'])
+        self.assertEqual(payload['next_page'], 2)
+
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_normalizes_nullable_and_empty_github_fields(self, requests_get):
+        issue = github_issue_payload(
+            number=101,
+            title='Nullable fields',
+            body='',
+            labels=[github_issue_label('ui', 'c5def5', None)],
+        )
+        issue['user'] = None
+        issue['locked'] = True
+        requests_get.return_value = MockGithubHttpResponse(payload=[issue], headers={'X-RateLimit-Remaining': '42'})
+
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+        issue_payload = cast(list[dict[str, object]], payload['issues'])[0]
+        labels = cast(list[dict[str, object]], issue_payload['labels'])
+        assignees = cast(list[dict[str, object]], issue_payload['assignees'])
+        rate_limit = cast(dict[str, object], payload['rate_limit'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(issue_payload['author'])
+        self.assertEqual(issue_payload['body_excerpt'], '')
+        self.assertFalse(issue_payload['body_truncated'])
+        self.assertIsNone(labels[0]['description'])
+        self.assertEqual(assignees[0]['login'], 'backend-owner')
+        self.assertTrue(issue_payload['locked'])
+        self.assertEqual(rate_limit['remaining'], 42)
+
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_maps_rate_limit_error(self, requests_get):
+        requests_get.return_value = MockGithubHttpResponse(
+            payload={'message': 'API rate limit exceeded'},
+            status_code=403,
+            headers={'X-RateLimit-Limit': '60', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1770000000'},
+        )
+
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(payload['code'], 'github_rate_limited')
+        self.assertEqual(payload['upstream_status'], 403)
+        self.assertEqual(cast(dict[str, object], payload['rate_limit'])['remaining'], 0)
+
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_maps_repo_not_found_error(self, requests_get):
+        requests_get.return_value = MockGithubHttpResponse(payload={'message': 'Not Found'}, status_code=404)
+
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(payload['code'], 'repo_not_found')
+
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_maps_private_repo_error(self, requests_get):
+        requests_get.return_value = MockGithubHttpResponse(
+            payload={'message': 'Resource not accessible by integration'},
+            status_code=403,
+            headers={'X-RateLimit-Remaining': '57'},
+        )
+
+        response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(payload['code'], 'private_repo')
+
+    @patch('github_repo.services.requests.get')
+    def test_issues_endpoint_does_not_read_or_write_cache(self, requests_get):
+        requests_get.return_value = mock_github_issue_list_response(include_pull_request=False, has_next_page=False)
+
+        with (
+            patch('django.core.cache.cache.get', side_effect=AssertionError('issue list must not read cache')),
+            patch('django.core.cache.cache.set', side_effect=AssertionError('issue list must not write cache')),
+        ):
+            response = cast(HttpResponse, self.client.get('/api/issues/', {'url': 'https://github.com/owner/repo'}))
+
+        self.assertEqual(response.status_code, 200)
 
 
 @override_settings(
@@ -2569,7 +2708,12 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('응답의 `nodes[].id`는 `/api/node-summary/`', schema_text)
         self.assertIn('/api/issues/', schema_text)
         self.assertIn('/api/issues/related-nodes/', schema_text)
-        self.assertIn('프런트엔드 선작업용 GitHub open issue 목록 mock API입니다', schema_text)
+        self.assertIn('GitHub open issue 목록 API입니다', schema_text)
+        self.assertIn('live GitHub REST API 조회입니다', schema_text)
+        self.assertIn('mock', schema_text)
+        self.assertIn('repository', schema_text)
+        self.assertIn('rate_limit', schema_text)
+        self.assertIn('warnings', schema_text)
         self.assertIn('응답의 `selected_node_ids`는 graph highlight에 바로 쓰고', schema_text)
         self.assertIn('Mock open issues response', schema_text)
         self.assertIn('body_truncated', schema_text)
