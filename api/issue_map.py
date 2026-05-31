@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 import os
 import re
+
+from llm.context_selection import identifier_tokens, score_nodes
 
 
 FILE_PATH_RE = re.compile(r'(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py|[A-Za-z0-9_.-]+\.py)(?::(?P<line>\d+))?')
@@ -190,3 +192,260 @@ def extract_issue_evidence(
 
 def file_basename(path: str) -> str:
     return os.path.basename(path)
+
+
+def _node_id(node: Mapping[str, Any]) -> str:
+    return _string(node.get('id'))
+
+
+def _node_kind(node: Mapping[str, Any]) -> str:
+    return _string(node.get('kind') or node.get('type'))
+
+
+def _node_path(node: Mapping[str, Any]) -> str | None:
+    path = node.get('path') or node.get('file')
+    if isinstance(path, str) and path:
+        return path
+    return None
+
+
+def _node_label(node: Mapping[str, Any]) -> str:
+    return _string(node.get('label') or node.get('symbol') or node.get('id'))
+
+
+def _node_symbol(node: Mapping[str, Any]) -> str:
+    return _string(node.get('symbol') or node.get('label'))
+
+
+def _node_line_range(node: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    start = node.get('start_line')
+    end = node.get('end_line')
+    return (start if isinstance(start, int) and not isinstance(start, bool) else None, end if isinstance(end, int) and not isinstance(end, bool) else None)
+
+
+def _display_node(node: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'id': _node_id(node),
+        'kind': _node_kind(node),
+        'label': _node_label(node),
+        'path': _node_path(node),
+        'start_line': node.get('start_line'),
+        'end_line': node.get('end_line'),
+        'metadata': dict(node.get('metadata') or {}),
+    }
+
+
+def _nodes_by_id(analysis: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        _node_id(cast(Mapping[str, Any], node)): dict(cast(Mapping[str, Any], node))
+        for node in analysis.get('nodes', [])
+        if isinstance(node, Mapping) and _node_id(cast(Mapping[str, Any], node))
+    }
+
+
+def _entrypoint_ids(analysis: Mapping[str, Any]) -> set[str]:
+    return {
+        str(entrypoint.get('id'))
+        for entrypoint in analysis.get('entrypoints', [])
+        if isinstance(entrypoint, Mapping) and entrypoint.get('id')
+    }
+
+
+def _key_module_ids(analysis: Mapping[str, Any]) -> set[str]:
+    return {
+        str(module.get('id'))
+        for module in analysis.get('key_modules', [])
+        if isinstance(module, Mapping) and module.get('id')
+    }
+
+
+def _final_id_segment(node_id: str) -> str:
+    return node_id.split('::')[-1].split('/')[-1]
+
+
+def _line_matches(node: Mapping[str, Any], line: int | None) -> bool:
+    if line is None:
+        return False
+    start, end = _node_line_range(node)
+    if start is None or end is None:
+        return False
+    return start <= line <= end
+
+
+def _add_score(
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+    node_id: str,
+    amount: int,
+    *,
+    evidence_type: str,
+    message: str,
+) -> None:
+    scores[node_id] = scores.get(node_id, 0) + amount
+    evidence = evidence_by_node.setdefault(node_id, [])
+    marker = (evidence_type, message)
+    if not any((item['type'], item['message']) == marker for item in evidence):
+        evidence.append({'type': evidence_type, 'message': message})
+
+
+def _apply_file_boosts(
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    for mention in evidence.get('file_mentions', []):
+        if not isinstance(mention, Mapping):
+            continue
+        mentioned_path = _string(mention.get('path'))
+        mentioned_line = mention.get('line') if isinstance(mention.get('line'), int) else None
+        for node_id, node in nodes_by_id.items():
+            node_path = _node_path(node)
+            if node_path != mentioned_path and node_id != mentioned_path:
+                continue
+            if _line_matches(node, mentioned_line):
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    320,
+                    evidence_type='stack_frame',
+                    message=f'{mentioned_path}:{mentioned_line} stack trace line matches this node.',
+                )
+            elif _node_kind(node) in {'function', 'method', 'class'}:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    180,
+                    evidence_type='file_path',
+                    message=f'Issue mentions file path {mentioned_path}.',
+                )
+            else:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    240,
+                    evidence_type='file_path',
+                    message=f'Issue directly mentions file node {mentioned_path}.',
+                )
+
+
+def _apply_symbol_boosts(
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    for mention in evidence.get('symbol_mentions', []):
+        if not isinstance(mention, Mapping):
+            continue
+        symbol = _string(mention.get('symbol')).lower()
+        if not symbol:
+            continue
+        for node_id, node in nodes_by_id.items():
+            label = _node_label(node).lower()
+            node_symbol = _node_symbol(node).lower()
+            final_segment = _final_id_segment(node_id).lower()
+            if symbol in {label, node_symbol, final_segment}:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    280,
+                    evidence_type='symbol',
+                    message=f'Issue explicitly mentions symbol {symbol}.',
+                )
+            elif symbol in identifier_tokens(label) or symbol in identifier_tokens(node_id):
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    120,
+                    evidence_type='symbol',
+                    message=f'Issue symbol {symbol} partially matches this node.',
+                )
+
+
+def _apply_label_boosts(
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    label_tokens = {
+        token
+        for label in evidence.get('labels', [])
+        if isinstance(label, Mapping)
+        for token in identifier_tokens(_string(label.get('name')))
+    }
+    if not label_tokens:
+        return
+    for node_id, node in nodes_by_id.items():
+        node_tokens = identifier_tokens(' '.join([node_id, _node_label(node), _node_path(node) or '']))
+        matched = sorted(label_tokens & node_tokens)
+        if matched:
+            _add_score(
+                scores,
+                evidence_by_node,
+                node_id,
+                20 * len(matched),
+                evidence_type='label',
+                message='Issue label matches node metadata: ' + ', '.join(matched[:4]),
+            )
+
+
+def rank_issue_candidates(
+    analysis: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    max_candidates: int = 20,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    nodes_by_id = _nodes_by_id(analysis)
+    base_scores, warnings = score_nodes(analysis, _string(evidence.get('query')))
+    scores = {node_id: score.score for node_id, score in base_scores.items() if node_id in nodes_by_id}
+    evidence_by_node: dict[str, list[dict[str, str]]] = {
+        node_id: [{'type': 'lexical', 'message': 'Issue title/body/comment text matches graph metadata.'}]
+        for node_id in scores
+    }
+
+    _apply_file_boosts(nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_symbol_boosts(nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_label_boosts(nodes_by_id, evidence, scores, evidence_by_node)
+
+    if not scores:
+        fallback_ids = sorted((_entrypoint_ids(analysis) | _key_module_ids(analysis)) & set(nodes_by_id))
+        for node_id in fallback_ids[:max_candidates]:
+            _add_score(
+                scores,
+                evidence_by_node,
+                node_id,
+                25,
+                evidence_type='fallback',
+                message='Issue evidence did not match directly; using entrypoint/key module fallback.',
+            )
+        warnings.append({'code': 'no_ranked_issue_nodes', 'message': 'Issue evidence did not match graph nodes directly.'})
+
+    ranked_ids = sorted(scores, key=lambda node_id: (-scores[node_id], _node_path(nodes_by_id[node_id]) or '', node_id))
+    if ranked_ids and scores[ranked_ids[0]] < 40:
+        warnings.append({'code': 'low_confidence_issue_ranking', 'message': 'Issue evidence produced only weak graph matches.'})
+
+    max_score = max([scores[node_id] for node_id in ranked_ids], default=1)
+    candidates: list[dict[str, Any]] = []
+    for rank, node_id in enumerate(ranked_ids[:max_candidates], start=1):
+        node = nodes_by_id[node_id]
+        normalized_score = round(min(1.0, max(0.05, scores[node_id] / max_score)), 3)
+        evidence_items = evidence_by_node.get(node_id) or [{'type': 'fallback', 'message': 'Deterministic fallback candidate.'}]
+        candidates.append(
+            {
+                'rank': rank,
+                'score': normalized_score,
+                'raw_score': scores[node_id],
+                'node_id': node_id,
+                'node': _display_node(node),
+                'reason': evidence_items[0]['message'],
+                'evidence': evidence_items[:6],
+            }
+        )
+    return candidates, warnings
