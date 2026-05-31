@@ -376,6 +376,50 @@ def normalize_github_issue(repo_path: str, issue: Any) -> dict[str, Any]:
     }
 
 
+def _issue_is_pull_request(issue: Any) -> bool:
+    return isinstance(issue, dict) and isinstance(issue.get('pull_request'), dict)
+
+
+def _has_next_page(response: Any) -> bool:
+    link_header = _response_header(response, 'Link')
+    return bool(re.search(r'rel="?next"?', link_header))
+
+
+def get_github_issue_list_response(repo_path: str, *, page: int = 1, per_page: int = 30, state: str = 'open') -> dict[str, Any]:
+    payload, response = fetch_github_issue_list_page(repo_path, page=page, per_page=per_page, state=state)
+    if not isinstance(payload, list):
+        raise GithubIssueApiError(
+            'github_issue_api_error',
+            'GitHub issue API 응답 형식이 올바르지 않습니다.',
+            status_code=502,
+            metadata={'repo': repo_path, 'payload_type': type(payload).__name__},
+            rate_limit=_github_rate_limit(response),
+        )
+
+    issue_payloads = [issue for issue in payload if not _issue_is_pull_request(issue)]
+    normalized_issues = [normalize_github_issue(repo_path, issue) for issue in issue_payloads]
+    has_next_page = _has_next_page(response)
+    return {
+        'repo': repo_path,
+        'repository': {
+            'full_name': repo_path,
+            'html_url': f'https://github.com/{repo_path}',
+            'api_url': f'{_github_api_base_url()}/repos/{repo_path}',
+        },
+        'provider': 'github',
+        'source': 'github',
+        'mock': False,
+        'state': state,
+        'page': page,
+        'per_page': per_page,
+        'has_next_page': has_next_page,
+        'next_page': page + 1 if has_next_page else None,
+        'issues': normalized_issues,
+        'rate_limit': _github_rate_limit(response),
+        'warnings': [],
+    }
+
+
 def _sanitize_stderr(stderr: str) -> str:
     sanitized = re.sub(r'https://[^@\s]+@github\.com/', 'https://github.com/', stderr)
     return sanitized[:MAX_STDERR_CHARS]
