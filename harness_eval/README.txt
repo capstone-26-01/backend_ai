@@ -10,8 +10,10 @@ It covers two questions:
 
 1. Did a real runner command produce the right behavior for a normal issue job?
    - required bounded tools were used,
+   - first-use tool order and required repo file reads were satisfied,
    - forbidden tools were not used,
    - final node IDs and file paths stayed on the allowlists,
+   - every expected node appeared in the investigation path with its exact repository-relative file path,
    - confidence values stayed in range.
 
 2. Did OpenCode Zen actually receive a request?
@@ -25,6 +27,7 @@ Tracked Files
 
 - `samples/*.json`: synthetic issue-map jobs. Hidden `expect` fields are used only by the deterministic evaluator.
 - `golden/repo_issue_consensus.json`: repo-fixture reference answers agreed by independent GPT-5.5 xhigh and Kimi judges.
+- `golden/judge_logs/*.txt`: prompts and raw reviewer outputs used to audit the repo-fixture golden set.
 - `sample_transcripts/*.json`: example runner transcripts for evaluator development.
 - `harness_matrix.sample.json`: model/tool/MCP/skill comparison matrix.
 - `evaluator.py`: schema and transcript scoring logic.
@@ -102,19 +105,21 @@ This is the production-like live check: `run-harness` stays the deterministic ju
 
 For repo samples, the job packet contains a local repo fixture path and issue text, not a precomputed graph artifact. Pi must call `list_repo_files`, `search_repo_symbols`, and `read_repo_file`; the deterministic evaluator compares the final transcript against hidden `expect` values derived from `golden/repo_issue_consensus.json`. The SUT never receives that golden file or the hidden `expect` block.
 
-Repo-fixture samples include parser timeout tracing and same-file extra-node precision checks. These catch cases where the model includes every plausible node from a file instead of the specific symbols supported by the issue evidence.
+Repo-fixture samples are not smoke tests. They cover multi-file call chains, same-file decoys, permission classes, GitHub ingestion failures, graph filtering, graph label conversion, parser visitor gaps, worker/cache key mismatch, and a negative needs-info issue where the correct answer is no node. These catch cases where the model includes every plausible node from a file, guesses from labels, or skips file reads before naming origin symbols.
 
 ```
 export OPENCODE_API_KEY=...
 export RUN_OPENCODE_LIVE_TESTS=true
 python -m harness_eval.runner run-harness harness_eval/samples/repo_parser_timeout.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
 python -m harness_eval.runner run-harness harness_eval/samples/repo_same_file_precision.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
+python -m harness_eval.runner run-harness harness_eval/samples/repo_fetch_none_crash.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
 ```
 
 Expected result:
 
 - exit code 0,
 - required repo-analysis tools were called,
+- required tool order and required file reads were satisfied,
 - forbidden filesystem/shell/network/GitHub tools were not called,
 - expected node IDs and paths passed the deterministic evaluator,
 - `pi_metadata.response_ids` and `pi_metadata.usage` are present in the transcript for API/dashboard correlation.

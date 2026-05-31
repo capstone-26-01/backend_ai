@@ -175,6 +175,124 @@ class HarnessEvalSampleTests(unittest.TestCase):
         self.assertNotIn('expect', rendered)
         self.assertNotIn('allowed_node_ids', rendered)
 
+    def test_repo_job_packets_do_not_expose_golden_answers(self):
+        for path in ROOT.glob('samples/repo_*.json'):
+            sample = load_json(path)
+            job = build_job_packet(sample)
+            rendered = json.dumps(job, ensure_ascii=False)
+            expect = sample['expect']
+
+            with self.subTest(path=path.name):
+                self.assertNotIn('expect', rendered)
+                self.assertNotIn('golden_ref', rendered)
+                for node_id in sorted(set((expect.get('node_ids') or []) + (expect.get('allowed_node_ids') or []))):
+                    self.assertNotIn(node_id, rendered)
+
+    def test_required_repo_reads_are_enforced(self):
+        sample = load_json(ROOT / 'samples' / 'repo_fetch_none_crash.json')
+        transcript = {
+            'sample_id': 'repo_fetch_none_crash',
+            'variant_id': 'skipped-file-read',
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'NoneType get file-list'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'github_repo/services.py::fetch_repo_files', 'confidence': 0.8}],
+                'investigation_path': [{'node_id': 'github_repo/services.py::fetch_repo_files', 'path': 'github_repo/services.py'}],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        report = evaluate_transcript(sample, transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertFalse(report['passed'])
+        self.assertFalse(checks['required_read_paths']['passed'])
+        self.assertTrue(checks['expected_nodes']['passed'])
+
+    def test_expected_nodes_need_investigation_paths(self):
+        sample = load_json(ROOT / 'samples' / 'repo_fetch_none_crash.json')
+        transcript = {
+            'sample_id': 'repo_fetch_none_crash',
+            'variant_id': 'missing-investigation-path',
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'NoneType get file-list'}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'github_repo/services.py'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'github_repo/services.py::fetch_repo_files', 'confidence': 0.8}],
+                'investigation_path': [],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        report = evaluate_transcript(sample, transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertFalse(report['passed'])
+        self.assertTrue(checks['expected_nodes']['passed'])
+        self.assertFalse(checks['expected_investigation_nodes']['passed'])
+        self.assertFalse(checks['expected_investigation_paths']['passed'])
+
+    def test_required_tool_first_use_order_is_strict(self):
+        sample = load_json(ROOT / 'samples' / 'repo_fetch_none_crash.json')
+        transcript = {
+            'sample_id': 'repo_fetch_none_crash',
+            'variant_id': 'bad-tool-order',
+            'tool_calls': [
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'NoneType'}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'file-list'}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'github_repo/services.py'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'github_repo/services.py::fetch_repo_files', 'confidence': 0.8}],
+                'investigation_path': [{'node_id': 'github_repo/services.py::fetch_repo_files', 'path': 'github_repo/services.py'}],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        report = evaluate_transcript(sample, transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertFalse(report['passed'])
+        self.assertTrue(checks['required_tool_order']['passed'])
+        self.assertFalse(checks['required_tool_first_use_order']['passed'])
+
+    def test_negative_repo_sample_allows_empty_final_and_rejects_spurious_nodes(self):
+        sample = load_json(ROOT / 'samples' / 'repo_no_relevant_code.json')
+        empty_transcript = {
+            'sample_id': 'repo_no_relevant_code',
+            'variant_id': 'empty-result',
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'slow laptop'}},
+            ],
+            'final': {
+                'hypotheses': [],
+                'investigation_path': [],
+                'confidence': {'score': 0.4},
+            },
+        }
+        spurious_transcript = {
+            **empty_transcript,
+            'final': {
+                'hypotheses': [{'node_id': 'api/services.py::get_repo_analysis', 'confidence': 0.2}],
+                'investigation_path': [{'node_id': 'api/services.py::get_repo_analysis', 'path': 'api/services.py'}],
+                'confidence': {'score': 0.2},
+            },
+        }
+
+        self.assertTrue(evaluate_transcript(sample, empty_transcript)['passed'])
+        report = evaluate_transcript(sample, spurious_transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertFalse(report['passed'])
+        self.assertFalse(checks['node_allowlist']['passed'])
+        self.assertFalse(checks['path_allowlist']['passed'])
+
     def test_repo_samples_match_judge_consensus_golden(self):
         checks = validate_golden_alignment(ROOT / 'samples', ROOT / 'golden' / 'repo_issue_consensus.json')
 
@@ -377,6 +495,34 @@ class PiRunnerEventParserTests(unittest.TestCase):
         self.assertEqual(parsed['sample_id'], 'origin_trace')
         self.assertEqual(parsed['tool_calls'][0]['name'], 'rank_issue_candidates')
 
+    def test_ignores_finish_tool_validation_errors_until_valid_transcript(self):
+        transcript = load_json(ROOT / 'sample_transcripts' / 'good_origin_trace.json')
+        invalid_event = {
+            'type': 'message_update',
+            'toolResults': [
+                {
+                    'role': 'toolResult',
+                    'toolName': 'finish_issue_map_transcript',
+                    'details': {'error': 'invalid_node_ids', 'invalid_node_ids': ['list_repo_files']},
+                }
+            ],
+        }
+        valid_event = {
+            'type': 'message_update',
+            'toolResults': [
+                {
+                    'role': 'toolResult',
+                    'toolName': 'finish_issue_map_transcript',
+                    'details': transcript,
+                }
+            ],
+        }
+
+        parsed, metadata = extract_transcript_from_pi_jsonl(json.dumps(invalid_event) + '\n' + json.dumps(valid_event))
+
+        self.assertEqual(parsed['sample_id'], 'origin_trace')
+        self.assertEqual(metadata['event_count'], 2)
+
 
 class PiRunnerCommandTests(unittest.TestCase):
     def test_pi_runner_emits_transcript_from_finish_tool_result(self):
@@ -426,7 +572,7 @@ class PiRunnerCommandTests(unittest.TestCase):
 
         command = pi_runner.build_pi_command(args, job)
 
-        self.assertIn('list_repo_files,search_repo_symbols,read_repo_file,finish_issue_map_transcript', command)
+        self.assertIn('list_repo_files,search_repo_symbols,search_repo_text,read_repo_file,finish_issue_map_transcript', command)
         self.assertNotIn('rank_issue_candidates,load_focus_graph,load_code_context,finish_issue_map_transcript', command)
 
 

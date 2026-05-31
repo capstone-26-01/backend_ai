@@ -1,0 +1,37 @@
+You are auditing the capstone backend_ai Pi harness evaluation suite.
+
+Goal:
+Decide whether the repo-fixture golden dataset is strong enough for an MVP gate that compares Pi/OpenCode issue-localization harness variants. Reply with exactly one verdict line:
+ACCEPT_FOR_MVP
+or
+REJECT_THIN_DATASET
+
+Context:
+- The system under test receives a GitHub issue and bounded repo tools.
+- It must localize likely origin code nodes for first-time contributors.
+- The deterministic evaluator, not the harness, scores the transcript.
+- Hidden sample expect fields and harness_eval/golden/repo_issue_consensus.json must never be sent to the system under test.
+- The dataset should avoid magic-number thresholds as ground truth. Golden answers should come from planted bugs/reference fixes and independent judge agreement.
+
+Inspect:
+- harness_eval/evaluator.py
+- harness_eval/pi_runner.py
+- harness_eval/pi/issue_map_extension.ts
+- harness_eval/samples/repo_*.json
+- harness_eval/golden/repo_issue_consensus.json
+- harness_eval/fixtures/repos/**/*
+- harness_eval/tests.py
+- harness_eval/README.txt
+
+Reject if any blocker remains:
+- fewer than eight repo-fixture golden samples,
+- issue text leaks exact hidden node IDs,
+- fixtures are too tiny or mostly one-hop,
+- no negative/no-actionable-code case,
+- no class/inheritance or multi-file case,
+- evaluator can pass without required repo reads,
+- finalizer or tools auto-insert the expected answers,
+- golden expectations are derived from SUT scores instead of planted bugs/reference reasoning,
+- no test guards that job packets hide hidden answers.
+
+If rejecting, list only concrete blockers and minimal fixes.

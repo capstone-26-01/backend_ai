@@ -1,0 +1,15 @@
+ACCEPT_FOR_MVP
+
+Residual non-blocking risks:
+
+1. Missing raw judge transcripts in `golden/judge_logs/` - Only the audit prompt is archived; the claimed GPT-5.5 xhigh and Kimi independent review outputs are not stored, weakening reproducibility of the consensus provenance. Fix: save raw judge responses alongside the prompt.
+
+2. Heavy reuse of `issue_locator_repo` - 6 of 9 samples draw from the same fixture. If a model caches fixture state across runs, or if overlapping symbols create unintended correlations, variance estimates could be biased. Fix: diversify with at least one additional multi-directory fixture repo in the next expansion.
+
+3. Broad `allowed_node_ids` on `repo_async_symbols_missing` and `repo_issue_cache_stale` - 6 and 8 allowed nodes vs. 1 and 2 expected nodes. The `node_allowlist` guard is therefore loose for these samples; a model can include several wrong nodes and still pass that sub-check. Fix: tighten allowed lists once live runs confirm stable precision.
+
+4. Small focused fixtures reward shallow matching - `parser_timeout_repo` and `ambiguous_services_repo` are under 15 lines per file. While `required_read_paths` forces file inspection, the tiny surface makes lucky keyword guesses non-negligible. Fix: merge these into richer fixtures with more decoy symbols.
+
+5. No automated lint against partial symbol-name leakage in issue text - `repo_same_file_precision` intentionally names `delete_share_token` as a decoy, but there is no harness-level test scanning issue bodies for unexpected mentions of expected symbol basenames such as `attach_labels` or `refresh_issue_cache`. Fix: add a validation check that no expected `node_id` basename appears verbatim in the issue text unless explicitly allowlisted as a decoy.
+
+6. Negation heuristic brittleness in `issue_map_extension.ts` - `isNegatedMention` relies on a hardcoded 48-character context window and a static phrase list. Novel negation phrasing outside this window could evade rejection at runtime. Fix: expand phrase list and add a sample that exercises a longer-distance negation.

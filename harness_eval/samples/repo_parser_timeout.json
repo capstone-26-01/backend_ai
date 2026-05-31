@@ -9,13 +9,13 @@
   },
   "issue": {
     "number": 201,
-    "title": "Repository analysis crashes while parsing",
-    "body": "Traceback points at api/services.py::_build_and_store_analysis. The call into parser/services.py::parse_repo never returns and looks like a parser timeout.",
+    "title": "Repository analysis hangs while parsing a Python repo",
+    "body": "A request to build repository analysis reaches the analysis service and then never completes once parser/services.py starts scanning files. The HTTP view only forwards the request.",
     "labels": [{"name": "analysis"}, {"name": "parser"}],
     "comments": [
       {
         "id": 21,
-        "body": "Please inspect _build_and_store_analysis and parse_repo. api/views.py::analysis is just the request entry point."
+        "body": "The same repo works if parser scanning is bypassed, so start from the analysis-to-parser handoff rather than the view layer."
       }
     ]
   },
@@ -36,9 +36,11 @@
   "expect": {
     "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_parser_timeout",
     "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["api/services.py", "parser/services.py"],
     "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
-    "node_ids": ["api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo"],
-    "allowed_node_ids": ["api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo"],
+    "node_ids": ["parser/services.py::parse_repo", "parser/services.py::should_continue"],
+    "allowed_node_ids": ["api/services.py::_build_and_store_analysis", "api/services.py::get_repo_analysis", "parser/services.py::parse_repo", "parser/services.py::should_continue", "parser/services.py::parse_next_file"],
     "allowed_paths": ["api/services.py", "parser/services.py"]
   }
 }

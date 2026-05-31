@@ -1,7 +1,18 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-05-31T06:06:55Z",
-  "method": "Independent GPT-5.5 xhigh subagent and Kimi judge agreement over repo fixture code and issue text.",
+  "generated_at_utc": "2026-05-31T08:18:00Z",
+  "method": "Planted-bug repo fixtures with hidden deterministic expected nodes, then independent GPT-5.5 xhigh and Kimi audit. The system under test receives only issue text and bounded repo tools, never this file or sample expect fields.",
+  "coverage": [
+    "multi-file call-chain localization",
+    "same-file decoy exclusion",
+    "security permission class path",
+    "GitHub ingestion null response",
+    "graph construction filtering bug",
+    "graph label transformation bug",
+    "parser class visitor bug",
+    "background worker/cache-key mismatch",
+    "negative needs-info issue with no actionable code node"
+  ],
   "judges": [
     {
       "name": "gpt-5.5-xhigh-subagent",
@@ -16,14 +27,22 @@
     {
       "sample_id": "repo_parser_timeout",
       "node_ids": [
+        "parser/services.py::parse_repo",
+        "parser/services.py::should_continue"
+      ],
+      "allowed_node_ids": [
         "api/services.py::_build_and_store_analysis",
-        "parser/services.py::parse_repo"
+        "api/services.py::get_repo_analysis",
+        "parser/services.py::parse_repo",
+        "parser/services.py::should_continue",
+        "parser/services.py::parse_next_file"
       ],
       "allowed_paths": [
         "api/services.py",
         "parser/services.py"
       ],
-      "rationale": "Both judges selected _build_and_store_analysis as the traceback caller and parse_repo as the non-returning parser call. api/views.py::analysis is only the request entry point, and parser helpers are implementation details outside the minimal origin."
+      "reference_bug": "The analysis service hands repo input to parse_repo, whose loop relies on should_continue(repo_path); should_continue stays true for a truthy repo path and parse_next_file does not advance loop state.",
+      "rationale": "The required origin is the parser loop and non-terminating loop condition. Service handoff and parse_next_file are allowed as investigation context because they show how the parser is reached and that no loop progress update occurs."
     },
     {
       "sample_id": "repo_same_file_precision",
@@ -34,7 +53,132 @@
       "allowed_paths": [
         "api/services.py"
       ],
-      "rationale": "Both judges selected get_repo_analysis and _build_and_store_analysis as the issue path. delete_share_token is an unrelated same-file helper, while api/views.py and github_repo/services.py are explicit decoys."
+      "reference_bug": "The stale analysis path is contained in the analysis service rebuild flow; same-file token cleanup and clone helpers are unrelated decoys.",
+      "rationale": "The expected path requires finding the two analysis-service functions while excluding unrelated symbols that share the same file."
+    },
+    {
+      "sample_id": "repo_private_summary_leak",
+      "node_ids": [
+        "api/views.py::get",
+        "auth/permissions.py::can_view"
+      ],
+      "allowed_node_ids": [
+        "api/views.py::SummaryView",
+        "api/views.py::get",
+        "auth/permissions.py::RepoPermission",
+        "auth/permissions.py::can_view"
+      ],
+      "allowed_paths": [
+        "api/views.py",
+        "auth/permissions.py"
+      ],
+      "reference_bug": "SummaryView.get delegates private-repo access to RepoPermission.can_view, whose private check accepts any authenticated user instead of verifying ownership.",
+      "rationale": "The endpoint class/method and permission decision method are required for a first-time contributor to understand where the private summary leak enters and where the bad authorization decision is made."
+    },
+    {
+      "sample_id": "repo_fetch_none_crash",
+      "node_ids": [
+        "github_repo/services.py::fetch_repo_files"
+      ],
+      "allowed_node_ids": [
+        "github_repo/services.py::fetch_repo_files",
+        "github_repo/services.py::github_client_get",
+        "api/services.py::_build_and_store_analysis"
+      ],
+      "allowed_paths": [
+        "github_repo/services.py",
+        "api/services.py"
+      ],
+      "reference_bug": "fetch_repo_files calls response.get(...) even when github_client_get returns None for a missing upstream response.",
+      "rationale": "The crash occurs before parser code runs; parser and graph files are decoys for this issue."
+    },
+    {
+      "sample_id": "repo_graph_private_nodes",
+      "node_ids": [
+        "graph/builders.py::build_dependency_graph"
+      ],
+      "allowed_node_ids": [
+        "graph/builders.py::build_dependency_graph",
+        "graph/builders.py::connect_edges",
+        "api/services.py::_build_and_store_analysis",
+        "parser/services.py::parse_repo",
+        "parser/services.py::extract_symbols"
+      ],
+      "allowed_paths": [
+        "graph/builders.py",
+        "api/services.py",
+        "parser/services.py"
+      ],
+      "reference_bug": "build_dependency_graph filters out underscore-prefixed symbols even though parser output still contains them.",
+      "rationale": "The missing private-helper nodes are caused during graph assembly, not symbol extraction. connect_edges is allowed as investigation context because the user-facing symptom includes disappearing edges into filtered private helpers."
+    },
+    {
+      "sample_id": "repo_graph_label_mismatch",
+      "node_ids": [
+        "graph/builders.py::attach_labels"
+      ],
+      "allowed_node_ids": [
+        "graph/builders.py::attach_labels",
+        "graph/builders.py::build_dependency_graph",
+        "api/services.py::_build_and_store_analysis"
+      ],
+      "allowed_paths": [
+        "graph/builders.py",
+        "api/services.py"
+      ],
+      "reference_bug": "attach_labels assigns each node's file basename as the visual label instead of the node's symbol name.",
+      "rationale": "The origin is label transformation. Graph construction and the analysis caller are allowed only as investigation context to show that symbol data exists before attach_labels ignores it."
+    },
+    {
+      "sample_id": "repo_async_symbols_missing",
+      "node_ids": [
+        "parser/services.py::visit_AsyncFunctionDef"
+      ],
+      "allowed_node_ids": [
+        "parser/services.py::visit_AsyncFunctionDef",
+        "parser/services.py::extract_symbols",
+        "parser/services.py::PythonSymbolCollector",
+        "parser/services.py::visit_FunctionDef",
+        "parser/services.py::parse_repo",
+        "api/services.py::_build_and_store_analysis"
+      ],
+      "allowed_paths": [
+        "parser/services.py",
+        "api/services.py"
+      ],
+      "reference_bug": "PythonSymbolCollector.visit_AsyncFunctionDef returns None, dropping async functions from parser output.",
+      "rationale": "Regular def and class visitors work; the async visitor is the narrow parser origin."
+    },
+    {
+      "sample_id": "repo_issue_cache_stale",
+      "node_ids": [
+        "workers/jobs.py::refresh_issue_cache",
+        "api/services.py::get_repo_analysis"
+      ],
+      "allowed_node_ids": [
+        "workers/jobs.py::refresh_issue_cache",
+        "api/services.py::get_repo_analysis",
+        "workers/jobs.py::close_issue",
+        "parser/cache.py::write_cache",
+        "parser/cache.py::read_cache",
+        "parser/cache.py::invalidate_issue_cache",
+        "parser/cache.py::cache_key",
+        "api/services.py::_build_and_store_analysis"
+      ],
+      "allowed_paths": [
+        "workers/jobs.py",
+        "api/services.py",
+        "parser/cache.py"
+      ],
+      "reference_bug": "refresh_issue_cache writes analysis under issue['id'], while the read path stores and reads analysis by repo id.",
+      "rationale": "The bug is a key mismatch, so the worker writer and API reader are both required to explain the stale result. Cache helpers and close/invalidate paths are allowed investigation nodes because they demonstrate the key contract and related issue-id invalidation path."
+    },
+    {
+      "sample_id": "repo_no_relevant_code",
+      "node_ids": [],
+      "allowed_paths": [],
+      "reference_bug": "No planted bug: the issue has no stack trace, endpoint, repo operation, or reproducible symptom.",
+      "rationale": "A correct harness should search enough to determine that no actionable code node is justified, then return an empty result."
     }
   ]
 }

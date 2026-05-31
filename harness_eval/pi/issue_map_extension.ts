@@ -28,11 +28,16 @@ type ToolCall = {
 const GENERIC_SYMBOLS = new Set(["analysis", "view", "views", "service", "services"]);
 const NEGATIVE_EVIDENCE = [
   "do not inspect",
+  "do not include",
   "don't inspect",
+  "don't include",
   "never enters",
   "never enter",
   "does not enter",
   "not enter",
+  "not part",
+  "should not",
+  "different request",
   "ignore",
   "avoid",
   "unrelated",
@@ -154,21 +159,21 @@ function readRepoFileText(job: IssueMapJob, relativePath: string): string {
 function extractSymbols(relativePath: string, text: string) {
   const symbols: Array<{ node_id: string; path: string; name: string; kind: string; line: number }> = [];
   text.split(/\r?\n/).forEach((line, index) => {
-    const match = line.match(/^\s*(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+    const match = line.match(/^\s*(async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
     if (!match) return;
     symbols.push({
       node_id: `${relativePath}::${match[2]}`,
       path: relativePath,
       name: match[2],
-      kind: match[1] === "def" ? "function" : "class",
+      kind: match[1] === "class" ? "class" : "function",
       line: index + 1,
     });
   });
   return symbols;
 }
 
-function rankRepoSymbols(job: IssueMapJob) {
-  const text = issueText(job);
+function rankRepoSymbols(job: IssueMapJob, query = "") {
+  const text = `${issueText(job)}\n${query}`.toLowerCase();
   const root = repoRoot(job);
   const candidates = listPythonFiles(root).flatMap((relativePath) => {
     const fileText = readRepoFileText(job, relativePath);
@@ -186,6 +191,22 @@ function rankRepoSymbols(job: IssueMapJob) {
   });
   candidates.sort((left, right) => right.score - left.score || left.node_id.localeCompare(right.node_id));
   return candidates;
+}
+
+function validNodeIds(job: IssueMapJob): Set<string> {
+  return new Set(validNodePathMap(job).keys());
+}
+
+function validNodePathMap(job: IssueMapJob): Map<string, string> {
+  if (job.repo?.local_path) {
+    const root = repoRoot(job);
+    return new Map(
+      listPythonFiles(root).flatMap((relativePath) =>
+        extractSymbols(relativePath, readRepoFileText(job, relativePath)).map((symbol) => [symbol.node_id, symbol.path] as [string, string])
+      )
+    );
+  }
+  return new Map((job.artifact?.nodes || []).map((node) => [node.id, node.path]));
 }
 
 const listRepoFiles = defineTool({
@@ -216,7 +237,7 @@ const searchRepoSymbols = defineTool({
   async execute(_toolCallId, params) {
     toolCalls.push({ name: "search_repo_symbols", arguments: params });
     const job = loadJob();
-    const candidates = rankRepoSymbols(job).slice(0, 8);
+    const candidates = rankRepoSymbols(job, String(params.query || "")).slice(0, 12);
     return {
       content: [{ type: "text", text: JSON.stringify({ candidates }) }],
       details: { candidates },
@@ -308,6 +329,35 @@ const loadCodeContext = defineTool({
   },
 });
 
+const searchRepoText = defineTool({
+  name: "search_repo_text",
+  label: "Search Repo Text",
+  description: "Search text across bounded Python files in the provided repository fixture.",
+  promptSnippet: "Search code text for symptoms, log strings, and output keys",
+  parameters: Type.Object({
+    query: Type.String(),
+  }),
+  async execute(_toolCallId, params) {
+    toolCalls.push({ name: "search_repo_text", arguments: params });
+    const job = loadJob();
+    const root = repoRoot(job);
+    const query = String(params.query || "").toLowerCase();
+    const terms = query.split(/[^a-zA-Z0-9_]+/).filter((term) => term.length >= 3);
+    const matches = listPythonFiles(root).flatMap((relativePath) => {
+      const text = readRepoFileText(job, relativePath);
+      return text.split(/\r?\n/).flatMap((line, index) => {
+        const lowered = line.toLowerCase();
+        if (!terms.some((term) => lowered.includes(term))) return [];
+        return [{ path: relativePath, line: index + 1, text: line.trim() }];
+      });
+    }).slice(0, 20);
+    return {
+      content: [{ type: "text", text: JSON.stringify({ matches }) }],
+      details: { matches },
+    };
+  },
+});
+
 const finishIssueMapTranscript = defineTool({
   name: "finish_issue_map_transcript",
   label: "Finish Issue Map Transcript",
@@ -336,36 +386,67 @@ const finishIssueMapTranscript = defineTool({
   async execute(_toolCallId, params) {
     toolCalls.push({ name: "finish_issue_map_transcript", arguments: params });
     const job = loadJob();
-    const allowed = new Map(selectedNodes(job).map((node) => [node.node_id, node]));
-    const selected = new Set(allowed.keys());
-    const hypotheses = params.hypotheses.filter((hypothesis) => selected.has(hypothesis.node_id));
-    const path = params.investigation_path.filter((step) => selected.has(step.node_id));
-    for (const node of allowed.values()) {
-      if (!hypotheses.some((hypothesis) => hypothesis.node_id === node.node_id)) {
-        hypotheses.push({
-          node_id: node.node_id,
-          confidence: Math.min(0.95, Math.max(0.55, node.score)),
-          rationale: "Selected by bounded issue evidence ranking.",
-        });
-      }
-      if (!path.some((step) => step.node_id === node.node_id)) {
-        path.push({
-          node_id: node.node_id,
-          path: node.path,
-          why: "Inspect this bounded candidate selected from issue evidence.",
-        });
-      }
+    const nodePaths = validNodePathMap(job);
+    const valid = new Set(nodePaths.keys());
+    const submittedIds = [
+      ...params.hypotheses.map((hypothesis) => hypothesis.node_id),
+      ...params.investigation_path.map((step) => step.node_id),
+    ];
+    const invalidIds = Array.from(new Set(submittedIds.filter((nodeId) => nodeId && !valid.has(nodeId))));
+    if (invalidIds.length > 0) {
+      const error = {
+        error: "invalid_node_ids",
+        invalid_node_ids: invalidIds,
+        valid_node_id_examples: Array.from(valid).slice(0, 16),
+        instruction: "Retry finish_issue_map_transcript using exact node_id values returned by search_repo_symbols. Do not use file paths or Class.method spellings as node_id values.",
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(error) }],
+        details: error,
+      };
+    }
+    const text = issueText(job);
+    const negatedIds = Array.from(new Set(submittedIds.filter((nodeId) => {
+      if (!nodeId) return false;
+      const symbol = nodeId.includes("::") ? nodeId.split("::").slice(-1)[0] : nodeId;
+      return [nodeId, symbol].some((value) => isNegatedMention(text, value));
+    })));
+    if (negatedIds.length > 0) {
+      const error = {
+        error: "negated_node_ids",
+        negated_node_ids: negatedIds,
+        instruction: "Retry finish_issue_map_transcript without node_id values the issue describes as unrelated, from another request, or not part of this failure.",
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(error) }],
+        details: error,
+      };
+    }
+    const validPaths = new Set(nodePaths.values());
+    const invalidPaths = Array.from(new Set(params.investigation_path.map((step) => step.path).filter((filePath) => filePath && !validPaths.has(filePath))));
+    const mismatchedPaths = params.investigation_path
+      .filter((step) => nodePaths.has(step.node_id) && nodePaths.get(step.node_id) !== step.path)
+      .map((step) => ({ node_id: step.node_id, path: step.path, expected_path: nodePaths.get(step.node_id) }));
+    if (invalidPaths.length > 0 || mismatchedPaths.length > 0) {
+      const error = {
+        error: "invalid_paths",
+        invalid_paths: invalidPaths,
+        mismatched_paths: mismatchedPaths,
+        valid_path_examples: Array.from(validPaths).slice(0, 16),
+        instruction: "Retry finish_issue_map_transcript using exact repository-relative file paths that match each node_id.",
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(error) }],
+        details: error,
+      };
     }
     const transcript = {
       sample_id: job.job_id,
       variant_id: "pi-opencode-kimi-k25-issue-tools",
       tool_calls: toolCalls.filter((call) => call.name !== "finish_issue_map_transcript"),
       final: {
-        hypotheses,
-        investigation_path: path.map((step) => {
-          const node = nodeById(job, step.node_id);
-          return { ...step, path: node?.path || step.path };
-        }),
+        hypotheses: params.hypotheses,
+        investigation_path: params.investigation_path,
         confidence: params.confidence,
       },
     };
@@ -380,6 +461,7 @@ const finishIssueMapTranscript = defineTool({
 export default function (pi: ExtensionAPI) {
   pi.registerTool(listRepoFiles);
   pi.registerTool(searchRepoSymbols);
+  pi.registerTool(searchRepoText);
   pi.registerTool(readRepoFile);
   pi.registerTool(rankIssueCandidates);
   pi.registerTool(loadFocusGraph);

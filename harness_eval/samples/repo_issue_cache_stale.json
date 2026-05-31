@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo_issue_cache_stale",
+  "task": "Analyze the provided Git repository fixture and identify background cache code related to stale issue state.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 208,
+    "title": "Issue badges stay stale after background refresh",
+    "body": "After an issue is closed, the background refresh reports success but the graph still shows stale issue badges on the next read. The job writes analysis under an issue identifier while the read path uses a repository identifier.",
+    "labels": [{"name": "cache"}, {"name": "worker"}],
+    "comments": [
+      {
+        "id": 28,
+        "body": "The frontend only displays cached backend data."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_issue_cache_stale",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "search_repo_text", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["workers/jobs.py", "parser/cache.py", "api/services.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["workers/jobs.py::refresh_issue_cache", "api/services.py::get_repo_analysis"],
+    "allowed_node_ids": ["workers/jobs.py::refresh_issue_cache", "api/services.py::get_repo_analysis", "workers/jobs.py::close_issue", "parser/cache.py::write_cache", "parser/cache.py::read_cache", "parser/cache.py::invalidate_issue_cache", "parser/cache.py::cache_key", "api/services.py::_build_and_store_analysis"],
+    "allowed_paths": ["workers/jobs.py", "api/services.py", "parser/cache.py"]
+  }
+}

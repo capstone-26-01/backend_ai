@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo_graph_private_nodes",
+  "task": "Analyze the provided Git repository fixture and identify graph construction code related to missing private helper nodes.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/issue_locator_repo",
+    "language": "python"
+  },
+  "issue": {
+    "number": 205,
+    "title": "Graph overview hides underscore-prefixed helper functions",
+    "body": "The graph contains public functions but drops private helper functions, so edges into private build helpers disappear from the overview. The parser output still contains those symbols.",
+    "labels": [{"name": "graph"}, {"name": "analysis"}],
+    "comments": [
+      {
+        "id": 25,
+        "body": "This is not a parser extraction problem; it happens when the dependency graph is assembled."
+      }
+    ]
+  },
+  "tools": [
+    {"name": "list_repo_files", "description": "List bounded Python files in the provided repository."},
+    {"name": "search_repo_symbols", "description": "Search Python functions/classes in the repository and rank them against issue evidence."},
+    {"name": "search_repo_text", "description": "Search code text for symptoms and output strings."},
+    {"name": "read_repo_file", "description": "Read bounded Python file contents from the repository."}
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_graph_private_nodes",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "search_repo_text", "read_repo_file"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_read_paths": ["graph/builders.py"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["graph/builders.py::build_dependency_graph"],
+    "allowed_node_ids": ["graph/builders.py::build_dependency_graph", "graph/builders.py::connect_edges", "api/services.py::_build_and_store_analysis", "parser/services.py::parse_repo", "parser/services.py::extract_symbols"],
+    "allowed_paths": ["graph/builders.py", "api/services.py", "parser/services.py"]
+  }
+}

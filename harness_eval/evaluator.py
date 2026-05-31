@@ -67,7 +67,8 @@ def validate_golden_alignment(samples_root: str | Path, golden_path: str | Path)
         if not isinstance(golden, Mapping):
             continue
         checks.append(CheckResult(f'{sample_id}_node_ids', list(expect.get('node_ids') or []) == list(golden.get('node_ids') or []), 'expect.node_ids must match judge consensus'))
-        checks.append(CheckResult(f'{sample_id}_allowed_node_ids', list(expect.get('allowed_node_ids') or []) == list(golden.get('node_ids') or []), 'expect.allowed_node_ids must match judge consensus node ids'))
+        golden_allowed_node_ids = list(golden.get('allowed_node_ids') or golden.get('node_ids') or [])
+        checks.append(CheckResult(f'{sample_id}_allowed_node_ids', list(expect.get('allowed_node_ids') or []) == golden_allowed_node_ids, 'expect.allowed_node_ids must match judge consensus allowed node ids'))
         checks.append(CheckResult(f'{sample_id}_allowed_paths', list(expect.get('allowed_paths') or []) == list(golden.get('allowed_paths') or []), 'expect.allowed_paths must match judge consensus'))
     if not checks:
         checks.append(CheckResult('golden_refs_present', False, 'at least one sample must reference a golden consensus'))
@@ -87,10 +88,18 @@ def validate_sample(sample: Mapping[str, Any]) -> list[CheckResult]:
         CheckResult('expect', isinstance(sample.get('expect'), Mapping), 'expect object is required'),
     ]
     expect = sample.get('expect') if isinstance(sample.get('expect'), Mapping) else {}
+    if has_repo:
+        checks.extend(
+            [
+                CheckResult('repo_golden_ref', isinstance(expect.get('golden_ref'), str) and bool(expect.get('golden_ref')), 'repo samples must reference a golden consensus entry'),
+                CheckResult('repo_required_tool_order', isinstance(expect.get('required_tool_order'), list), 'repo samples must declare required tool order'),
+                CheckResult('repo_required_read_paths', isinstance(expect.get('required_read_paths'), list), 'repo samples must declare required read paths'),
+            ]
+        )
     checks.extend(
         [
-            CheckResult('expected_node_ids', isinstance(expect.get('node_ids'), list) and bool(expect.get('node_ids')), 'expect.node_ids must be a non-empty list'),
-            CheckResult('allowed_paths', isinstance(expect.get('allowed_paths'), list) and bool(expect.get('allowed_paths')), 'expect.allowed_paths must be a non-empty list'),
+            CheckResult('expected_node_ids', isinstance(expect.get('node_ids'), list) and (bool(expect.get('node_ids')) or bool(expect.get('allow_empty'))), 'expect.node_ids must be a non-empty list unless allow_empty is true'),
+            CheckResult('allowed_paths', isinstance(expect.get('allowed_paths'), list) and (bool(expect.get('allowed_paths')) or bool(expect.get('allow_empty'))), 'expect.allowed_paths must be a non-empty list unless allow_empty is true'),
         ]
     )
     return checks
@@ -145,6 +154,53 @@ def _tool_names(transcript: Mapping[str, Any]) -> list[str]:
     return result
 
 
+def _final_list(final: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+    value = final.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _tool_paths(transcript: Mapping[str, Any], tool_name: str) -> set[str]:
+    paths = set()
+    for call in transcript.get('tool_calls') or []:
+        if not isinstance(call, Mapping) or call.get('name') != tool_name:
+            continue
+        arguments = call.get('arguments')
+        if isinstance(arguments, Mapping):
+            path = arguments.get('path')
+            if isinstance(path, str) and path:
+                paths.add(path)
+            for value in arguments.get('paths') or []:
+                if isinstance(value, str) and value:
+                    paths.add(value)
+    return paths
+
+
+def _is_ordered_subsequence(expected: list[str], actual: list[str]) -> bool:
+    if not expected:
+        return True
+    position = 0
+    for item in actual:
+        if item == expected[position]:
+            position += 1
+            if position == len(expected):
+                return True
+    return False
+
+
+def _is_first_use_order(expected: list[str], actual: list[str]) -> bool:
+    if not expected:
+        return True
+    positions = []
+    for tool_name in expected:
+        try:
+            positions.append(actual.index(tool_name))
+        except ValueError:
+            return False
+    return positions == sorted(positions) and positions[0] == 0
+
+
 def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]) -> dict[str, Any]:
     expect = sample.get('expect') if isinstance(sample.get('expect'), Mapping) else {}
     final = transcript.get('final') if isinstance(transcript.get('final'), Mapping) else {}
@@ -154,15 +210,38 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
     expected_nodes = set(expect.get('node_ids') or [])
     allowed_nodes = set(expect.get('allowed_node_ids') or expected_nodes)
     allowed_paths = set(expect.get('allowed_paths') or [])
+    required_read_paths = set(expect.get('required_read_paths') or [])
+    required_tool_order = [str(value) for value in expect.get('required_tool_order') or [] if isinstance(value, str)]
 
+    hypotheses = _final_list(final, 'hypotheses')
+    investigation_path = _final_list(final, 'investigation_path')
+    path_nodes = {str(step.get('node_id')) for step in investigation_path if isinstance(step.get('node_id'), str)}
+    expected_node_paths = {node_id: node_id.split('::', 1)[0] for node_id in expected_nodes if '::' in node_id}
+    path_pairs = {
+        (str(step.get('node_id')), str(step.get('path')))
+        for step in investigation_path
+        if isinstance(step.get('node_id'), str) and isinstance(step.get('path'), str)
+    }
     found_nodes = {str(value) for value in _collect_values(final, 'node_id') if isinstance(value, str)}
     found_paths = {str(value) for value in _collect_values(final, 'path') if isinstance(value, str) and value}
-    confidence_values = [value for value in _collect_values(final, 'score') if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    read_paths = _tool_paths(transcript, 'read_repo_file')
+    confidence_values = [
+        value
+        for key in ('score', 'confidence')
+        for value in _collect_values(final, key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
     checks = [
         CheckResult('sample_id', transcript.get('sample_id') == sample.get('id'), 'transcript sample_id must match sample id'),
+        CheckResult('final_shape', isinstance(final.get('hypotheses'), list) and isinstance(final.get('investigation_path'), list) and isinstance(final.get('confidence'), Mapping), 'final must contain hypotheses list, investigation_path list, and confidence object'),
         CheckResult('required_tools', required_tools.issubset(set(tool_names)), 'all required tools must be called'),
+        CheckResult('required_tool_order', _is_ordered_subsequence(required_tool_order, tool_names), 'required tools must be called in the expected order'),
+        CheckResult('required_tool_first_use_order', _is_first_use_order(required_tool_order, tool_names), 'required tools must appear in first-use order starting with the first required tool'),
+        CheckResult('required_read_paths', required_read_paths.issubset(read_paths), 'required repo files must be read by the harness'),
         CheckResult('forbidden_tools', not (forbidden_tools & set(tool_names)), 'forbidden tools must not be called'),
         CheckResult('expected_nodes', expected_nodes.issubset(found_nodes), 'final output must include expected node ids'),
+        CheckResult('expected_investigation_nodes', expected_nodes.issubset(path_nodes), 'investigation_path must include every expected node id'),
+        CheckResult('expected_investigation_paths', all((node_id, expected_path) in path_pairs for node_id, expected_path in expected_node_paths.items()), 'investigation_path must include exact file paths for every expected node id'),
         CheckResult('node_allowlist', found_nodes.issubset(allowed_nodes), 'final output node ids must stay within sample allowlist'),
         CheckResult('path_allowlist', found_paths.issubset(allowed_paths), 'final output paths must stay within sample allowlist'),
         CheckResult('confidence_range', all(0.0 <= float(value) <= 1.0 for value in confidence_values), 'confidence scores must be in [0, 1]'),
@@ -175,6 +254,7 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
         'score': round(sum(1 for check in checks if check.passed) / len(checks), 3),
         'checks': [check.__dict__ for check in checks],
         'tool_calls': tool_names,
+        'read_paths': sorted(read_paths),
         'found_node_ids': sorted(found_nodes),
         'found_paths': sorted(found_paths),
     }
