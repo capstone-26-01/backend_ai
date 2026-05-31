@@ -213,12 +213,29 @@ def _response_error_body(response: Any) -> str:
     return text[:MAX_GITHUB_ERROR_BODY_CHARS]
 
 
-def _github_error_from_response(response: Any, repo_path: str) -> GithubIssueApiError:
+def _github_error_from_response(
+    response: Any,
+    repo_path: str,
+    *,
+    resource: str = 'repository',
+    issue_number: int | None = None,
+) -> GithubIssueApiError:
     upstream_status = int(getattr(response, 'status_code', 0) or 0)
     rate_limit = _github_rate_limit(response)
     metadata = {'repo': repo_path, 'response_body': _response_error_body(response)}
+    if issue_number is not None:
+        metadata['issue_number'] = issue_number
 
     if upstream_status == 404:
+        if resource in {'issue', 'comments'}:
+            return GithubIssueApiError(
+                'issue_not_found',
+                'Issue를 찾을 수 없습니다.',
+                status_code=404,
+                upstream_status=upstream_status,
+                metadata=metadata,
+                rate_limit=rate_limit,
+            )
         return GithubIssueApiError(
             'repo_not_found',
             '레포를 찾을 수 없거나 private repository입니다.',
@@ -255,7 +272,14 @@ def _github_error_from_response(response: Any, repo_path: str) -> GithubIssueApi
     )
 
 
-def _github_get_json(path: str, *, repo_path: str, params: dict[str, Any] | None = None) -> tuple[Any, Any]:
+def _github_get_json(
+    path: str,
+    *,
+    repo_path: str,
+    params: dict[str, Any] | None = None,
+    resource: str = 'repository',
+    issue_number: int | None = None,
+) -> tuple[Any, Any]:
     url = f'{_github_api_base_url()}{path}'
     try:
         response = requests.get(url, headers=_github_headers(), params=params, timeout=_github_api_timeout())
@@ -268,7 +292,7 @@ def _github_get_json(path: str, *, repo_path: str, params: dict[str, Any] | None
         ) from exc
 
     if not getattr(response, 'ok', False):
-        raise _github_error_from_response(response, repo_path)
+        raise _github_error_from_response(response, repo_path, resource=resource, issue_number=issue_number)
 
     try:
         payload = response.json()
@@ -290,6 +314,33 @@ def fetch_github_issue_list_page(repo_path: str, *, page: int = 1, per_page: int
         f'/repos/{owner}/{repo}/issues',
         repo_path=repo_path,
         params={'state': state, 'page': page, 'per_page': per_page},
+    )
+
+
+def fetch_github_issue_detail(repo_path: str, issue_number: int) -> tuple[Any, Any]:
+    owner, repo = _repo_parts(repo_path)
+    return _github_get_json(
+        f'/repos/{owner}/{repo}/issues/{issue_number}',
+        repo_path=repo_path,
+        resource='issue',
+        issue_number=issue_number,
+    )
+
+
+def fetch_github_issue_comments_page(
+    repo_path: str,
+    issue_number: int,
+    *,
+    page: int = 1,
+    per_page: int = 30,
+) -> tuple[Any, Any]:
+    owner, repo = _repo_parts(repo_path)
+    return _github_get_json(
+        f'/repos/{owner}/{repo}/issues/{issue_number}/comments',
+        repo_path=repo_path,
+        params={'page': page, 'per_page': per_page},
+        resource='comments',
+        issue_number=issue_number,
     )
 
 
@@ -374,6 +425,77 @@ def normalize_github_issue(repo_path: str, issue: Any) -> dict[str, Any]:
         'locked': bool(issue.get('locked')),
         'is_pull_request': isinstance(issue.get('pull_request'), dict),
     }
+
+
+def normalize_github_issue_comment(comment: Any) -> dict[str, Any]:
+    if not isinstance(comment, dict):
+        raise GithubIssueApiError(
+            'github_issue_api_error',
+            'GitHub issue comment API 응답 형식이 올바르지 않습니다.',
+            status_code=502,
+            metadata={'payload_type': type(comment).__name__},
+        )
+    return {
+        'id': _int(comment.get('id')),
+        'author': _normalize_github_user(comment.get('user')),
+        'body': _string(comment.get('body')),
+        'created_at': _string(comment.get('created_at')),
+        'updated_at': _string(comment.get('updated_at')),
+        'html_url': _string(comment.get('html_url')),
+    }
+
+
+def get_github_issue_detail_response(repo_path: str, issue_number: int) -> dict[str, Any]:
+    payload, _response = fetch_github_issue_detail(repo_path, issue_number)
+    if not isinstance(payload, dict):
+        raise GithubIssueApiError(
+            'github_issue_api_error',
+            'GitHub issue API 응답 형식이 올바르지 않습니다.',
+            status_code=502,
+            metadata={'repo': repo_path, 'issue_number': issue_number, 'payload_type': type(payload).__name__},
+        )
+    if _issue_is_pull_request(payload):
+        raise GithubIssueApiError(
+            'issue_not_found',
+            'Pull Request는 issue map 대상으로 지원하지 않습니다.',
+            status_code=404,
+            metadata={'repo': repo_path, 'issue_number': issue_number},
+        )
+    issue = normalize_github_issue(repo_path, payload)
+    issue['body'] = _string(payload.get('body'))
+    return issue
+
+
+def get_github_issue_comments_response(
+    repo_path: str,
+    issue_number: int,
+    *,
+    max_comments: int = 20,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    max_comments = max(0, min(max_comments, 100))
+    if max_comments == 0:
+        return [], []
+
+    payload, response = fetch_github_issue_comments_page(repo_path, issue_number, page=1, per_page=max_comments)
+    if not isinstance(payload, list):
+        raise GithubIssueApiError(
+            'github_issue_api_error',
+            'GitHub issue comment API 응답 형식이 올바르지 않습니다.',
+            status_code=502,
+            metadata={'repo': repo_path, 'issue_number': issue_number, 'payload_type': type(payload).__name__},
+            rate_limit=_github_rate_limit(response),
+        )
+    comments = [normalize_github_issue_comment(comment) for comment in payload[:max_comments]]
+    warnings = []
+    if _has_next_page(response):
+        warnings.append(
+            {
+                'code': 'github_comments_truncated',
+                'message': 'GitHub issue comment가 max_comments 한도를 초과해 일부만 사용했습니다.',
+                'max_comments': max_comments,
+            }
+        )
+    return comments, warnings
 
 
 def _issue_is_pull_request(issue: Any) -> bool:
