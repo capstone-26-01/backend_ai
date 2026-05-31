@@ -940,6 +940,18 @@ class IssueMapRankingEvalTests(TestCase):
                 self.assertEqual(candidates_by_case[case.name][0]['node_id'], case.expected_top_node_id)
 
 
+class IssueMapDeferredPiDesignTests(TestCase):
+    def test_deferred_pi_sidecar_doc_keeps_pi_out_of_mvp_request_path(self):
+        text = (settings.BASE_DIR / 'docs' / 'issue_map_pi_sidecar_design.txt').read_text(encoding='utf-8')
+
+        self.assertIn('deferred design only', text)
+        self.assertIn('@earendil-works/pi-coding-agent', text)
+        self.assertIn('must not replace the deterministic ranking path', text)
+        self.assertIn('filesystem access', text)
+        self.assertIn('network access', text)
+        self.assertIn('Tests mock the sidecar and never call a live model', text)
+
+
 class GraphArtifactContractTests(TestCase):
     def _legacy_graph(self):
         return {
