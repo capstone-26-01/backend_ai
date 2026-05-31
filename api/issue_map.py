@@ -5,6 +5,7 @@ from typing import Any, cast
 import os
 import re
 
+from api.readme_svg import select_overview_cards
 from llm.context_selection import identifier_tokens, score_nodes
 
 
@@ -449,3 +450,60 @@ def rank_issue_candidates(
             }
         )
     return candidates, warnings
+
+
+def _edge_source(edge: Mapping[str, Any]) -> str:
+    return _string(edge.get('source'))
+
+
+def _edge_target(edge: Mapping[str, Any]) -> str:
+    return _string(edge.get('target'))
+
+
+def _edge_kind(edge: Mapping[str, Any]) -> str:
+    return _string(edge.get('kind') or edge.get('type'))
+
+
+def _display_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'source': _edge_source(edge),
+        'target': _edge_target(edge),
+        'type': _edge_kind(edge),
+        'metadata': dict(edge.get('metadata') or {}),
+    }
+
+
+def build_overview_graph_projection(
+    analysis: Mapping[str, Any],
+    *,
+    node_limit: int = 80,
+) -> dict[str, Any]:
+    nodes_by_id = _nodes_by_id(analysis)
+    edges = [cast(Mapping[str, Any], edge) for edge in analysis.get('edges', []) if isinstance(edge, Mapping)]
+    entrypoints = [cast(Mapping[str, Any], item) for item in analysis.get('entrypoints', []) if isinstance(item, Mapping)]
+    key_modules = [cast(Mapping[str, Any], item) for item in analysis.get('key_modules', []) if isinstance(item, Mapping)]
+    cards, scores = select_overview_cards(nodes_by_id, edges, entrypoints, key_modules, node_limit=node_limit)
+    selected_ids = [
+        str(card.get('node_id'))
+        for card in cards
+        if card.get('node_id') in nodes_by_id
+    ]
+    selected_set = set(selected_ids)
+    selected_edges = [
+        _display_edge(edge)
+        for edge in edges
+        if _edge_source(edge) in selected_set and _edge_target(edge) in selected_set
+    ]
+    return {
+        'nodes': [
+            {
+                **_display_node(nodes_by_id[node_id]),
+                'overview_category': next((str(card.get('category')) for card in cards if card.get('node_id') == node_id), ''),
+                'overview_score': scores.get(node_id, 0),
+            }
+            for node_id in selected_ids
+        ],
+        'edges': selected_edges,
+        'node_ids': selected_ids,
+        'limits': {'node_limit': node_limit, 'node_count': len(selected_ids), 'edge_count': len(selected_edges)},
+    }
