@@ -596,3 +596,104 @@ def build_focus_graph_projection(
         },
     }
     return focus_graph, selected_node_ids, warnings
+
+
+def _node_window(node: Mapping[str, Any], total_lines: int, *, padding: int = 3) -> tuple[int, int] | None:
+    start, end = _node_line_range(node)
+    if start is None or end is None or total_lines < 1:
+        return None
+    return max(1, start - padding), min(total_lines, end + padding)
+
+
+def _format_window(lines: list[str], start: int, end: int) -> str:
+    return '\n'.join(f'{line_number:>4}: {lines[line_number - 1]}' for line_number in range(start, end + 1))
+
+
+def build_code_context(
+    analysis: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    max_context_files: int = 4,
+    max_context_chars: int = 12000,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    warnings: list[dict[str, Any]] = []
+    max_context_files = max(1, min(max_context_files, 10))
+    max_context_chars = max(1000, min(max_context_chars, 40000))
+    nodes_by_id = _nodes_by_id(analysis)
+    file_contents = analysis.get('file_contents')
+    if not isinstance(file_contents, Mapping):
+        file_contents = {}
+
+    files: list[str] = []
+    nodes_by_file: dict[str, list[Mapping[str, Any]]] = {}
+    for candidate in candidates:
+        node_id = str(candidate.get('node_id'))
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            continue
+        path = _node_path(node)
+        if not path or path not in file_contents:
+            continue
+        if path not in files:
+            files.append(path)
+        nodes_by_file.setdefault(path, []).append(node)
+        if len(files) >= max_context_files:
+            break
+
+    used_chars = 0
+    truncated = False
+    context_files: list[dict[str, Any]] = []
+    for path in files:
+        code = _string(file_contents.get(path))
+        lines = code.splitlines()
+        windows = [
+            window
+            for node in nodes_by_file.get(path, [])
+            if (window := _node_window(node, len(lines))) is not None
+        ]
+        if windows:
+            excerpts = []
+            for start, end in sorted(set(windows)):
+                excerpts.append({'start_line': start, 'end_line': end, 'text': _format_window(lines, start, end)})
+        else:
+            excerpts = [{'start_line': 1, 'end_line': min(len(lines), 80), 'text': '\n'.join(lines[:80])}]
+
+        file_text = '\n\n'.join(excerpt['text'] for excerpt in excerpts)
+        remaining = max_context_chars - used_chars
+        if remaining <= 0:
+            truncated = True
+            break
+        file_truncated = len(file_text) > remaining
+        if file_truncated:
+            file_text = file_text[:remaining]
+            truncated = True
+        used_chars += len(file_text)
+        context_files.append(
+            {
+                'path': path,
+                'node_ids': [_node_id(node) for node in nodes_by_file.get(path, []) if _node_id(node)],
+                'excerpts': excerpts,
+                'text': file_text,
+                'truncated': file_truncated,
+            }
+        )
+        if used_chars >= max_context_chars:
+            truncated = True
+            break
+
+    if truncated or len(files) > len(context_files):
+        warnings.append(
+            {
+                'code': 'code_context_truncated',
+                'message': 'Code context가 설정된 파일/문자 한도 내로 잘렸습니다.',
+                'max_context_files': max_context_files,
+                'max_context_chars': max_context_chars,
+            }
+        )
+    return {
+        'files': context_files,
+        'file_count': len(context_files),
+        'max_context_files': max_context_files,
+        'max_context_chars': max_context_chars,
+        'truncated': bool(truncated),
+    }, warnings
