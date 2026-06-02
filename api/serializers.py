@@ -6,7 +6,7 @@ import re
 
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
-GRAPH_ID_PATTERN = re.compile(r'^[A-Za-z0-9_./:-]+$')
+GRAPH_ID_UNSAFE_PATTERN = re.compile(r'[\x00-\x1f\x7f\\]')
 SHARE_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
 UNSAFE_REF_PATTERN = re.compile(r'[\s\\~^:?*\[\]\x00-\x1f]')
 
@@ -32,7 +32,9 @@ def is_safe_ref(ref: str) -> bool:
 
 
 def is_safe_graph_id(graph_id: str) -> bool:
-    if not graph_id or len(graph_id) > 512 or GRAPH_ID_PATTERN.fullmatch(graph_id) is None:
+    if not graph_id or len(graph_id) > 2048 or GRAPH_ID_UNSAFE_PATTERN.search(graph_id):
+        return False
+    if graph_id.startswith('/'):
         return False
     normalized_parts = graph_id.replace('::', '/').split('/')
     return all(part not in {'', '.', '..'} for part in normalized_parts)

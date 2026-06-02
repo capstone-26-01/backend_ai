@@ -171,8 +171,12 @@ class RepoUrlSerializerTests(TestCase):
     def test_graph_id_validator_allows_symbol_ids_but_rejects_path_escape(self):
         self.assertTrue(is_safe_graph_id('pkg/app.py::Worker::run'))
         self.assertTrue(is_safe_graph_id('module::pkg.app'))
+        self.assertTrue(is_safe_graph_id('pkg/@generated/app.py::main'))
+        self.assertTrue(is_safe_graph_id('한글/모듈.py::처리'))
         self.assertFalse(is_safe_graph_id('../pkg/app.py::run'))
-        self.assertFalse(is_safe_graph_id('pkg/app.py::bad id'))
+        self.assertFalse(is_safe_graph_id('/pkg/app.py::run'))
+        self.assertFalse(is_safe_graph_id('pkg\\app.py::run'))
+        self.assertFalse(is_safe_graph_id('pkg/app.py::bad\nid'))
 
     def test_share_id_validator_accepts_urlsafe_tokens_only(self):
         self.assertTrue(is_safe_share_id('abcdefghijklmnopqrstuvwxyz_123456'))
@@ -518,6 +522,22 @@ class ParserGraphTests(TestCase):
 
         self.assertIn('app.py::route', node_ids)
         self.assertIn('app.py::User::name', node_ids)
+
+    def test_parse_repo_emits_graph_ids_with_at_sign_paths_and_unicode_symbols(self):
+        files = ['pkg/@generated/모듈.py']
+        file_contents = {
+            'pkg/@generated/모듈.py': (
+                'def 처리():\n'
+                '    return "ok"\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path])
+        node_ids = {node['id'] for node in graph['nodes']}
+
+        self.assertIn('pkg/@generated/모듈.py', node_ids)
+        self.assertIn('module::pkg.@generated.모듈', node_ids)
+        self.assertIn('pkg/@generated/모듈.py::처리', node_ids)
 
     def test_parse_repo_does_not_resolve_non_self_attribute_calls_to_local_functions(self):
         files = ['app.py']
@@ -2586,12 +2606,17 @@ class SummaryEndpointTests(TestCase):
                     {'id': 'pkg/app.py', 'type': 'file', 'label': 'app.py', 'file': 'pkg/app.py'},
                     {'id': 'module::pkg.app', 'type': 'module', 'label': 'pkg.app', 'file': 'pkg/app.py'},
                     {'id': 'pkg/app.py::main', 'type': 'function', 'label': 'main', 'file': 'pkg/app.py', 'start_line': 1, 'end_line': 2},
+                    {'id': 'pkg/@generated/모듈.py', 'type': 'file', 'label': '모듈.py', 'file': 'pkg/@generated/모듈.py'},
+                    {'id': 'pkg/@generated/모듈.py::처리', 'type': 'function', 'label': '처리', 'file': 'pkg/@generated/모듈.py', 'start_line': 1, 'end_line': 2},
                 ],
                 'edges': [
                     {'id': 'e1', 'type': 'contains', 'source': 'module::pkg.app', 'target': 'pkg/app.py::main', 'file': 'pkg/app.py'},
                 ],
             },
-            file_contents={'pkg/app.py': 'def main():\n    return "ok"\n'},
+            file_contents={
+                'pkg/app.py': 'def main():\n    return "ok"\n',
+                'pkg/@generated/모듈.py': 'def 처리():\n    return "ok"\n',
+            },
             entrypoints=[{'id': 'pkg/app.py::main', 'kind': 'main_function', 'path': 'pkg/app.py'}],
             key_modules=[{'id': 'module::pkg.app', 'path': 'pkg/app.py', 'score': 10}],
         )
@@ -2670,6 +2695,29 @@ class SummaryEndpointTests(TestCase):
         self.assertEqual(summary['target_id'], 'pkg/app.py::main')
         self.assertIn('pkg/app.py::main', summary['source_nodes'])
         self.assertIn('pkg/app.py', summary['source_files'])
+
+    @patch('llm.summaries._generate_answer')
+    def test_node_summary_endpoint_accepts_graph_id_with_at_sign_path(self, generate_answer):
+        generate_answer.return_value = '처리 함수 설명입니다.'
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/node-summary/',
+                {
+                    'analysis_id': self.analysis_run.id,
+                    'node_id': 'pkg/@generated/모듈.py::처리',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        summary = cast(dict[str, object], payload['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(summary['kind'], 'node')
+        self.assertEqual(summary['target_id'], 'pkg/@generated/모듈.py::처리')
+        self.assertIn('pkg/@generated/모듈.py::처리', summary['source_nodes'])
+        self.assertIn('pkg/@generated/모듈.py', summary['source_files'])
 
     @patch('llm.summaries._generate_answer')
     def test_node_summary_endpoint_can_explain_file_node(self, generate_answer):
