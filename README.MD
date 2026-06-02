@@ -3,6 +3,111 @@
 Backend service for analyzing public GitHub Python repositories and turning them
 into graph, tree, issue, summary, and QA payloads for the frontend.
 
+## Backend Runtime Structure
+
+```mermaid
+flowchart LR
+  F[Frontend] --> E[API endpoints<br/>analysis tree graph repo<br/>issues related-nodes<br/>summary node-summary qa<br/>diff share svg embed]
+  E --> V[api.views<br/>DRF handlers]
+  V --> S[api.serializers<br/>URL revision id validation]
+  S --> A[api.services<br/>analysis cache response orchestration]
+
+  subgraph G[Repository and issue clients]
+    Git[github_repo.services<br/>git clone fetch reset ls-tree show] --> Local[(playground<br/>local checkout)]
+    IssuesClient[github_repo.services<br/>GitHub issue REST client] --> IssueData[open issues<br/>detail comments]
+  end
+
+  subgraph P[Parser artifacts and storage]
+    Snapshot[revision-pinned file snapshot] --> Parser[parser.services<br/>tree-sitter Python<br/>tree nodes edges entrypoints key modules]
+    Parser --> Artifact[api.artifacts<br/>graph-artifact.v1<br/>file_contents warnings summaries]
+    Artifact --> DB[(Django DB<br/>Repository AnalysisRun AnalysisArtifact ShareLink)]
+    Artifact --> Cache[(temp/analysis<br/>graph.json cache)]
+  end
+
+  A --> Git
+  Git --> Snapshot
+  A --> IssuesClient
+  A --> DB
+
+  subgraph L[LLM and issue mapping]
+    DB --> Context[llm.context_selection<br/>rank nodes files<br/>bounded code context]
+    Context --> QA[llm.services<br/>QA answers]
+    DB --> Summary[llm.summaries<br/>repo onboarding node summaries]
+    IssueData --> IssueMap[api.issue_map<br/>evidence extraction<br/>deterministic node ranking]
+    DB --> IssueMap
+    IssueMap --> Explain[llm.issue_explanation<br/>bounded issue explanation]
+  end
+
+  subgraph O[Runtime outputs]
+    DB --> GraphOut[analysis tree graph responses]
+    QA --> QAOut[QA with citations]
+    Summary --> SummaryOut[cached summary responses]
+    IssueMap --> IssueOut[related nodes<br/>overview focus graphs<br/>code context hypotheses]
+    Explain --> IssueOut
+    DB --> Diff[api.diff<br/>revision graph diff]
+    DB --> Share[share links<br/>public graph payload]
+    Share --> Svg[api.readme_svg<br/>README-safe SVG]
+    Share --> Embed[share detail and embed]
+  end
+
+  GraphOut --> F
+  QAOut --> F
+  SummaryOut --> F
+  IssueOut --> F
+  Diff --> F
+  Svg --> F
+  Embed --> F
+```
+
+## Evaluation Harness Structure
+
+```mermaid
+flowchart LR
+  subgraph Inputs["Harness inputs"]
+    Samples["samples/*.json<br/>issue jobs plus hidden expect"]
+    Golden["golden/repo_issue_consensus.json<br/>hidden repo-fixture consensus"]
+    Matrix["harness_matrix.sample.json<br/>variant grid"]
+  end
+
+  Runner["runner.py CLI<br/>validate, render-job, run-harness,<br/>evaluate-transcript, dry-run-matrix"]
+  Job["Stripped job packet<br/>visible issue, repo or artifact only"]
+  SUT["Black-box SUT command<br/>fake harness or external runner"]
+  PiRunner["pi_runner.py<br/>Pi adapter, live opt-in"]
+  Live["OpenCode Zen live path<br/>smoke, sample, or Pi run<br/>opt-in only"]
+
+  subgraph Tools["Bounded Pi tools and fixtures"]
+    ArtifactTools["Artifact tools<br/>rank_issue_candidates<br/>load_focus_graph<br/>load_code_context"]
+    RepoTools["Repo fixture tools<br/>list_repo_files<br/>search_repo_symbols<br/>search_repo_text<br/>read_repo_file"]
+    Fixtures["fixtures/repos/*<br/>local Python repos"]
+    Finish["finish_issue_map_transcript<br/>terminating transcript tool"]
+  end
+
+  Transcript["Transcript JSON<br/>sample_id, tool_calls, final"]
+  Evaluator["evaluator.py<br/>deterministic scorer"]
+  Checks["Checks<br/>required tools and order<br/>required file reads<br/>forbidden tools<br/>node and path allowlists<br/>investigation paths<br/>confidence range"]
+  Report["Report JSON<br/>passed, score, checks,<br/>latency, optional temp output"]
+
+  Samples --> Runner
+  Matrix --> Runner
+  Runner -->|"build_job_packet strips expect"| Job
+  Job --> SUT
+  Job -. live opt-in .-> PiRunner
+  PiRunner -.-> Live
+  PiRunner --> ArtifactTools
+  PiRunner --> RepoTools
+  ArtifactTools --> Finish
+  RepoTools --> Fixtures
+  RepoTools --> Finish
+  Finish --> Transcript
+  SUT --> Transcript
+  Samples -->|"hidden expect only"| Evaluator
+  Golden -->|"golden refs only"| Evaluator
+  Transcript --> Evaluator
+  Evaluator --> Checks
+  Checks --> Report
+  Live -. metadata correlation .-> Report
+```
+
 The core product flow is:
 
 1. A user submits a public GitHub repository URL.
