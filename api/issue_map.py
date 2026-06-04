@@ -783,7 +783,7 @@ def _sanitize_llm_hypotheses(
         confidence = _float_in_range(item.get('confidence'), default=0.5)
         rationale = _inert_text(item.get('rationale') or item.get('reason') or '', max_chars=800)
         if not rationale:
-            rationale = 'LLM explanation did not include a usable rationale.'
+            rationale = 'Explanation output did not include a usable rationale.'
             rewritten += 1
         result.append(
             {
@@ -845,6 +845,8 @@ def _sanitize_llm_investigation_path(
 def _sanitize_llm_confidence(
     value: Any,
     fallback: dict[str, Any],
+    *,
+    source: str = 'llm',
 ) -> tuple[dict[str, Any], int, int]:
     if not isinstance(value, Mapping):
         return fallback, 1, 0
@@ -872,7 +874,7 @@ def _sanitize_llm_confidence(
             'score': score,
             'reasons': reasons,
             'warning_codes': list(fallback.get('warning_codes') or []),
-            'source': 'llm',
+            'source': source,
         },
         0,
         rewritten,
@@ -887,6 +889,7 @@ def sanitize_issue_explanation_output(
     fallback_hypotheses: list[dict[str, Any]],
     fallback_investigation_path: list[dict[str, Any]],
     fallback_confidence: dict[str, Any],
+    source: str = 'llm',
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     node_paths = _focus_node_paths(focus_graph)
     allowed_paths = _allowed_explanation_paths(focus_graph, code_context)
@@ -906,6 +909,7 @@ def sanitize_issue_explanation_output(
     confidence, dropped_confidence, rewritten_confidence = _sanitize_llm_confidence(
         output.get('confidence'),
         fallback_confidence,
+        source=source,
     )
 
     dropped = dropped_hypotheses + dropped_steps + dropped_confidence
@@ -914,7 +918,7 @@ def sanitize_issue_explanation_output(
         warnings.append(
             {
                 'code': 'llm_output_sanitized',
-                'message': 'LLM explanation에서 허용되지 않은 node/path 또는 잘못된 필드를 제거하거나 보정했습니다.',
+                'message': 'Issue explanation에서 허용되지 않은 node/path 또는 잘못된 필드를 제거하거나 보정했습니다.',
                 'dropped_items': dropped,
                 'rewritten_items': rewritten,
             }

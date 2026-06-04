@@ -1,75 +1,121 @@
-Deferred Pi SDK Sidecar Design
+Runtime Pi Issue Harness Design
+===============================
 
-Status: deferred design only. This is not part of the MVP request path.
+Status
+------
+
+Runtime design. The harness is optional and fail-closed, but it is no longer
+only a deferred future note.
 
 Boundary
 --------
 
-The Python/Django backend remains the owner of:
+The Django backend remains the owner of:
 
 - GitHub issue API calls,
 - stored analysis artifact loading,
-- deterministic issue evidence extraction,
-- deterministic candidate ranking,
-- overview/focus graph projection,
-- bounded code context construction,
-- API response validation and schema compatibility.
+- deterministic evidence extraction,
+- deterministic seed ranking,
+- response schema compatibility,
+- backend validation of all returned node IDs and paths.
 
-A future Pi SDK harness, if approved in a later plan, should run as a separate Node/TypeScript sidecar built on `@earendil-works/pi-coding-agent`. It must not replace the deterministic ranking path.
+The runtime harness owns:
 
-Runtime Model
+- bounded repo investigation over the supplied artifact,
+- tool-backed search/read/neighbor inspection,
+- final issue-origin node selection,
+- investigation path and confidence rationale.
+
+Harness Input
 -------------
 
-The sidecar should be invoked only after the backend has built a bounded issue-map payload. It receives data through an explicit request body or `ResourceLoader` equivalent:
+`llm.issue_harness.build_issue_harness_job()` builds a bounded job packet:
 
-- issue title/body excerpts,
-- normalized comment excerpts,
-- deterministic candidates,
-- focus graph nodes and edges,
-- bounded code context,
-- allowed node IDs and file paths.
+- issue title/body and comment excerpts,
+- extracted deterministic evidence,
+- deterministic seed candidates as hints,
+- graph nodes/edges from the stored artifact,
+- bounded `file_contents` selected from the artifact,
+- the list of available tools and safety rules.
 
-It must return structured explanation fields only:
+The harness does not receive GitHub credentials, a repository clone path, raw
+environment values, shell access, network access, unrestricted filesystem
+access, or filesystem access outside the bounded job file.
 
-- hypotheses,
-- investigation path wording,
-- confidence rationale.
+Runtime Adapter
+---------------
 
-The backend validates the returned node IDs, paths, confidence, and text before sending anything to the frontend.
+`llm.pi_issue_runner` invokes `@earendil-works/pi-coding-agent` with:
 
-Tool Policy
------------
+- JSON mode,
+- no context files,
+- no session,
+- no built-in tools,
+- a runtime extension at `llm/pi_issue_extension.ts`,
+- allowlisted tools only.
 
-Built-in tools are disabled by default. If tools are ever enabled, they must be strictly allowlisted and expose only bounded artifact data already selected by the backend.
+The extension reads only the job file path provided through
+`ISSUE_HARNESS_JOB_FILE`. Its tools expose bounded artifact data:
 
-The sidecar must not receive:
+- `get_issue_context`
+- `list_repo_files`
+- `search_repo_symbols`
+- `search_repo_text`
+- `read_repo_file`
+- `get_node`
+- `get_neighbors`
+- `finish_issue_map_transcript`
 
-- filesystem access,
-- shell access,
-- network access,
-- repository clone access,
-- GitHub credentials,
-- raw `.env` values,
-- private repo contents outside the bounded payload.
+Validation And Fallback
+-----------------------
 
-Sessions
---------
+`llm.issue_harness.run_issue_harness()` rejects harness output that:
 
-Use in-memory sessions for MVP follow-up experiments. Do not introduce persistent sidecar sessions, cache entries, or replay storage until retention and debugging requirements are explicitly approved.
+- is not JSON,
+- has no final fields,
+- has no tool calls,
+- exceeds the bounded tool-call budget,
+- finishes without reading bounded issue context,
+- finishes without listing bounded repository files,
+- names origin nodes without repository search,
+- names origin nodes without code or graph inspection.
 
-Deployment And Secrets
-----------------------
+`api.services.get_issue_map_response()` then validates returned node IDs against
+the analysis graph. If the harness returns only missing nodes, fails, times out,
+or violates the tool-use contract, the endpoint falls back to deterministic
+ranking with a structured warning. No issue-path cache is introduced.
 
-Sidecar credentials are configured outside Django settings and outside this repository's committed files. The Django app should treat the sidecar as optional and fail closed to deterministic output if it is unavailable.
+Frontend Contract
+-----------------
 
-The testing-only Pi harness / OpenCode Kimi review gate is separate from this product sidecar. Review-gate credentials and packets must not be reused by runtime application code.
+Existing fields remain:
 
-Acceptance Criteria For Future Implementation
----------------------------------------------
+- `selected_node_ids`
+- `candidates`
+- `overview_graph`
+- `focus_graph`
+- `hypotheses`
+- `investigation_path`
+- `code_context`
+- `confidence`
 
-- Existing `/api/issues/related-nodes/` request and response contracts remain backward-compatible.
-- Deterministic ranking works without the sidecar.
-- Sidecar failure returns deterministic hypotheses, investigation path, confidence, and a structured warning.
-- Returned node IDs and paths are allowlist-validated by the backend.
-- No issue-path cache is introduced.
-- Tests mock the sidecar and never call a live model.
+The additive `harness` field exposes bounded tool-call metadata for debugging.
+The frontend may ignore it.
+
+Testing
+-------
+
+Required deterministic tests:
+
+- harness job packets contain bounded graph/file data,
+- subprocess harness runner rejects no-tool final answers,
+- subprocess harness runner rejects tool-call budget overruns,
+- subprocess harness runner rejects final answers that never read issue context,
+- subprocess harness runner rejects search-only final answers,
+- default Pi runner fails closed without provider credentials,
+- issue endpoint uses valid harness output to rebuild candidates/focus graph,
+- issue endpoint falls back on invalid/missing harness output,
+- full Django and harness-eval suites remain green.
+
+Live Pi/OpenCode evaluation is separate from Django tests and must be explicitly
+enabled before a merge/release gate.

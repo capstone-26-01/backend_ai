@@ -145,7 +145,7 @@ github_repo/  GitHub repository cloning, git snapshotting, GitHub issue REST
 parser/       Python tree-sitter parsing, tree/graph construction, static edge
               resolution, entrypoint and key-module scoring
 llm/          QA context selection, OpenAI/Gemini calls, optional smolagents QA,
-              summaries, bounded issue explanations
+              summaries, bounded runtime issue harness
 harness_eval/ Deterministic issue-map runner evaluation suite and optional live
               Pi/OpenCode adapters
 config/       Django settings, OpenAPI/Swagger routing, WSGI/ASGI entrypoints
@@ -204,14 +204,14 @@ tree endpoints:
 3. `POST /api/issues/related-nodes/` receives `analysis_id` and `issue_number`.
 4. The backend fetches issue detail and comments, extracts deterministic evidence
    from titles, bodies, labels, stack traces, symbols, and file mentions.
-5. `api.issue_map` ranks relevant graph nodes, returns highlighted node IDs,
-   overview/focus graph projections, hypotheses, investigation path, bounded
-   code excerpts, confidence, and warnings.
-6. Optional bounded LLM explanation can enrich the deterministic result. Ranking
-   remains deterministic backend logic.
-
-Pi/OpenCode is evaluation tooling in this repo, not the default runtime issue
-mapper.
+5. `api.issue_map` ranks seed graph nodes deterministically.
+6. When enabled, the bounded Pi issue harness receives only the issue packet,
+   stored graph, and bounded file contents. It must read issue context, list
+   available files, search repo symbols/text, inspect code or graph neighbors,
+   and return investigated node IDs.
+7. The backend validates harness node IDs/paths, rebuilds focus graph/code
+   context, and falls back to deterministic ranking if the harness is unavailable
+   or violates the contract.
 
 ## API Surface
 
@@ -283,6 +283,9 @@ The suite contains:
 - A Pi runner adapter using bounded tools from `harness_eval/pi/`.
 - Optional OpenCode Zen live smoke/sample commands for dashboard and provider
   correlation.
+
+Runtime issue mapping uses the separate bounded harness under `llm/`; the
+`harness_eval/` suite remains the judge for model/tool changes.
 
 The system under test never receives hidden `expect` fields.
 

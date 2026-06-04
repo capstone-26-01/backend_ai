@@ -1,5 +1,8 @@
 import os
+import json
 import shutil
+import sys
+import tempfile
 from unittest.mock import Mock, patch
 
 from django.conf import settings
@@ -10,6 +13,11 @@ from typing import cast
 from api.services import get_repo_analysis
 from api.test_utils import create_git_fixture_repo
 from llm.agents import AgentTimedOut, AgentUnavailable, answer_question_with_smolagents
+from llm.issue_harness import (
+    IssueHarnessUnavailable,
+    build_issue_harness_job,
+    run_issue_harness,
+)
 from llm.services import answer_question, _build_context, _question_tokens, _rank_files
 from llm.summaries import SUMMARY_KIND_ONBOARDING, SummaryUnavailable, generate_summary
 from llm.tools import ArtifactToolbox, ToolLimitExceeded
@@ -202,6 +210,225 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         with self.assertRaises(SummaryUnavailable):
             generate_summary(analysis, SUMMARY_KIND_ONBOARDING)
+
+
+class IssueHarnessRuntimeTests(TestCase):
+    def _analysis(self):
+        return {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'file_contents': {
+                'api/services.py': 'def get_repo_analysis():\n    return parse_repo()\n',
+                'parser/services.py': 'def parse_repo():\n    return {"nodes": []}\n',
+            },
+            'nodes': [
+                {'id': 'api/services.py::get_repo_analysis', 'kind': 'function', 'label': 'get_repo_analysis', 'path': 'api/services.py', 'start_line': 1, 'end_line': 2},
+                {'id': 'parser/services.py::parse_repo', 'kind': 'function', 'label': 'parse_repo', 'path': 'parser/services.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [
+                {'source': 'api/services.py::get_repo_analysis', 'target': 'parser/services.py::parse_repo', 'kind': 'calls', 'path': 'api/services.py'},
+            ],
+            'entrypoints': [{'id': 'api/services.py::get_repo_analysis', 'path': 'api/services.py'}],
+            'key_modules': [],
+        }
+
+    def _job(self):
+        return build_issue_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            issue={'number': 42, 'title': 'Parser timeout starts in parse_repo', 'body': 'Trace shows parser/services.py parse_repo timeout.'},
+            comments=[],
+            evidence={'query': 'parser/services.py parse_repo timeout', 'file_mentions': [{'path': 'parser/services.py'}], 'symbol_mentions': [{'symbol': 'parse_repo'}]},
+            candidates=[
+                {
+                    'rank': 1,
+                    'score': 0.7,
+                    'node_id': 'parser/services.py::parse_repo',
+                    'node': {'path': 'parser/services.py'},
+                    'reason': 'seed',
+                    'evidence': [],
+                }
+            ],
+            analysis=self._analysis(),
+        )
+
+    def _command_that_prints(self, payload: dict[str, object]) -> list[str]:
+        code = 'import json; print(json.dumps(%r))' % payload
+        return [sys.executable, '-c', code]
+
+    def test_issue_harness_job_contains_bounded_graph_and_file_tools(self):
+        job = self._job()
+
+        self.assertEqual(job['task'], 'investigate_github_issue_origin')
+        self.assertIn('get_issue_context', {tool['name'] for tool in job['available_tools']})
+        self.assertIn('search_repo_symbols', {tool['name'] for tool in job['available_tools']})
+        self.assertIn('parser/services.py::parse_repo', {node['id'] for node in job['graph']['nodes']})
+        self.assertIn('parser/services.py', job['file_contents'])
+        self.assertNotIn('/etc/passwd', job['file_contents'])
+
+    def test_issue_harness_job_ignores_malformed_artifact_collections(self):
+        analysis = self._analysis()
+        analysis['nodes'] = {'bad': 'not a node list'}
+        analysis['edges'] = {'bad': 'not an edge list'}
+        analysis['entrypoints'] = {'bad': 'not an entrypoint list'}
+        evidence = {'query': 'parse_repo', 'file_mentions': {'bad': 'not a mention list'}}
+
+        job = build_issue_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            issue={'number': 42, 'title': 'Parser timeout', 'body': ''},
+            comments=[],
+            evidence=evidence,
+            candidates=[],
+            analysis=analysis,
+        )
+
+        self.assertEqual(job['graph']['nodes'], [])
+        self.assertEqual(job['graph']['edges'], [])
+        self.assertEqual(job['graph']['entrypoints'], [])
+        self.assertEqual(job['evidence']['file_mentions'], [])
+
+    def test_run_issue_harness_accepts_tool_backed_transcript(self):
+        payload = {
+            'variant_id': 'test-harness',
+            'tool_calls': [
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'parser/services.py::parse_repo', 'confidence': 0.8, 'rationale': 'read file'}],
+                'investigation_path': [{'node_id': 'parser/services.py::parse_repo', 'path': 'parser/services.py', 'why': 'inspect parser'}],
+                'confidence': {'score': 0.8, 'reasons': ['tool-backed']},
+            },
+        }
+
+        result = run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
+
+        self.assertEqual(result.output['hypotheses'][0]['node_id'], 'parser/services.py::parse_repo')
+        self.assertEqual([call['name'] for call in result.tool_calls], ['get_issue_context', 'list_repo_files', 'search_repo_symbols', 'read_repo_file'])
+        self.assertEqual(result.metadata['variant_id'], 'test-harness')
+
+    def test_run_issue_harness_rejects_final_answer_without_tool_work(self):
+        payload = {
+            'tool_calls': [],
+            'final': {
+                'hypotheses': [{'node_id': 'parser/services.py::parse_repo', 'confidence': 0.8, 'rationale': 'guess'}],
+                'investigation_path': [{'node_id': 'parser/services.py::parse_repo', 'path': 'parser/services.py', 'why': 'guess'}],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'without tool calls'):
+            run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
+
+    def test_run_issue_harness_rejects_named_nodes_without_code_or_graph_inspection(self):
+        payload = {
+            'tool_calls': [
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'parser/services.py::parse_repo', 'confidence': 0.8, 'rationale': 'search only'}],
+                'investigation_path': [{'node_id': 'parser/services.py::parse_repo', 'path': 'parser/services.py', 'why': 'search only'}],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'inspect code or graph neighbors'):
+            run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
+
+    def test_run_issue_harness_rejects_missing_issue_context(self):
+        payload = {
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            'final': {'hypotheses': [], 'investigation_path': [], 'confidence': {'score': 0.0}},
+        }
+
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'bounded issue context'):
+            run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
+
+    def test_run_issue_harness_rejects_tool_call_budget_overrun(self):
+        tool_calls = [
+            {'name': 'get_issue_context', 'arguments': {}},
+            {'name': 'list_repo_files', 'arguments': {}},
+            {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
+            {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+        ]
+        tool_calls.extend({'name': 'get_node', 'arguments': {'node_id': 'parser/services.py::parse_repo'}} for _ in range(31))
+        payload = {
+            'tool_calls': tool_calls,
+            'final': {
+                'hypotheses': [{'node_id': 'parser/services.py::parse_repo', 'confidence': 0.8, 'rationale': 'read file'}],
+                'investigation_path': [{'node_id': 'parser/services.py::parse_repo', 'path': 'parser/services.py', 'why': 'inspect parser'}],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'exceeded 30 tool calls'):
+            run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
+
+    def test_run_issue_harness_reports_failed_non_json_command_as_harness_failure(self):
+        command = [sys.executable, '-c', 'import sys; sys.stderr.write("boom"); raise SystemExit(3)']
+
+        with self.assertRaises(IssueHarnessUnavailable) as caught:
+            run_issue_harness(self._job(), command=command, timeout_seconds=5)
+
+        self.assertEqual(caught.exception.code, 'harness_failed')
+        self.assertIn('boom', caught.exception.message)
+
+    def test_default_pi_runner_fails_closed_without_opencode_key(self):
+        with patch.dict(os.environ, {'OPENCODE_API_KEY': ''}, clear=False):
+            with self.assertRaisesMessage(IssueHarnessUnavailable, 'OPENCODE_API_KEY'):
+                run_issue_harness(self._job(), timeout_seconds=5)
+
+    def test_pi_runner_deletes_bounded_job_file_after_success(self):
+        from llm import pi_issue_runner
+
+        transcript = {
+            'sample_id': 'github:owner/repo#42@abc123',
+            'variant_id': 'runtime-pi-issue-harness',
+            'tool_calls': [
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+            ],
+            'final': {'hypotheses': [], 'investigation_path': [], 'confidence': {'score': 0.0}},
+        }
+        event = {'role': 'toolResult', 'toolName': 'finish_issue_map_transcript', 'details': transcript}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job_dir = os.path.join(temp_dir, 'jobs')
+            completed = Mock(returncode=0, stdout=json.dumps(event), stderr='')
+            with (
+                patch.object(pi_issue_runner, 'DEFAULT_JOB_DIR', pi_issue_runner.Path(job_dir)),
+                patch('llm.pi_issue_runner.subprocess.run', return_value=completed),
+                patch.dict(os.environ, {'OPENCODE_API_KEY': 'test-key', 'ISSUE_HARNESS_KEEP_JOB_FILES': ''}, clear=False),
+                patch('sys.stdin', Mock(read=Mock(return_value=json.dumps(self._job())))),
+                patch('builtins.print'),
+            ):
+                status = pi_issue_runner.main(['--timeout', '5'])
+
+            self.assertEqual(status, 0)
+            self.assertEqual(os.listdir(job_dir), [])
+
+    def test_pi_runner_transcript_parser_ignores_malformed_finish_tool_text(self):
+        from llm.pi_issue_runner import extract_transcript
+
+        event = {
+            'role': 'toolResult',
+            'toolName': 'finish_issue_map_transcript',
+            'content': [{'type': 'text', 'text': 'not json'}],
+        }
+
+        transcript, metadata = extract_transcript(json.dumps(event))
+
+        self.assertIsNone(transcript)
+        self.assertEqual(metadata['event_count'], 1)
 
 
 class SmolagentsToolAgentTests(TestCase):
