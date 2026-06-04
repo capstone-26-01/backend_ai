@@ -74,6 +74,7 @@ from llm.issue_explanation import (
     build_issue_explanation_messages,
     build_issue_explanation_prompt_payload,
 )
+from llm.issue_harness import IssueHarnessResult, IssueHarnessUnavailable
 import yaml
 
 get_repo_analysis = importlib.import_module('api.services').get_repo_analysis
@@ -968,16 +969,18 @@ class IssueMapRankingEvalTests(TestCase):
                 self.assertEqual(candidates_by_case[case.name][0]['node_id'], case.expected_top_node_id)
 
 
-class IssueMapDeferredPiDesignTests(TestCase):
-    def test_deferred_pi_sidecar_doc_keeps_pi_out_of_mvp_request_path(self):
+class IssueMapRuntimePiDesignTests(TestCase):
+    def test_runtime_pi_harness_doc_requires_bounded_tools_and_fallback(self):
         text = (settings.BASE_DIR / 'docs' / 'issue_map_pi_sidecar_design.txt').read_text(encoding='utf-8')
 
-        self.assertIn('deferred design only', text)
+        self.assertIn('Runtime design', text)
         self.assertIn('@earendil-works/pi-coding-agent', text)
-        self.assertIn('must not replace the deterministic ranking path', text)
+        self.assertIn('deterministic seed ranking', text)
+        self.assertIn('fallback', text.lower())
+        self.assertIn('no built-in tools', text)
         self.assertIn('filesystem access', text)
         self.assertIn('network access', text)
-        self.assertIn('Tests mock the sidecar and never call a live model', text)
+        self.assertIn('subprocess harness runner rejects no-tool final answers', text)
 
 
 class GraphArtifactContractTests(TestCase):
@@ -2189,7 +2192,7 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertTrue(any(warning['code'] == 'github_comments_truncated' for warning in cast(list[dict[str, object]], payload['warnings'])))
 
 
-class IssueMapLlmExplanationTests(ExternalHttpBlockedMixin, TestCase):
+class IssueMapHarnessExplanationTests(ExternalHttpBlockedMixin, TestCase):
     def _create_analysis_run(self) -> AnalysisRun:
         repository, _created = Repository.objects.get_or_create(
             provider='github',
@@ -2288,96 +2291,150 @@ class IssueMapLlmExplanationTests(ExternalHttpBlockedMixin, TestCase):
         self.assertEqual(sanitized['confidence']['level'], 'high')
         self.assertTrue(any(warning['code'] == 'llm_output_sanitized' for warning in warnings))
 
-    @override_settings(ISSUE_MAP_LLM_ENABLED=False)
+    @override_settings(ISSUE_MAP_LLM_ENABLED=False, ISSUE_HARNESS_ENABLED=False)
     @patch('github_repo.services.requests.get')
-    def test_related_nodes_llm_disabled_returns_deterministic_response_and_warning(self, requests_get):
+    def test_related_nodes_harness_disabled_returns_deterministic_response_and_warning(self, requests_get):
         analysis_run = self._create_analysis_run()
         requests_get.side_effect = [
             mock_github_issue_detail_response(issue_number=42),
             mock_github_issue_comments_response(issue_number=42, count=2),
         ]
 
-        with patch('llm.issue_explanation.generate_issue_explanation') as generate_issue_explanation:
+        with patch('api.services.run_issue_harness') as run_harness:
             status_code, payload = self._post_related_nodes(analysis_run)
 
         self.assertEqual(status_code, 200)
-        generate_issue_explanation.assert_not_called()
-        self.assertTrue(any(warning['code'] == 'llm_disabled' for warning in cast(list[dict[str, object]], payload['warnings'])))
+        run_harness.assert_not_called()
+        self.assertTrue(any(warning['code'] == 'harness_disabled' for warning in cast(list[dict[str, object]], payload['warnings'])))
         self.assertNotEqual(cast(dict[str, object], payload['confidence']).get('source'), 'llm')
+        self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'deterministic')
 
-    @override_settings(ISSUE_MAP_LLM_ENABLED=True)
+    @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
     @patch('github_repo.services.requests.get')
-    def test_related_nodes_merges_valid_llm_explanation(self, requests_get):
+    def test_related_nodes_uses_tool_backed_harness_investigation(self, requests_get):
         analysis_run = self._create_analysis_run()
         requests_get.side_effect = [
             mock_github_issue_detail_response(issue_number=42),
             mock_github_issue_comments_response(issue_number=42, count=2),
         ]
-        llm_response = {
+        harness_output = {
             'hypotheses': [
                 {
                     'kind': 'likely_origin',
-                    'node_id': 'api/services.py::_build_and_store_analysis',
+                    'node_id': 'parser/services.py::parse_repo',
                     'confidence': 0.83,
-                    'rationale': 'LLM ties the stack frame to parser ingestion.',
+                    'rationale': 'Harness searched symbols and read parser/services.py before selecting parse_repo.',
                 }
             ],
             'investigation_path': [
                 {
                     'step': 1,
-                    'node_id': 'api/services.py::_build_and_store_analysis',
-                    'path': 'api/services.py',
+                    'node_id': 'parser/services.py::parse_repo',
+                    'path': 'parser/services.py',
                     'action': 'inspect',
-                    'why': 'Start where parse_repo is called.',
+                    'why': 'Read the parser entrypoint that matches the issue stack trace.',
                 }
             ],
-            'confidence': {'level': 'high', 'score': 0.83, 'reasons': ['stack frame and code excerpt align']},
+            'confidence': {'level': 'high', 'score': 0.83, 'reasons': ['tool-backed parser inspection']},
         }
+        harness_result = IssueHarnessResult(
+            output=harness_output,
+            tool_calls=[
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            metadata={'variant_id': 'test-runtime-harness'},
+        )
 
         with (
             patch('django.core.cache.cache.get', side_effect=AssertionError('issue map must not read cache')),
             patch('django.core.cache.cache.set', side_effect=AssertionError('issue map must not write cache')),
-            patch('llm.issue_explanation.generate_issue_explanation', return_value=llm_response) as generate_issue_explanation,
+            patch('api.services.run_issue_harness', return_value=harness_result) as run_harness,
         ):
             status_code, payload = self._post_related_nodes(analysis_run)
 
         self.assertEqual(status_code, 200)
-        self.assertEqual(cast(list[dict[str, object]], payload['hypotheses'])[0]['rationale'], 'LLM ties the stack frame to parser ingestion.')
-        self.assertEqual(cast(dict[str, object], payload['confidence'])['source'], 'llm')
+        self.assertEqual(cast(list[dict[str, object]], payload['hypotheses'])[0]['node_id'], 'parser/services.py::parse_repo')
+        self.assertEqual(cast(list[dict[str, object]], payload['candidates'])[0]['node_id'], 'parser/services.py::parse_repo')
+        self.assertIn('parser/services.py::parse_repo', cast(list[str], payload['selected_node_ids']))
+        self.assertIn('parser/services.py::parse_repo', cast(list[str], cast(dict[str, object], payload['focus_graph'])['highlight_node_ids']))
+        self.assertEqual(cast(dict[str, object], payload['confidence'])['source'], 'harness')
         self.assertEqual(cast(dict[str, object], payload['confidence'])['score'], 0.83)
-        self.assertFalse(any(warning['code'] == 'llm_disabled' for warning in cast(list[dict[str, object]], payload['warnings'])))
-        generate_issue_explanation.assert_called_once()
+        self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'pi_harness')
+        harness_tool_names = [call['name'] for call in cast(list[dict[str, object]], cast(dict[str, object], payload['harness'])['tool_calls'])]
+        self.assertIn('get_issue_context', harness_tool_names)
+        self.assertIn('search_repo_symbols', harness_tool_names)
+        run_harness.assert_called_once()
+        harness_job = run_harness.call_args.args[0]
+        self.assertIn('graph', harness_job)
+        self.assertIn('file_contents', harness_job)
+        self.assertIn('parser/services.py', harness_job['file_contents'])
 
-    @override_settings(ISSUE_MAP_LLM_ENABLED=True)
+    @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
     @patch('github_repo.services.requests.get')
-    def test_related_nodes_invalid_llm_json_falls_back(self, requests_get):
+    def test_related_nodes_harness_without_required_tool_work_falls_back(self, requests_get):
         analysis_run = self._create_analysis_run()
         requests_get.side_effect = [
             mock_github_issue_detail_response(issue_number=42),
             mock_github_issue_comments_response(issue_number=42, count=2),
         ]
 
-        with patch('llm.issue_explanation._generate_answer', return_value='not json'):
+        with patch('api.services.run_issue_harness', side_effect=IssueHarnessUnavailable('harness_missing_inspection', 'Issue harness must inspect code or graph neighbors before naming origin nodes.')):
             status_code, payload = self._post_related_nodes(analysis_run)
 
         self.assertEqual(status_code, 200)
-        self.assertTrue(any(warning['code'] == 'llm_invalid_response' for warning in cast(list[dict[str, object]], payload['warnings'])))
+        self.assertTrue(any(warning['code'] == 'harness_missing_inspection' for warning in cast(list[dict[str, object]], payload['warnings'])))
         self.assertNotEqual(cast(dict[str, object], payload['confidence']).get('source'), 'llm')
+        self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'deterministic')
 
-    @override_settings(ISSUE_MAP_LLM_ENABLED=True)
+    @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
     @patch('github_repo.services.requests.get')
-    def test_related_nodes_llm_unavailable_falls_back(self, requests_get):
+    def test_related_nodes_hallucinated_harness_nodes_fall_back(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.side_effect = [
+            mock_github_issue_detail_response(issue_number=42),
+            mock_github_issue_comments_response(issue_number=42, count=2),
+        ]
+        harness_result = IssueHarnessResult(
+            output={
+                'hypotheses': [{'node_id': 'missing.py::fake', 'confidence': 0.8, 'rationale': 'bad'}],
+                'investigation_path': [{'node_id': 'missing.py::fake', 'path': 'missing.py', 'why': 'bad'}],
+                'confidence': {'score': 0.8},
+            },
+            tool_calls=[
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'fake'}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'api/services.py'}},
+            ],
+            metadata={'variant_id': 'test-runtime-harness'},
+        )
+
+        with patch('api.services.run_issue_harness', return_value=harness_result):
+            status_code, payload = self._post_related_nodes(analysis_run)
+
+        self.assertEqual(status_code, 200)
+        warning_codes = {str(warning['code']) for warning in cast(list[dict[str, object]], payload['warnings'])}
+        self.assertIn('harness_no_valid_nodes', warning_codes)
+        self.assertNotEqual(cast(dict[str, object], payload['confidence']).get('source'), 'llm')
+        self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'deterministic')
+
+    @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_harness_unavailable_falls_back(self, requests_get):
         analysis_run = self._create_analysis_run()
         requests_get.side_effect = [
             mock_github_issue_detail_response(issue_number=42),
             mock_github_issue_comments_response(issue_number=42, count=2),
         ]
 
-        with patch('llm.issue_explanation._generate_answer', side_effect=RuntimeError('model offline')):
+        with patch('api.services.run_issue_harness', side_effect=IssueHarnessUnavailable('harness_failed', 'model offline')):
             status_code, payload = self._post_related_nodes(analysis_run)
 
         self.assertEqual(status_code, 200)
-        self.assertTrue(any(warning['code'] == 'llm_unavailable' for warning in cast(list[dict[str, object]], payload['warnings'])))
+        self.assertTrue(any(warning['code'] == 'harness_failed' for warning in cast(list[dict[str, object]], payload['warnings'])))
         self.assertNotEqual(cast(dict[str, object], payload['confidence']).get('source'), 'llm')
 
 

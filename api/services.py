@@ -33,7 +33,12 @@ from github_repo.services import (
     get_repo_snapshot_or_raise as get_repo_snapshot,
 )
 from llm.context_selection import rank_nodes
-from llm import issue_explanation as issue_llm
+from llm.issue_harness import (
+    IssueHarnessUnavailable,
+    build_issue_harness_job,
+    command_from_string,
+    run_issue_harness,
+)
 from llm.summaries import (
     SUMMARY_KIND_NODE,
     SUMMARY_KIND_ONBOARDING,
@@ -664,7 +669,7 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
                 'score': round(max(0.1, 1.0 - ((index - 1) * 0.08)), 2),
                 'node_id': node_id,
                 'node': display_node,
-                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 deterministic graph ranking 및 bounded LLM explanation을 사용합니다.',
+                'reason': 'Mock candidate based on issue title/body tokens and graph node metadata. 실제 구현에서는 GitHub issue 본문/comment와 deterministic graph ranking 및 bounded issue harness investigation을 사용합니다.',
                 'evidence': evidence,
             }
         )
@@ -752,25 +757,93 @@ def _issue_confidence(candidates: list[dict[str, Any]], warnings: list[dict[str,
     }
 
 
+def _issue_harness_enabled() -> bool:
+    return bool(getattr(settings, 'ISSUE_HARNESS_ENABLED', False))
+
+
+def _issue_harness_command() -> list[str] | None:
+    command = str(getattr(settings, 'ISSUE_HARNESS_COMMAND', '') or '').strip()
+    if not command:
+        return None
+    return command_from_string(command)
+
+
+def _issue_harness_warning(error: IssueHarnessUnavailable) -> dict[str, Any]:
+    return {
+        'code': error.code,
+        'message': error.message or 'Issue harness를 사용할 수 없어 deterministic issue ranking을 반환했습니다.',
+    }
+
+
+def _issue_harness_node_ids(output: dict[str, Any]) -> list[str]:
+    node_ids: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value and value not in node_ids:
+            node_ids.append(value)
+
+    for hypothesis in output.get('hypotheses') or []:
+        if isinstance(hypothesis, dict):
+            add(hypothesis.get('node_id'))
+    for step in output.get('investigation_path') or []:
+        if isinstance(step, dict):
+            add(step.get('node_id'))
+    return node_ids
+
+
+def _issue_harness_candidates(
+    analysis: dict[str, Any],
+    harness_output: dict[str, Any],
+    seed_candidates: list[dict[str, Any]],
+    *,
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    nodes_by_id = {
+        str(node.get('id')): dict(node)
+        for node in analysis.get('nodes', [])
+        if isinstance(node, dict) and node.get('id')
+    }
+    seed_by_id = {str(candidate.get('node_id')): candidate for candidate in seed_candidates}
+    warnings: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for rank, node_id in enumerate(_issue_harness_node_ids(harness_output)[:max_candidates], start=1):
+        node = nodes_by_id.get(node_id)
+        if node is None:
+            warnings.append({'code': 'harness_node_not_in_graph', 'message': 'Issue harness returned a node_id that is not in the analysis graph.', 'node_id': node_id})
+            continue
+        seed = seed_by_id.get(node_id, {})
+        score = max(0.05, min(1.0, 1.0 - ((rank - 1) * 0.08)))
+        candidates.append(
+            {
+                'rank': rank,
+                'score': round(score, 3),
+                'raw_score': seed.get('raw_score', round(score * 100, 3)),
+                'node_id': node_id,
+                'node': _node_display_payload(node),
+                'reason': 'Issue harness inspected bounded repo tools and selected this node.',
+                'evidence': [
+                    {'type': 'harness', 'message': 'Selected by bounded issue investigation harness.'},
+                    *list(seed.get('evidence') or [])[:3],
+                ],
+            }
+        )
+    return candidates, warnings
+
+
+def _issue_harness_summary(harness_result) -> dict[str, Any]:
+    return {
+        'enabled': True,
+        'source': 'pi_harness',
+        'tool_calls': harness_result.tool_calls,
+        'metadata': harness_result.metadata,
+    }
+
+
 def _comments_unavailable_warning(error: GithubIssueApiError) -> dict[str, Any]:
     return {
         'code': 'github_comments_unavailable',
         'message': 'GitHub issue comment를 읽지 못해 issue 본문만으로 후보를 계산했습니다.',
         'detail': error.as_dict(),
-    }
-
-
-def _llm_disabled_warning() -> dict[str, Any]:
-    return {
-        'code': 'llm_disabled',
-        'message': 'Issue-map LLM explanation flag가 꺼져 있어 deterministic explanation을 반환했습니다.',
-    }
-
-
-def _llm_fallback_warning(error: issue_llm.IssueExplanationUnavailable) -> dict[str, Any]:
-    return {
-        'code': error.code,
-        'message': error.message or 'Issue-map LLM explanation을 사용할 수 없어 deterministic explanation을 반환했습니다.',
     }
 
 
@@ -822,36 +895,72 @@ def get_issue_map_response(
         'include_comments': include_comments,
         'max_context_files': max_context_files,
         'max_candidates': max(12, max_nodes * 3),
-        'llm_enabled': bool(getattr(settings, 'ISSUE_MAP_LLM_ENABLED', False)),
+        'llm_enabled': _issue_harness_enabled(),
+        'harness_enabled': _issue_harness_enabled(),
     }
+    harness: dict[str, Any] = {'enabled': False, 'source': 'deterministic'}
 
-    if bool(getattr(settings, 'ISSUE_MAP_LLM_ENABLED', False)):
-        limits['llm_model'] = issue_llm.issue_explanation_model_metadata()
+    if _issue_harness_enabled():
         try:
-            llm_output = issue_llm.generate_issue_explanation(
-                issue,
-                comments,
-                evidence,
-                candidates,
-                focus_graph,
-                code_context,
+            harness_job = build_issue_harness_job(
+                repo_path=repo_path,
+                revision=analysis_run.revision,
+                issue=issue,
+                comments=comments,
+                evidence=evidence,
+                candidates=candidates,
+                analysis=analysis,
             )
+            harness_result = run_issue_harness(
+                harness_job,
+                command=_issue_harness_command(),
+                timeout_seconds=int(getattr(settings, 'ISSUE_HARNESS_TIMEOUT_SECONDS', 180)),
+            )
+            harness = _issue_harness_summary(harness_result)
+            harness_candidates, harness_warnings = _issue_harness_candidates(
+                analysis,
+                harness_result.output,
+                candidates,
+                max_candidates=max(12, max_nodes * 3),
+            )
+            warnings.extend(harness_warnings)
+            if _issue_harness_node_ids(harness_result.output) and not harness_candidates:
+                raise IssueHarnessUnavailable('harness_no_valid_nodes', 'Issue harness did not return any node_id present in the analysis graph.')
+            candidates = harness_candidates
+            focus_graph, selected_node_ids, focus_warnings = build_focus_graph_projection(
+                analysis,
+                candidates,
+                max_focus_nodes=max(24, max_nodes * 6),
+                max_selected_nodes=max_nodes,
+            )
+            warnings.extend(focus_warnings)
+            code_context, code_warnings = build_code_context(
+                analysis,
+                candidates,
+                max_context_files=max_context_files,
+            )
+            warnings.extend(code_warnings)
+            fallback_hypotheses = _issue_hypotheses(candidates)
+            fallback_investigation_path = _issue_investigation_path(candidates)
+            fallback_confidence = _issue_confidence(candidates, warnings)
             llm_fields, llm_warnings = sanitize_issue_explanation_output(
-                llm_output,
+                harness_result.output,
                 focus_graph=focus_graph,
                 code_context=code_context,
-                fallback_hypotheses=hypotheses,
-                fallback_investigation_path=investigation_path,
-                fallback_confidence=confidence,
+                fallback_hypotheses=fallback_hypotheses,
+                fallback_investigation_path=fallback_investigation_path,
+                fallback_confidence=fallback_confidence,
+                source='harness',
             )
             hypotheses = llm_fields['hypotheses']
             investigation_path = llm_fields['investigation_path']
             confidence = llm_fields['confidence']
             warnings.extend(llm_warnings)
-        except issue_llm.IssueExplanationUnavailable as error:
-            warnings.append(_llm_fallback_warning(error))
+        except IssueHarnessUnavailable as error:
+            harness = {'enabled': True, 'source': 'deterministic', 'fallback_reason': error.code}
+            warnings.append(_issue_harness_warning(error))
     else:
-        warnings.append(_llm_disabled_warning())
+        warnings.append({'code': 'harness_disabled', 'message': 'Issue harness flag가 꺼져 있어 deterministic issue ranking을 반환했습니다.'})
 
     return {
         'analysis_id': analysis_run.id,
@@ -869,6 +978,7 @@ def get_issue_map_response(
         'investigation_path': investigation_path,
         'code_context': code_context,
         'confidence': confidence,
+        'harness': harness,
         'limits': limits,
         'warnings': warnings,
     }
