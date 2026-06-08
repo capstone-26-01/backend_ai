@@ -2665,6 +2665,13 @@ class SummaryEndpointTests(TestCase):
                     {'id': 'pkg/app.py::main', 'type': 'function', 'label': 'main', 'file': 'pkg/app.py', 'start_line': 1, 'end_line': 2},
                     {'id': 'pkg/@generated/모듈.py', 'type': 'file', 'label': '모듈.py', 'file': 'pkg/@generated/모듈.py'},
                     {'id': 'pkg/@generated/모듈.py::처리', 'type': 'function', 'label': '처리', 'file': 'pkg/@generated/모듈.py', 'start_line': 1, 'end_line': 2},
+                    {
+                        'id': '.gitignore',
+                        'type': 'file',
+                        'label': '.gitignore',
+                        'file': '.gitignore',
+                        'metadata': {'unsupported': True, 'language': None},
+                    },
                 ],
                 'edges': [
                     {'id': 'e1', 'type': 'contains', 'source': 'module::pkg.app', 'target': 'pkg/app.py::main', 'file': 'pkg/app.py'},
@@ -2798,6 +2805,55 @@ class SummaryEndpointTests(TestCase):
         self.assertEqual(summary['target_id'], 'pkg/app.py')
         self.assertIn('pkg/app.py', summary['source_nodes'])
         self.assertIn('pkg/app.py', summary['source_files'])
+
+    @patch('llm.summaries._generate_answer')
+    def test_node_summary_endpoint_can_explain_unsupported_dotfile_without_llm(self, generate_answer):
+        generate_answer.side_effect = RuntimeError('model unavailable')
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/node-summary/',
+                {
+                    'analysis_id': self.analysis_run.id,
+                    'node_id': '.gitignore',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        summary = cast(dict[str, object], payload['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload['cached'])
+        self.assertEqual(summary['kind'], 'node')
+        self.assertEqual(summary['target_id'], '.gitignore')
+        self.assertEqual(cast(dict[str, object], summary['model'])['fallback'], 'deterministic')
+        self.assertIn('.gitignore', summary['text'])
+        self.assertIn('.gitignore', summary['source_nodes'])
+        self.assertIn('.gitignore', summary['source_files'])
+        self.assertTrue(any(warning['code'] == 'node_summary_deterministic_fallback' for warning in cast(list[dict[str, object]], summary['warnings'])))
+        generate_answer.assert_not_called()
+
+    @patch('llm.summaries._generate_answer', side_effect=RuntimeError('model unavailable'))
+    def test_node_summary_endpoint_falls_back_when_model_unavailable(self, generate_answer):
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/node-summary/',
+                {
+                    'analysis_id': self.analysis_run.id,
+                    'node_id': 'pkg/app.py::main',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        summary = cast(dict[str, object], payload['summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(summary['target_id'], 'pkg/app.py::main')
+        self.assertEqual(cast(dict[str, object], summary['model'])['fallback'], 'deterministic')
+        self.assertIn('model_unavailable', {warning.get('reason') for warning in cast(list[dict[str, object]], summary['warnings'])})
+        generate_answer.assert_called_once()
 
     @patch('llm.summaries._generate_answer')
     def test_node_summary_missing_node_returns_400(self, generate_answer):
