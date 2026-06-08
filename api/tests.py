@@ -2715,15 +2715,15 @@ class SummaryEndpointTests(TestCase):
         generate_answer.side_effect = ['v1 summary', 'v2 summary']
 
         first = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
-        with patch('llm.summaries.SUMMARY_PROMPT_VERSION', 'summary.v2'):
+        with patch('llm.summaries.SUMMARY_PROMPT_VERSION', 'summary.v3'):
             second = cast(HttpResponse, self.client.get('/api/summary/', {'analysis_id': self.analysis_run.id}))
         first_payload = cast(dict[str, object], json.loads(first.content))
         second_payload = cast(dict[str, object], json.loads(second.content))
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(cast(dict[str, object], first_payload['summary'])['prompt_version'], 'summary.v1')
-        self.assertEqual(cast(dict[str, object], second_payload['summary'])['prompt_version'], 'summary.v2')
+        self.assertEqual(cast(dict[str, object], first_payload['summary'])['prompt_version'], 'summary.v2')
+        self.assertEqual(cast(dict[str, object], second_payload['summary'])['prompt_version'], 'summary.v3')
         self.assertEqual(generate_answer.call_count, 2)
         artifact = AnalysisArtifact.objects.get(analysis_run=self.analysis_run)
         self.assertEqual(len(cast(dict[str, object], artifact.payload['summaries'])), 2)

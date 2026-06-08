@@ -9,7 +9,7 @@ from llm.context_selection import build_context_for_files
 from llm.services import _generate_answer
 
 
-SUMMARY_PROMPT_VERSION = 'summary.v1'
+SUMMARY_PROMPT_VERSION = 'summary.v2'
 SUMMARY_KIND_REPO_OVERVIEW = 'repo_overview'
 SUMMARY_KIND_ONBOARDING = 'onboarding_guide'
 SUMMARY_KIND_NODE = 'node'
