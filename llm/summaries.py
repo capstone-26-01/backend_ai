@@ -119,7 +119,8 @@ def _summary_source_refs(
         for source_node in source_nodes
         if source_node in nodes_by_id and _node_file(nodes_by_id[source_node])
     ]
-    source_files.extend(key_module_paths)
+    if kind != SUMMARY_KIND_NODE:
+        source_files.extend(key_module_paths)
     if not source_files:
         source_files = sorted(cast(Mapping[str, str], analysis.get('file_contents', {})).keys())[:4]
     return source_nodes[:12], _unique(cast(list[str], source_files))[:6]
@@ -186,6 +187,83 @@ def _build_prompt_payload(
     return payload, source_nodes, source_files
 
 
+def _target_node(prompt_payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    target_id = prompt_payload.get('target_node_id')
+    for node in prompt_payload.get('source_nodes', []):
+        if isinstance(node, Mapping) and node.get('id') == target_id:
+            return node
+    return None
+
+
+def _deterministic_node_summary_text(prompt_payload: Mapping[str, Any], *, reason: str) -> str:
+    node = _target_node(prompt_payload)
+    target_id = str(prompt_payload.get('target_node_id') or '')
+    source_files = [str(path) for path in prompt_payload.get('source_files', []) if isinstance(path, str)]
+    if node is None:
+        return f'{target_id} 노드는 그래프에는 있지만 상세 메타데이터를 찾지 못했습니다.'
+
+    kind = str(node.get('kind') or 'node')
+    label = str(node.get('label') or target_id)
+    path = str(node.get('path') or (source_files[0] if source_files else ''))
+    metadata = node.get('metadata') if isinstance(node.get('metadata'), Mapping) else {}
+    unsupported = bool(metadata.get('unsupported'))
+    language = node.get('language') or metadata.get('language')
+
+    if kind == 'file':
+        lines = [f'{label}은(는) `{path or target_id}` 파일 노드입니다.']
+        if unsupported or not language:
+            lines.append('현재 분석기는 Python 파일만 세부 symbol/code excerpt로 저장하므로 이 파일은 구조 그래프의 file node로만 설명됩니다.')
+        elif language:
+            lines.append(f'분석 언어는 {language}입니다.')
+    elif kind == 'directory':
+        lines = [f'{label}은(는) `{path or target_id}` 디렉터리 노드입니다.']
+    else:
+        line_suffix = ''
+        if node.get('start_line') and node.get('end_line'):
+            line_suffix = f' ({node.get("start_line")}-{node.get("end_line")}행)'
+        lines = [f'{label}은(는) `{path or target_id}` 안의 {kind} 노드{line_suffix}입니다.']
+
+    related_nodes = [
+        str(item.get('id'))
+        for item in prompt_payload.get('source_nodes', [])
+        if isinstance(item, Mapping) and item.get('id') and item.get('id') != target_id
+    ]
+    if related_nodes:
+        lines.append(f'그래프상 인접 노드로 {", ".join(related_nodes[:3])} 등이 연결됩니다.')
+    if reason == 'model_unavailable':
+        lines.append('모델 요약 호출이 실패해 저장된 graph metadata를 근거로 fallback 설명을 반환했습니다.')
+    return ' '.join(lines)
+
+
+def _deterministic_node_summary(
+    analysis: Mapping[str, Any],
+    prompt_payload: Mapping[str, Any],
+    source_nodes: list[str],
+    source_files: list[str],
+    *,
+    node_id: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    warnings = list(analysis.get('warnings', []))[:8]
+    warnings.append(
+        {
+            'code': 'node_summary_deterministic_fallback',
+            'message': 'Node summary를 LLM 없이 graph metadata 기반 fallback으로 생성했습니다.',
+            'reason': reason,
+        }
+    )
+    return {
+        'kind': SUMMARY_KIND_NODE,
+        'prompt_version': SUMMARY_PROMPT_VERSION,
+        'model': {'fallback': 'deterministic'},
+        'target_id': node_id,
+        'text': _deterministic_node_summary_text(prompt_payload, reason=reason),
+        'source_nodes': source_nodes,
+        'source_files': source_files,
+        'warnings': warnings,
+    }
+
+
 def _build_summary_messages(kind: str, prompt_payload: Mapping[str, Any]) -> list[dict[str, str]]:
     if kind == SUMMARY_KIND_ONBOARDING:
         task = (
@@ -218,9 +296,27 @@ def generate_summary(analysis: Mapping[str, Any], kind: str, *, node_id: str | N
         raise SummaryInputError('unsupported summary kind')
 
     prompt_payload, source_nodes, source_files = _build_prompt_payload(analysis, kind, node_id=node_id)
+    if kind == SUMMARY_KIND_NODE and not prompt_payload.get('code_excerpts'):
+        return _deterministic_node_summary(
+            analysis,
+            prompt_payload,
+            source_nodes,
+            source_files,
+            node_id=node_id,
+            reason='no_code_excerpt',
+        )
     try:
         text = _generate_answer(_build_summary_messages(kind, prompt_payload))
     except Exception as exc:
+        if kind == SUMMARY_KIND_NODE:
+            return _deterministic_node_summary(
+                analysis,
+                prompt_payload,
+                source_nodes,
+                source_files,
+                node_id=node_id,
+                reason='model_unavailable',
+            )
         raise SummaryUnavailable(str(exc)) from exc
 
     return {
