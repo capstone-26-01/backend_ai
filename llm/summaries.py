@@ -117,7 +117,7 @@ def _summary_source_refs(
     source_files = [
         _node_file(nodes_by_id[source_node])
         for source_node in source_nodes
-        if source_node in nodes_by_id and _node_file(nodes_by_id[source_node])
+        if source_node in nodes_by_id and _node_kind(nodes_by_id[source_node]) != 'directory' and _node_file(nodes_by_id[source_node])
     ]
     if kind != SUMMARY_KIND_NODE:
         source_files.extend(key_module_paths)
