@@ -41,7 +41,7 @@ from api.issue_map import (
 )
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision, is_safe_share_id
-from api.services import get_artifact_by_revision, get_repo_analysis
+from api.services import build_issue_navigation_guide, get_artifact_by_revision, get_repo_analysis
 from api.test_utils import (
     EVAL_RUBRIC,
     ISSUE_MAP_FIXTURE,
@@ -1938,6 +1938,12 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
         self.assertEqual(issue['comments_count'], 3)
         self.assertEqual(issue['body_excerpt'], 'Repository analysis fails when the project has many Python files or the parser exceeds configured limits.')
         self.assertEqual(cast(list[dict[str, object]], issue['labels'])[0]['name'], 'bug')
+        start_here = cast(dict[str, object], payload['start_here'])
+        self.assertIn(start_here['node_id'], selected_node_ids)
+        self.assertEqual(start_here['path'], cast(dict[str, object], candidates[0]['node'])['path'])
+        self.assertLessEqual(len(cast(list[dict[str, object]], payload['next_steps'])), 3)
+        self.assertEqual(payload['avoid'], [])
+        self.assertIn('guidance_summary', payload)
 
     def test_issue_related_nodes_returns_404_for_unknown_mock_issue(self):
         analysis_run = self._create_analysis_run()
@@ -2260,6 +2266,37 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
 
         self.assertTrue(any(warning.get('code') == 'weak_issue_evidence' for warning in warnings))
 
+    def test_build_issue_navigation_guide_prefers_path_steps_and_caps_next_steps(self):
+        candidates = [
+            {'node_id': 'pkg', 'score': 0.99, 'node': {'id': 'pkg', 'kind': 'directory', 'label': 'pkg', 'path': 'pkg'}, 'reason': 'directory should not start', 'evidence': []},
+            {'node_id': 'pkg/a.py::first', 'score': 0.91, 'node': {'id': 'pkg/a.py::first', 'kind': 'function', 'label': 'first', 'path': 'pkg/a.py', 'start_line': 10, 'end_line': 20}, 'reason': 'first symbol', 'evidence': []},
+            {'node_id': 'pkg/b.py::second', 'score': 0.82, 'node': {'id': 'pkg/b.py::second', 'kind': 'function', 'label': 'second', 'path': 'pkg/b.py', 'start_line': 1, 'end_line': 4}, 'reason': 'second symbol', 'evidence': []},
+            {'node_id': 'pkg/c.py::third', 'score': 0.73, 'node': {'id': 'pkg/c.py::third', 'kind': 'class', 'label': 'third', 'path': 'pkg/c.py', 'start_line': 5, 'end_line': 9}, 'reason': 'third symbol', 'evidence': []},
+            {'node_id': 'pkg/d.py::fourth', 'score': 0.64, 'node': {'id': 'pkg/d.py::fourth', 'kind': 'method', 'label': 'fourth', 'path': 'pkg/d.py', 'start_line': 6, 'end_line': 8}, 'reason': 'fourth symbol', 'evidence': []},
+            {'node_id': 'pkg/e.py::fifth', 'score': 0.55, 'node': {'id': 'pkg/e.py::fifth', 'kind': 'function', 'label': 'fifth', 'path': 'pkg/e.py', 'start_line': 2, 'end_line': 3}, 'reason': 'fifth symbol', 'evidence': []},
+        ]
+        investigation_path = [
+            {'node_id': 'pkg/b.py::second', 'path': 'pkg/b.py', 'action': 'inspect', 'why': 'path step should win'},
+            {'node_id': 'pkg/c.py::third', 'path': 'pkg/c.py', 'action': 'trace_call', 'why': 'follow caller'},
+            {'node_id': 'pkg/d.py::fourth', 'path': 'pkg/d.py', 'action': 'inspect', 'why': 'inspect sibling'},
+            {'node_id': 'pkg/e.py::fifth', 'path': 'pkg/e.py', 'action': 'inspect', 'why': 'extra step should be capped away'},
+        ]
+
+        guide = build_issue_navigation_guide(
+            candidates=candidates,
+            hypotheses=[{'node_id': 'pkg/a.py::first', 'confidence': 0.91, 'rationale': 'hypothesis fallback'}],
+            investigation_path=investigation_path,
+            confidence={'level': 'high', 'score': 0.91},
+            warnings=[{'code': 'sample_warning'}],
+        )
+
+        self.assertEqual(cast(dict[str, object], guide['start_here'])['node_id'], 'pkg/b.py::second')
+        self.assertEqual(cast(dict[str, object], guide['start_here'])['path'], 'pkg/b.py')
+        self.assertEqual(len(cast(list[dict[str, object]], guide['next_steps'])), 3)
+        self.assertEqual(cast(list[dict[str, object]], guide['next_steps'])[0]['action'], 'trace_call')
+        self.assertEqual(guide['avoid'], [])
+        self.assertIn('sample_warning', cast(dict[str, object], guide['guidance_summary'])['warning_codes'])
+
     def test_focus_graph_projection_keeps_highlights_real_and_edges_valid(self):
         analysis = build_issue_map_analysis_artifact()
         evidence = extract_issue_evidence(github_issue_payload(body='api/services.py _build_and_store_analysis parse_repo()'))
@@ -2331,6 +2368,8 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         focus_graph = cast(dict[str, object], payload['focus_graph'])
         selected_node_ids = cast(list[str], payload['selected_node_ids'])
         focus_node_ids = set(cast(list[str], focus_graph['node_ids']))
+        start_here = cast(dict[str, object], payload['start_here'])
+        candidate_by_id = {str(candidate['node_id']): candidate for candidate in candidates}
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['source'], 'github')
@@ -2343,11 +2382,20 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertIn('focus_graph', payload)
         self.assertIn('hypotheses', payload)
         self.assertIn('investigation_path', payload)
+        self.assertIn('start_here', payload)
+        self.assertIn('next_steps', payload)
+        self.assertIn('avoid', payload)
+        self.assertIn('guidance_summary', payload)
         self.assertIn('code_context', payload)
         self.assertIn('confidence', payload)
         self.assertGreater(len(candidates), 0)
         self.assertTrue(set(selected_node_ids).issubset(focus_node_ids))
         self.assertEqual(selected_node_ids, focus_graph['highlight_node_ids'])
+        self.assertIn(start_here['node_id'], candidate_by_id)
+        self.assertIn(start_here['node_id'], focus_node_ids)
+        self.assertEqual(start_here['path'], cast(dict[str, object], candidate_by_id[str(start_here['node_id'])]['node'])['path'])
+        self.assertLessEqual(len(cast(list[dict[str, object]], payload['next_steps'])), 3)
+        self.assertEqual(payload['avoid'], [])
         self.assertEqual(requests_get.call_count, 2)
 
     @patch('github_repo.services.requests.get')
@@ -2595,6 +2643,12 @@ class IssueMapHarnessExplanationTests(ExternalHttpBlockedMixin, TestCase):
         self.assertEqual(cast(dict[str, object], payload['confidence'])['source'], 'harness')
         self.assertEqual(cast(dict[str, object], payload['confidence'])['score'], 0.83)
         self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'pi_harness')
+        start_here = cast(dict[str, object], payload['start_here'])
+        self.assertEqual(start_here['node_id'], 'parser/services.py::parse_repo')
+        self.assertEqual(start_here['path'], 'parser/services.py')
+        self.assertEqual(start_here['confidence'], 0.83)
+        self.assertEqual(payload['avoid'], [])
+        self.assertLessEqual(len(cast(list[dict[str, object]], payload['next_steps'])), 3)
         harness_tool_names = [call['name'] for call in cast(list[dict[str, object]], cast(dict[str, object], payload['harness'])['tool_calls'])]
         self.assertIn('get_issue_context', harness_tool_names)
         self.assertIn('search_repo_symbols', harness_tool_names)
@@ -3640,13 +3694,18 @@ class SchemaRevisionDocumentationTests(TestCase):
         self.assertIn('repository', schema_text)
         self.assertIn('rate_limit', schema_text)
         self.assertIn('warnings', schema_text)
-        self.assertIn('응답의 `selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 바로 쓰고', schema_text)
+        self.assertIn('응답의 `start_here`는 초보자용', schema_text)
+        self.assertIn('`selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 사용합니다', schema_text)
         self.assertIn('include_comments', schema_text)
         self.assertIn('max_context_files', schema_text)
         self.assertIn('overview_graph', schema_text)
         self.assertIn('focus_graph', schema_text)
         self.assertIn('hypotheses', schema_text)
         self.assertIn('investigation_path', schema_text)
+        self.assertIn('start_here', schema_text)
+        self.assertIn('next_steps', schema_text)
+        self.assertIn('avoid', schema_text)
+        self.assertIn('guidance_summary', schema_text)
         self.assertIn('code_context', schema_text)
         self.assertIn('confidence', schema_text)
         self.assertIn('Mock open issues response', schema_text)

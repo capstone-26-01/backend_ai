@@ -673,6 +673,16 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
                 'evidence': evidence,
             }
         )
+    hypotheses = _issue_hypotheses(candidates)
+    investigation_path = _issue_investigation_path(candidates)
+    confidence = _issue_confidence(candidates, warnings)
+    guide = build_issue_navigation_guide(
+        candidates=candidates,
+        hypotheses=hypotheses,
+        investigation_path=investigation_path,
+        confidence=confidence,
+        warnings=warnings,
+    )
 
     return {
         'analysis_id': analysis_run.id,
@@ -694,6 +704,7 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
         },
         'selected_node_ids': [candidate['node_id'] for candidate in candidates],
         'candidates': candidates,
+        **guide,
         'limits': {'max_nodes': max_nodes},
         'warnings': warnings,
     }
@@ -754,6 +765,149 @@ def _issue_confidence(candidates: list[dict[str, Any]], warnings: list[dict[str,
         'score': round(score, 3),
         'reasons': [candidate['reason'] for candidate in candidates[:3]],
         'warning_codes': sorted(code for code in warning_codes if code),
+    }
+
+
+def _guide_candidate_by_id(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(candidate.get('node_id')): candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get('node_id')
+    }
+
+
+def _guide_node_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    node = candidate.get('node')
+    return dict(node) if isinstance(node, dict) else {}
+
+
+def _guide_entry(
+    candidate: dict[str, Any],
+    *,
+    why: Any = None,
+    confidence: Any = None,
+    action: str | None = None,
+    path: Any = None,
+) -> dict[str, Any]:
+    node = _guide_node_from_candidate(candidate)
+    node_id = str(candidate.get('node_id') or node.get('id') or '')
+    entry: dict[str, Any] = {
+        'node_id': node_id,
+        'path': path or node.get('path'),
+        'start_line': node.get('start_line'),
+        'end_line': node.get('end_line'),
+        'label': node.get('label') or node_id,
+        'kind': node.get('kind') or node.get('type') or '',
+        'why': str(why or candidate.get('reason') or 'Issue evidence points to this node.'),
+    }
+    if action:
+        entry['action'] = action
+    if confidence is not None:
+        try:
+            entry['confidence'] = round(max(0.0, min(1.0, float(confidence))), 3)
+        except (TypeError, ValueError):
+            entry['confidence'] = round(max(0.0, min(1.0, float(candidate.get('score') or 0.0))), 3)
+    return entry
+
+
+def _guide_start_candidate(
+    candidates: list[dict[str, Any]],
+    hypotheses: list[dict[str, Any]],
+    investigation_path: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    candidates_by_id = _guide_candidate_by_id(candidates)
+    for step in investigation_path:
+        if not isinstance(step, dict) or not step.get('path'):
+            continue
+        candidate = candidates_by_id.get(str(step.get('node_id')))
+        if candidate:
+            return candidate, step
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict):
+            continue
+        candidate = candidates_by_id.get(str(hypothesis.get('node_id')))
+        if candidate:
+            return candidate, hypothesis
+    for candidate in candidates:
+        node = _guide_node_from_candidate(candidate)
+        if str(node.get('kind') or node.get('type') or '') in {'function', 'method', 'class', 'module'}:
+            return candidate, None
+    for candidate in candidates:
+        node = _guide_node_from_candidate(candidate)
+        if str(node.get('kind') or node.get('type') or '') == 'file':
+            return candidate, None
+    return None, None
+
+
+def build_issue_navigation_guide(
+    *,
+    candidates: list[dict[str, Any]],
+    hypotheses: list[dict[str, Any]],
+    investigation_path: list[dict[str, Any]],
+    confidence: dict[str, Any],
+    warnings: list[dict[str, Any]],
+    low_confidence: bool = False,
+) -> dict[str, Any]:
+    warning_codes = {str(warning.get('code')) for warning in warnings if isinstance(warning, dict)}
+    start_candidate, start_source = _guide_start_candidate(candidates, hypotheses, investigation_path)
+    mode = 'harness' if confidence.get('source') == 'harness' else 'deterministic'
+    if low_confidence or start_candidate is None:
+        message = 'No exact starting node was identified from the issue evidence.'
+        return {'start_here': None, 'next_steps': [], 'avoid': [], 'guidance_summary': {'mode': mode, 'message': message, 'warning_codes': sorted(code for code in warning_codes if code)}}
+
+    start_node_id = str(start_candidate.get('node_id'))
+    start_why = start_source.get('why') if isinstance(start_source, dict) else None
+    start_confidence = start_source.get('confidence') if isinstance(start_source, dict) else None
+    start_here = _guide_entry(
+        start_candidate,
+        why=start_why or (start_source.get('rationale') if isinstance(start_source, dict) else None),
+        confidence=start_confidence if start_confidence is not None else (confidence.get('score') if 'score' in confidence else start_candidate.get('score')),
+        path=start_source.get('path') if isinstance(start_source, dict) else None,
+    )
+    start_path = start_here.get('path')
+    candidates_by_id = _guide_candidate_by_id(candidates)
+    next_steps: list[dict[str, Any]] = []
+    seen = {start_node_id}
+
+    def add_step(candidate: dict[str, Any], *, source: dict[str, Any] | None = None) -> None:
+        if len(next_steps) >= 3:
+            return
+        node_id = str(candidate.get('node_id') or '')
+        if not node_id or node_id in seen:
+            return
+        seen.add(node_id)
+        action = str((source or {}).get('action') or 'inspect')
+        why = (source or {}).get('why') or candidate.get('reason')
+        next_steps.append(_guide_entry(candidate, why=why, action=action, path=(source or {}).get('path')))
+
+    for step in investigation_path:
+        if not isinstance(step, dict):
+            continue
+        candidate = candidates_by_id.get(str(step.get('node_id')))
+        if candidate:
+            add_step(candidate, source=step)
+    for candidate in candidates:
+        node = _guide_node_from_candidate(candidate)
+        if start_path and node.get('path') == start_path:
+            continue
+        add_step(candidate)
+    for candidate in candidates:
+        add_step(candidate)
+
+    summary_target = start_here['node_id']
+    if next_steps:
+        message = f'Start with {summary_target}, then inspect {next_steps[0]["node_id"]}.'
+    else:
+        message = f'Start with {summary_target}.'
+    return {
+        'start_here': start_here,
+        'next_steps': next_steps,
+        'avoid': [],
+        'guidance_summary': {
+            'mode': mode,
+            'message': message,
+            'warning_codes': sorted(code for code in warning_codes if code),
+        },
     }
 
 
@@ -961,6 +1115,13 @@ def get_issue_map_response(
             warnings.append(_issue_harness_warning(error))
     else:
         warnings.append({'code': 'harness_disabled', 'message': 'Issue harness flag가 꺼져 있어 deterministic issue ranking을 반환했습니다.'})
+    guide = build_issue_navigation_guide(
+        candidates=candidates,
+        hypotheses=hypotheses,
+        investigation_path=investigation_path,
+        confidence=confidence,
+        warnings=warnings,
+    )
 
     return {
         'analysis_id': analysis_run.id,
@@ -976,6 +1137,7 @@ def get_issue_map_response(
         'focus_graph': focus_graph,
         'hypotheses': hypotheses,
         'investigation_path': investigation_path,
+        **guide,
         'code_context': code_context,
         'confidence': confidence,
         'harness': harness,
