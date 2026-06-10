@@ -18,7 +18,7 @@ QUOTED_STRING_RE = re.compile(r'(?P<quote>["\'])(?P<text>[^"\']{4,160})(?P=quote
 CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(')
 ERROR_LINE_RE = re.compile(r'(?i)\b(error|exception|traceback|failed|failure|timeout|crash|invalid)\b')
 SYMBOL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-EXCEPTION_RE = re.compile(r'\b(?P<class>(?:Exception|Timeout|Failure|[A-Z][A-Za-z0-9_.]*(?:Error|Exception|Timeout)))(?::\s*(?P<message>[^\n`]{3,180}))?')
+EXCEPTION_RE = re.compile(r'\b(?P<class>(?:[A-Z][A-Za-z0-9_.]*(?:Error|Exception|Timeout|Failure)|Exception|Timeout|Failure))\b(?::\s*(?P<message>[^\n`]{3,180}))?')
 ROUTE_RE = re.compile(r'(?<![\w.-])(?P<route>/(?:[A-Za-z0-9_.{}:-]+/)*[A-Za-z0-9_.{}:-]*/?)(?![\w.-])')
 CONFIG_NAME_RE = re.compile(r'\b(?P<name>[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b')
 TEST_NAME_RE = re.compile(r'\b(?P<name>test_[A-Za-z0-9_]+)\b')
