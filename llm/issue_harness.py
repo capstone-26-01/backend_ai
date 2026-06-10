@@ -129,6 +129,11 @@ def _bounded_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         'stack_frames': _bounded_list(evidence.get('stack_frames'), 40),
         'quoted_errors': _bounded_list(evidence.get('quoted_errors'), 20),
         'labels': _bounded_list(evidence.get('labels'), 20),
+        'exception_mentions': _bounded_list(evidence.get('exception_mentions'), 20),
+        'route_mentions': _bounded_list(evidence.get('route_mentions'), 40),
+        'config_mentions': _bounded_list(evidence.get('config_mentions'), 40),
+        'test_mentions': _bounded_list(evidence.get('test_mentions'), 40),
+        'quoted_strings': _bounded_list(evidence.get('quoted_strings'), 20),
     }
 
 

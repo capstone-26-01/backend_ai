@@ -2158,6 +2158,30 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertTrue(any('Parser timeout error' in str(item['text']) for item in quoted_errors))
         self.assertIn('rm -rf / should be ignored as text', cast(list[dict[str, object]], evidence['comments'])[0]['body'])
 
+    def test_extract_issue_evidence_returns_route_config_exception_test_and_quoted_string_evidence(self):
+        issue = github_issue_payload(
+            body=(
+                'ValueError: Invalid related-nodes payload\n'
+                'POST /api/issues/related-nodes/ fails when SECRET_KEY is missing.\n'
+                'The API returns "No exact origin found".\n'
+                'Failing test: test_related_nodes_returns_old_fields_and_issue_graph_fields.'
+            ),
+        )
+
+        evidence = extract_issue_evidence(issue)
+
+        exception_mentions = cast(list[dict[str, object]], evidence['exception_mentions'])
+        route_mentions = cast(list[dict[str, object]], evidence['route_mentions'])
+        config_mentions = cast(list[dict[str, object]], evidence['config_mentions'])
+        test_mentions = cast(list[dict[str, object]], evidence['test_mentions'])
+        quoted_strings = cast(list[dict[str, object]], evidence['quoted_strings'])
+
+        self.assertTrue(any(item['class'] == 'ValueError' and 'Invalid related-nodes payload' in str(item['message']) for item in exception_mentions))
+        self.assertTrue(any(item['route'] == '/api/issues/related-nodes/' for item in route_mentions))
+        self.assertTrue(any(item['name'] == 'SECRET_KEY' for item in config_mentions))
+        self.assertTrue(any(item['name'] == 'test_related_nodes_returns_old_fields_and_issue_graph_fields' for item in test_mentions))
+        self.assertTrue(any(item['text'] == 'No exact origin found' for item in quoted_strings))
+
     def test_rank_issue_candidates_uses_exact_file_symbol_label_and_comment_evidence(self):
         analysis = build_issue_map_analysis_artifact()
         issue = github_issue_payload(
@@ -2173,6 +2197,68 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertIn('parser/services.py::parse_repo', candidate_ids)
         self.assertTrue(any(item['type'] in {'stack_frame', 'symbol', 'file_path'} for item in candidates[0]['evidence']))
         self.assertFalse(any(warning.get('code') == 'no_ranked_issue_nodes' for warning in warnings))
+
+    def test_rank_issue_candidates_uses_route_config_exception_and_quoted_string_evidence(self):
+        analysis = {
+            'nodes': [
+                {'id': 'api/views.py::issue_related_nodes', 'type': 'function', 'label': 'issue_related_nodes', 'file': 'api/views.py', 'start_line': 10, 'end_line': 20},
+                {'id': 'config/settings.py', 'type': 'file', 'label': 'settings.py', 'file': 'config/settings.py'},
+                {'id': 'api/errors.py::format_issue_error', 'type': 'function', 'label': 'format_issue_error', 'file': 'api/errors.py', 'start_line': 1, 'end_line': 4},
+                {'id': 'parser/services.py::parse_repo', 'type': 'function', 'label': 'parse_repo', 'file': 'parser/services.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [],
+            'entrypoints': [],
+            'key_modules': [],
+            'file_contents': {
+                'api/views.py': 'urlpatterns = ["api/issues/related-nodes/"]\ndef issue_related_nodes(request):\n    pass\n',
+                'config/settings.py': 'SECRET_KEY = env("SECRET_KEY")\n',
+                'api/errors.py': 'def format_issue_error():\n    return "No exact origin found"\n',
+                'parser/services.py': 'def parse_repo(files):\n    return files\n',
+            },
+        }
+        issue = github_issue_payload(
+            body='POST /api/issues/related-nodes/ fails with RuntimeError: No exact origin found when SECRET_KEY is absent.',
+        )
+
+        candidates, warnings = rank_issue_candidates(analysis, extract_issue_evidence(issue), max_candidates=4)
+        candidate_ids = [candidate['node_id'] for candidate in candidates]
+
+        self.assertLess(candidate_ids.index('api/views.py::issue_related_nodes'), candidate_ids.index('parser/services.py::parse_repo'))
+        self.assertIn('config/settings.py', candidate_ids)
+        self.assertIn('api/errors.py::format_issue_error', candidate_ids)
+        self.assertTrue(any(item['type'] == 'route' for item in candidates[candidate_ids.index('api/views.py::issue_related_nodes')]['evidence']))
+        self.assertFalse(any(warning.get('code') == 'no_ranked_issue_nodes' for warning in warnings))
+
+    def test_rank_issue_candidates_deprioritizes_test_nodes_unless_issue_is_test_specific(self):
+        analysis = {
+            'nodes': [
+                {'id': 'parser/services.py::parse_repo', 'type': 'function', 'label': 'parse_repo', 'file': 'parser/services.py', 'start_line': 1, 'end_line': 3},
+                {'id': 'tests/test_parser.py::test_parse_repo_timeout', 'type': 'function', 'label': 'test_parse_repo_timeout', 'file': 'tests/test_parser.py', 'start_line': 1, 'end_line': 4},
+            ],
+            'edges': [],
+            'entrypoints': [],
+            'key_modules': [],
+            'file_contents': {
+                'parser/services.py': 'def parse_repo(files):\n    raise TimeoutError("parser timeout")\n',
+                'tests/test_parser.py': 'def test_parse_repo_timeout():\n    assert parse_repo([])\n',
+            },
+        }
+
+        generic_evidence = extract_issue_evidence(github_issue_payload(body='parse_repo raises parser timeout'))
+        generic_candidates, _warnings = rank_issue_candidates(analysis, generic_evidence, max_candidates=2)
+        test_evidence = extract_issue_evidence(github_issue_payload(body='pytest failing test_parse_repo_timeout in tests/test_parser.py'))
+        test_candidates, _warnings = rank_issue_candidates(analysis, test_evidence, max_candidates=2)
+
+        self.assertEqual(generic_candidates[0]['node_id'], 'parser/services.py::parse_repo')
+        self.assertEqual(test_candidates[0]['node_id'], 'tests/test_parser.py::test_parse_repo_timeout')
+
+    def test_rank_issue_candidates_emits_weak_evidence_warning_for_label_only_match(self):
+        analysis = build_issue_map_analysis_artifact()
+        evidence = extract_issue_evidence(github_issue_payload(body='please investigate', labels=[github_issue_label('parser', '1d76db', '')]))
+
+        _candidates, warnings = rank_issue_candidates(analysis, evidence, max_candidates=4)
+
+        self.assertTrue(any(warning.get('code') == 'weak_issue_evidence' for warning in warnings))
 
     def test_focus_graph_projection_keeps_highlights_real_and_edges_valid(self):
         analysis = build_issue_map_analysis_artifact()
