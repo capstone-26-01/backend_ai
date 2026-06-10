@@ -150,6 +150,17 @@ function nodePath(job: IssueHarnessJob, nodeId: string): string | undefined {
   return nodeById(job, nodeId)?.path;
 }
 
+function safeNodeId(job: IssueHarnessJob, rawNodeId: string): string {
+  const nodeId = String(rawNodeId || "");
+  if (!nodeId || path.isAbsolute(nodeId) || nodeId.includes("..") || nodeId.includes("\\") || /[\r\n]/.test(nodeId)) {
+    throw new Error("node_id must be a safe graph node id");
+  }
+  if (!nodeById(job, nodeId)) {
+    throw new Error("node_id is not available in the bounded harness job");
+  }
+  return nodeId;
+}
+
 function validNodeIds(job: IssueHarnessJob): Set<string> {
   return new Set((job.graph?.nodes || []).map((node) => node.id || "").filter(Boolean));
 }
@@ -264,6 +275,36 @@ function searchText(job: IssueHarnessJob, query: string) {
   return matches.slice(0, 40);
 }
 
+function compactNode(node: NonNullable<IssueHarnessJob["graph"]>["nodes"][number] | undefined) {
+  if (!node) return undefined;
+  return {
+    id: node.id,
+    kind: node.kind || node.type,
+    type: node.type,
+    label: node.label,
+    symbol: node.symbol,
+    path: node.path,
+    parent_id: node.parent_id,
+    start_line: node.start_line,
+    end_line: node.end_line,
+  };
+}
+
+function findContainer(job: IssueHarnessJob, node: NonNullable<IssueHarnessJob["graph"]>["nodes"][number]) {
+  const nodes = job.graph?.nodes || [];
+  if (node.parent_id) {
+    const parent = nodes.find((candidate) => candidate.id === node.parent_id);
+    if (parent) return compactNode(parent);
+  }
+  const fileNode = nodes.find((candidate) => candidate.path === node.path && ["file", "module"].includes(String(candidate.kind || candidate.type || "")));
+  if (fileNode && fileNode.id !== node.id) return compactNode(fileNode);
+  const nodeId = String(node.id || "");
+  const prefixContainers = nodes
+    .filter((candidate) => candidate.id && candidate.id !== node.id && nodeId.startsWith(`${candidate.id}::`))
+    .sort((left, right) => String(right.id || "").length - String(left.id || "").length);
+  return compactNode(prefixContainers[0]);
+}
+
 const listRepoFiles = defineTool({
   name: "list_repo_files",
   label: "List Repo Files",
@@ -329,6 +370,83 @@ const readRepoFile = defineTool({
     const end = Math.min(lines.length, Number(params.end_line || Math.min(lines.length, start + 120)));
     const excerpt = lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 8000);
     const result = { path: filePath, start_line: start, end_line: end, excerpt };
+    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+  },
+});
+
+const readNodeContext = defineTool({
+  name: "read_node_context",
+  label: "Read Node Context",
+  description: "Read bounded code, container, and direct graph neighbors for one exact node.",
+  promptSnippet: "Use after symbol search to inspect the most relevant candidate node in context",
+  parameters: Type.Object({
+    node_id: Type.String(),
+    before: Type.Optional(Type.Number()),
+    after: Type.Optional(Type.Number()),
+  }),
+  async execute(_toolCallId, params) {
+    const budgetError = recordToolCall("read_node_context", params);
+    if (budgetError) return budgetError;
+    const job = loadJob();
+    const nodeId = safeNodeId(job, params.node_id);
+    const node = nodeById(job, nodeId)!;
+    const warnings: string[] = [];
+
+    const before = Math.max(0, Math.min(80, Number(params.before ?? 8)));
+    const after = Math.max(0, Math.min(80, Number(params.after ?? 20)));
+    const nodeStart = Number(node.start_line || 0);
+    const nodeEnd = Number(node.end_line || node.start_line || 0);
+    const filePath = node.path || "";
+    let context: Record<string, unknown> = {
+      path: filePath || undefined,
+      start_line: node.start_line,
+      end_line: node.end_line,
+      excerpt: "",
+    };
+
+    if (!filePath || !Object.prototype.hasOwnProperty.call(job.file_contents || {}, filePath)) {
+      warnings.push("file_content_unavailable");
+    } else if (!nodeStart || !nodeEnd) {
+      warnings.push("line_range_unavailable");
+      const lines = String((job.file_contents || {})[filePath] || "").split(/\r?\n/);
+      const end = Math.min(lines.length, 120);
+      context = {
+        path: filePath,
+        start_line: 1,
+        end_line: end,
+        excerpt: lines.slice(0, end).map((line, index) => `${index + 1}: ${line}`).join("\n").slice(0, 8000),
+      };
+    } else {
+      const lines = String((job.file_contents || {})[filePath] || "").split(/\r?\n/);
+      const start = Math.max(1, nodeStart - before);
+      const end = Math.min(lines.length, nodeEnd + after);
+      context = {
+        path: filePath,
+        start_line: start,
+        end_line: end,
+        excerpt: lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 8000),
+      };
+    }
+
+    const incoming = (job.graph?.edges || []).filter((edge) => edge.target === nodeId).slice(0, 50);
+    const outgoing = (job.graph?.edges || []).filter((edge) => edge.source === nodeId).slice(0, 50);
+    const neighborIds = new Set(
+      [...incoming, ...outgoing]
+        .flatMap((edge) => [edge.source || "", edge.target || ""])
+        .filter((candidateId) => candidateId && candidateId !== nodeId)
+    );
+    const neighborNodes = (job.graph?.nodes || []).filter((candidate) => neighborIds.has(candidate.id || "")).slice(0, 50).map(compactNode);
+    const result = {
+      node: compactNode(node),
+      context,
+      container: findContainer(job, node),
+      neighbors: {
+        incoming,
+        outgoing,
+        nodes: neighborNodes,
+      },
+      warnings,
+    };
     return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
   },
 });
@@ -437,10 +555,14 @@ const finishIssueMapTranscript = defineTool({
       };
       return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
     }
-    if (allNodeIds.length && !toolNames.includes("read_repo_file") && !toolNames.includes("get_neighbors")) {
+    const hasInspection =
+      toolNames.includes("read_repo_file") ||
+      toolNames.includes("get_neighbors") ||
+      toolNames.includes("read_node_context");
+    if (allNodeIds.length && !hasInspection) {
       const error = {
         error: "missing_inspection",
-        instruction: "Retry after reading relevant code with read_repo_file or inspecting graph neighbors with get_neighbors.",
+        instruction: "Retry after inspecting a candidate with read_node_context, read_repo_file, or get_neighbors.",
       };
       return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
     }
@@ -514,5 +636,6 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(readRepoFile);
   pi.registerTool(getNode);
   pi.registerTool(getNeighbors);
+  pi.registerTool(readNodeContext);
   pi.registerTool(finishIssueMapTranscript);
 }

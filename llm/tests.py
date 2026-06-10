@@ -306,9 +306,11 @@ class IssueHarnessRuntimeTests(TestCase):
     def test_issue_harness_job_contains_bounded_graph_and_file_tools(self):
         job = self._job()
 
+        tool_names = {tool['name'] for tool in job['available_tools']}
         self.assertEqual(job['task'], 'investigate_github_issue_origin')
-        self.assertIn('get_issue_context', {tool['name'] for tool in job['available_tools']})
-        self.assertIn('search_repo_symbols', {tool['name'] for tool in job['available_tools']})
+        self.assertIn('get_issue_context', tool_names)
+        self.assertIn('search_repo_symbols', tool_names)
+        self.assertIn('read_node_context', tool_names)
         self.assertIn('parser/services.py::parse_repo', {node['id'] for node in job['graph']['nodes']})
         self.assertIn('parser/services.py', job['file_contents'])
         self.assertNotIn('/etc/passwd', job['file_contents'])
@@ -398,6 +400,27 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertEqual([call['name'] for call in result.tool_calls], ['get_issue_context', 'list_repo_files', 'search_repo_symbols', 'read_repo_file'])
         self.assertEqual(result.metadata['variant_id'], 'test-harness')
 
+    def test_run_issue_harness_accepts_read_node_context_as_inspection(self):
+        payload = {
+            'variant_id': 'test-harness',
+            'tool_calls': [
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
+                {'name': 'read_node_context', 'arguments': {'node_id': 'parser/services.py::parse_repo'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'parser/services.py::parse_repo', 'confidence': 0.8, 'rationale': 'read node context'}],
+                'investigation_path': [{'node_id': 'parser/services.py::parse_repo', 'path': 'parser/services.py', 'why': 'inspect parser node context'}],
+                'confidence': {'score': 0.8, 'reasons': ['tool-backed']},
+            },
+        }
+
+        result = run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
+
+        self.assertEqual(result.output['hypotheses'][0]['node_id'], 'parser/services.py::parse_repo')
+        self.assertEqual([call['name'] for call in result.tool_calls], ['get_issue_context', 'list_repo_files', 'search_repo_symbols', 'read_node_context'])
+
     def test_run_issue_harness_rejects_final_answer_without_tool_work(self):
         payload = {
             'tool_calls': [],
@@ -425,7 +448,7 @@ class IssueHarnessRuntimeTests(TestCase):
             },
         }
 
-        with self.assertRaisesMessage(IssueHarnessUnavailable, 'inspect code or graph neighbors'):
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'inspect code, node context, or graph neighbors'):
             run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
 
     def test_run_issue_harness_rejects_missing_issue_context(self):
@@ -517,6 +540,35 @@ class IssueHarnessRuntimeTests(TestCase):
 
         self.assertIsNone(transcript)
         self.assertEqual(metadata['event_count'], 1)
+
+    def test_pi_runner_command_and_prompt_include_read_node_context(self):
+        from argparse import Namespace
+        from llm import pi_issue_runner
+
+        args = Namespace(
+            pi_bin='npx',
+            pi_package='@earendil-works/pi-coding-agent@0.78.0',
+            extension=pi_issue_runner.DEFAULT_EXTENSION,
+            provider='opencode',
+            model='kimi-k2.5',
+        )
+
+        command = pi_issue_runner.build_command(args, self._job())
+        tools = command[command.index('--tools') + 1]
+        prompt = pi_issue_runner.build_prompt(self._job())
+
+        self.assertIn('get_neighbors,read_node_context,finish_issue_map_transcript', tools)
+        self.assertIn('read_node_context', prompt)
+        self.assertLess(tools.index('read_node_context'), tools.index('finish_issue_map_transcript'))
+
+    def test_runtime_finish_gate_accepts_read_node_context_tool_name(self):
+        extension_path = settings.BASE_DIR / 'llm' / 'pi_issue_extension.ts'
+        text = extension_path.read_text(encoding='utf-8')
+
+        self.assertIn('name: "read_node_context"', text)
+        self.assertIn('recordToolCall("read_node_context"', text)
+        self.assertIn('toolNames.includes("read_node_context")', text)
+        self.assertNotIn('toolNames.includes("readNodeContext")', text)
 
 
 class ArtifactToolboxTests(TestCase):

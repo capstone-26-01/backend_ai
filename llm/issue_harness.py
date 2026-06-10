@@ -304,6 +304,7 @@ def build_issue_harness_job(
             {'name': 'read_repo_file', 'purpose': 'Read a bounded file excerpt from the analysis artifact.'},
             {'name': 'get_node', 'purpose': 'Inspect exact node metadata.'},
             {'name': 'get_neighbors', 'purpose': 'Inspect incoming/outgoing graph neighbors.'},
+            {'name': 'read_node_context', 'purpose': 'Inspect bounded code, container, and graph neighbors for one exact node.'},
             {'name': 'finish_issue_map_transcript', 'purpose': 'Return final node IDs and investigation path.'},
         ],
         'limits': {
@@ -379,8 +380,9 @@ def _validate_harness_work(output: Mapping[str, Any], tool_calls: Sequence[Mappi
         raise IssueHarnessUnavailable('harness_missing_file_listing', 'Issue harness must list bounded repository files before finishing.')
     if 'search_repo_symbols' not in names and 'search_repo_text' not in names:
         raise IssueHarnessUnavailable('harness_missing_search', 'Issue harness must search repository symbols or text before finishing.')
-    if has_final_nodes and 'read_repo_file' not in names and 'get_neighbors' not in names:
-        raise IssueHarnessUnavailable('harness_missing_inspection', 'Issue harness must inspect code or graph neighbors before naming origin nodes.')
+    inspection_tools = {'read_repo_file', 'get_neighbors', 'read_node_context'}
+    if has_final_nodes and not any(name in inspection_tools for name in names):
+        raise IssueHarnessUnavailable('harness_missing_inspection', 'Issue harness must inspect code, node context, or graph neighbors before naming origin nodes.')
 
 
 def run_issue_harness(
