@@ -40,7 +40,7 @@ from api.issue_map import (
     sanitize_issue_explanation_output,
 )
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
-from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision, is_safe_share_id
+from api.serializers import IssueNavigationStepSerializer, extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision, is_safe_share_id
 from api.services import build_issue_navigation_guide, get_artifact_by_revision, get_repo_analysis, issue_candidates_are_low_confidence
 from api.test_utils import (
     EVAL_RUBRIC,
@@ -2361,6 +2361,26 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertEqual(guide['avoid'], [])
         self.assertIn('sample_warning', cast(dict[str, object], guide['guidance_summary'])['warning_codes'])
 
+    def test_build_issue_navigation_guide_skips_directory_start_from_path(self):
+        candidates = [
+            {'node_id': 'pkg', 'score': 0.99, 'node': {'id': 'pkg', 'kind': 'directory', 'label': 'pkg', 'path': 'pkg'}, 'reason': 'directory should not start', 'evidence': []},
+            {'node_id': 'pkg/app.py::handle', 'score': 0.88, 'node': {'id': 'pkg/app.py::handle', 'kind': 'function', 'label': 'handle', 'path': 'pkg/app.py', 'start_line': 12, 'end_line': 30}, 'reason': 'symbol should start', 'evidence': []},
+            {'node_id': 'pkg/app.py', 'score': 0.77, 'node': {'id': 'pkg/app.py', 'kind': 'file', 'label': 'app.py', 'path': 'pkg/app.py'}, 'reason': 'file fallback', 'evidence': []},
+        ]
+
+        guide = build_issue_navigation_guide(
+            candidates=candidates,
+            hypotheses=[],
+            investigation_path=[
+                {'node_id': 'pkg', 'path': 'pkg', 'action': 'inspect', 'why': 'directory came first'},
+                {'node_id': 'pkg/app.py::handle', 'path': 'pkg/app.py', 'action': 'inspect', 'why': 'open the handler'},
+            ],
+            confidence={'level': 'high', 'score': 0.88},
+            warnings=[],
+        )
+
+        self.assertEqual(cast(dict[str, object], guide['start_here'])['node_id'], 'pkg/app.py::handle')
+
     def test_low_confidence_guide_returns_search_steps_without_start_node(self):
         candidates = [
             {
@@ -2388,7 +2408,14 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertIsNone(guide['start_here'])
         self.assertEqual(cast(dict[str, object], guide['guidance_summary'])['mode'], 'low_confidence')
         self.assertIn('timeout', cast(list[str], cast(dict[str, object], guide['guidance_summary'])['search_terms']))
-        self.assertEqual(cast(list[dict[str, object]], guide['next_steps'])[0]['action'], 'search')
+        first_step = cast(list[dict[str, object]], guide['next_steps'])[0]
+        self.assertEqual(set(first_step), {'path', 'action', 'why'})
+        self.assertEqual(first_step['action'], 'search')
+
+    def test_issue_navigation_step_serializer_allows_search_step_without_node_id(self):
+        serializer = IssueNavigationStepSerializer(data={'path': 'api/views.py', 'action': 'search', 'why': 'Search this file for the reproduced error.'})
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
 
     def test_focus_graph_projection_keeps_highlights_real_and_edges_valid(self):
         analysis = build_issue_map_analysis_artifact()
