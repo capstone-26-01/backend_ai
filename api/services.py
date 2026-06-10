@@ -453,7 +453,7 @@ def _get_succeeded_artifact_record_by_id(analysis_id: int) -> tuple[AnalysisRun,
         return None
 
 
-def _get_issue_map_artifact_record(analysis_id: int) -> tuple[AnalysisRun, dict[str, Any]]:
+def _get_issue_map_artifact_record(analysis_id: int) -> tuple[AnalysisRun, AnalysisArtifact, dict[str, Any]]:
     analysis_run = (
         AnalysisRun.objects
         .select_related('repository')
@@ -478,7 +478,7 @@ def _get_issue_map_artifact_record(analysis_id: int) -> tuple[AnalysisRun, dict[
     payload = artifact.payload
     if not isinstance(payload, dict) or not isinstance(payload.get('nodes'), list) or not isinstance(payload.get('edges'), list):
         raise IssueMapResponseError('analysis_artifact_invalid', '분석 artifact 형식이 올바르지 않습니다.', status_code=500, metadata={'analysis_id': analysis_id})
-    return analysis_run, payload
+    return analysis_run, artifact, payload
 
 
 def _mock_github_user(login: str) -> dict[str, str]:
@@ -1123,6 +1123,44 @@ def _comments_unavailable_warning(error: GithubIssueApiError) -> dict[str, Any]:
     }
 
 
+ISSUE_MAP_CACHE_VERSION = 'v2'
+
+
+def _issue_map_cache_key(
+    *,
+    issue_number: int,
+    include_comments: bool,
+    max_context_files: int,
+    max_nodes: int,
+    harness_enabled: bool,
+) -> str:
+    comments_label = 'comments_true' if include_comments else 'comments_false'
+    harness_label = f'harness_{ISSUE_MAP_CACHE_VERSION}' if harness_enabled else 'harness_off'
+    return f'issue_map:{int(issue_number)}:{ISSUE_MAP_CACHE_VERSION}:{comments_label}:ctx_{int(max_context_files)}:nodes_{int(max_nodes)}:{harness_label}'
+
+
+def _issue_map_cache_enabled(*, include_comments: bool, harness_enabled: bool) -> bool:
+    return not include_comments and not harness_enabled
+
+
+def _cached_issue_map_response(artifact: AnalysisArtifact, cache_key: str) -> dict[str, Any] | None:
+    payload = artifact.payload if isinstance(artifact.payload, dict) else {}
+    summaries = payload.get('summaries')
+    if not isinstance(summaries, dict):
+        return None
+    cached = summaries.get(cache_key)
+    return dict(cached) if isinstance(cached, dict) else None
+
+
+def _store_issue_map_response_cache(artifact: AnalysisArtifact, cache_key: str, response: dict[str, Any]) -> None:
+    payload = dict(artifact.payload)
+    summaries = dict(payload.get('summaries') or {})
+    summaries[cache_key] = dict(response)
+    payload['summaries'] = summaries
+    artifact.payload = payload
+    artifact.save(update_fields=['payload'])
+
+
 def get_issue_map_response(
     analysis_id: int,
     issue_number: int,
@@ -1131,10 +1169,23 @@ def get_issue_map_response(
     include_comments: bool = True,
     max_context_files: int = 4,
 ) -> dict[str, Any]:
-    analysis_run, analysis = _get_issue_map_artifact_record(analysis_id)
+    analysis_run, artifact, analysis = _get_issue_map_artifact_record(analysis_id)
     repo_path = analysis_run.repository.full_name
     max_nodes = max(1, min(max_nodes, 20))
     max_context_files = max(1, min(max_context_files, 10))
+    harness_enabled = _issue_harness_enabled()
+    cache_enabled = _issue_map_cache_enabled(include_comments=include_comments, harness_enabled=harness_enabled)
+    cache_key = _issue_map_cache_key(
+        issue_number=issue_number,
+        include_comments=include_comments,
+        max_context_files=max_context_files,
+        max_nodes=max_nodes,
+        harness_enabled=harness_enabled,
+    )
+    if cache_enabled:
+        cached_response = _cached_issue_map_response(artifact, cache_key)
+        if cached_response is not None:
+            return cached_response
 
     issue = get_github_issue_detail_response(repo_path, issue_number)
     comments: list[dict[str, Any]] = []
@@ -1171,12 +1222,12 @@ def get_issue_map_response(
         'include_comments': include_comments,
         'max_context_files': max_context_files,
         'max_candidates': max(12, max_nodes * 3),
-        'llm_enabled': _issue_harness_enabled(),
-        'harness_enabled': _issue_harness_enabled(),
+        'llm_enabled': harness_enabled,
+        'harness_enabled': harness_enabled,
     }
     harness: dict[str, Any] = {'enabled': False, 'source': 'deterministic'}
 
-    if _issue_harness_enabled():
+    if harness_enabled:
         try:
             harness_job = build_issue_harness_job(
                 repo_path=repo_path,
@@ -1250,7 +1301,7 @@ def get_issue_map_response(
         low_confidence=low_confidence,
     )
 
-    return {
+    response = {
         'analysis_id': analysis_run.id,
         'repo': repo_path,
         'revision': analysis_run.revision,
@@ -1271,6 +1322,9 @@ def get_issue_map_response(
         'limits': limits,
         'warnings': warnings,
     }
+    if cache_enabled:
+        _store_issue_map_response_cache(artifact, cache_key, response)
+    return response
 
 
 def _summary_response(analysis_run: AnalysisRun, summary: dict[str, Any], *, cached: bool) -> dict[str, Any]:
