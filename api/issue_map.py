@@ -18,7 +18,7 @@ QUOTED_STRING_RE = re.compile(r'(?P<quote>["\'])(?P<text>[^"\']{4,160})(?P=quote
 CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(')
 ERROR_LINE_RE = re.compile(r'(?i)\b(error|exception|traceback|failed|failure|timeout|crash|invalid)\b')
 SYMBOL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-EXCEPTION_RE = re.compile(r'\b(?P<class>[A-Z][A-Za-z0-9_.]*(?:Error|Exception|Timeout))(?::\s*(?P<message>[^\n`]{3,180}))?')
+EXCEPTION_RE = re.compile(r'\b(?P<class>(?:Exception|Timeout|Failure|[A-Z][A-Za-z0-9_.]*(?:Error|Exception|Timeout)))(?::\s*(?P<message>[^\n`]{3,180}))?')
 ROUTE_RE = re.compile(r'(?<![\w.-])(?P<route>/(?:[A-Za-z0-9_.{}:-]+/)*[A-Za-z0-9_.{}:-]*/?)(?![\w.-])')
 CONFIG_NAME_RE = re.compile(r'\b(?P<name>[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b')
 TEST_NAME_RE = re.compile(r'\b(?P<name>test_[A-Za-z0-9_]+)\b')
@@ -55,6 +55,10 @@ def _dedupe(items: list[dict[str, Any]], *keys: str) -> list[dict[str, Any]]:
         seen.add(marker)
         deduped.append(item)
     return deduped
+
+
+def _dedupe_limited(items: list[dict[str, Any]], limit: int, *keys: str) -> list[dict[str, Any]]:
+    return _dedupe(items, *keys)[:limit]
 
 
 def _extract_file_mentions(source: str, text: str) -> list[dict[str, Any]]:
@@ -245,6 +249,11 @@ def extract_issue_evidence(
             )
 
     labels = _issue_labels(issue)
+    bounded_exception_mentions = _dedupe_limited(exception_mentions, 20, 'class', 'message', 'source')
+    bounded_route_mentions = _dedupe_limited(route_mentions, 40, 'route', 'source')
+    bounded_config_mentions = _dedupe_limited(config_mentions, 40, 'name', 'source')
+    bounded_test_mentions = _dedupe_limited(test_mentions, 40, 'name', 'path', 'keyword', 'source')
+    bounded_quoted_strings = _dedupe_limited(quoted_strings, 20, 'text', 'source')
     query_parts = [
         _string(issue.get('title')),
         _string(issue.get('body') or issue.get('body_excerpt')),
@@ -252,11 +261,11 @@ def extract_issue_evidence(
         ' '.join(comment.get('body', '') for comment in comments or [] if isinstance(comment.get('body'), str)),
         ' '.join(item['path'] for item in file_mentions),
         ' '.join(item['symbol'] for item in symbol_mentions),
-        ' '.join(item.get('text', '') for item in exception_mentions),
-        ' '.join(item.get('route', '') for item in route_mentions),
-        ' '.join(item.get('name', '') for item in config_mentions),
-        ' '.join(item.get('name', '') or item.get('path', '') or item.get('keyword', '') for item in test_mentions),
-        ' '.join(item.get('text', '') for item in quoted_strings),
+        ' '.join(item.get('text', '') for item in bounded_exception_mentions),
+        ' '.join(item.get('route', '') for item in bounded_route_mentions),
+        ' '.join(item.get('name', '') for item in bounded_config_mentions),
+        ' '.join(item.get('name', '') or item.get('path', '') or item.get('keyword', '') for item in bounded_test_mentions),
+        ' '.join(item.get('text', '') for item in bounded_quoted_strings),
     ]
     return {
         'query': ' '.join(part for part in query_parts if part),
@@ -264,11 +273,11 @@ def extract_issue_evidence(
         'symbol_mentions': _dedupe(symbol_mentions, 'symbol', 'source'),
         'stack_frames': _dedupe(stack_frames, 'path', 'line', 'symbol', 'source'),
         'quoted_errors': _dedupe(quoted_errors, 'text', 'source'),
-        'exception_mentions': _dedupe(exception_mentions, 'class', 'message', 'source'),
-        'route_mentions': _dedupe(route_mentions, 'route', 'source'),
-        'config_mentions': _dedupe(config_mentions, 'name', 'source'),
-        'test_mentions': _dedupe(test_mentions, 'name', 'path', 'keyword', 'source'),
-        'quoted_strings': _dedupe(quoted_strings, 'text', 'source'),
+        'exception_mentions': bounded_exception_mentions,
+        'route_mentions': bounded_route_mentions,
+        'config_mentions': bounded_config_mentions,
+        'test_mentions': bounded_test_mentions,
+        'quoted_strings': bounded_quoted_strings,
         'labels': labels,
         'comments': [
             {
@@ -685,6 +694,7 @@ def _apply_quoted_string_boosts(
 
 
 def _apply_test_boosts_or_penalties(
+    analysis: Mapping[str, Any],
     nodes_by_id: Mapping[str, Mapping[str, Any]],
     evidence: Mapping[str, Any],
     scores: dict[str, int],
@@ -701,6 +711,7 @@ def _apply_test_boosts_or_penalties(
         for mention in _safe_evidence_list(evidence.get('test_mentions'))
         if isinstance(mention, Mapping) and mention.get('path')
     }
+    matched_test_ids: set[str] = set()
     for node_id, node in nodes_by_id.items():
         if not _is_test_node(node):
             continue
@@ -713,6 +724,7 @@ def _apply_test_boosts_or_penalties(
         node_path = _node_path(node) or ''
         final_segment = _final_id_segment(node_id).lower()
         if node_path in test_paths or final_segment in test_names or _node_label(node).lower() in test_names:
+            matched_test_ids.add(node_id)
             _add_score(
                 scores,
                 evidence_by_node,
@@ -721,6 +733,30 @@ def _apply_test_boosts_or_penalties(
                 evidence_type='test',
                 message='Issue explicitly names this failing test context.',
             )
+    if not matched_test_ids:
+        return
+    for edge in analysis.get('edges', []):
+        if not isinstance(edge, Mapping):
+            continue
+        source = _edge_source(edge)
+        target = _edge_target(edge)
+        if source in matched_test_ids and target in nodes_by_id:
+            production_id = target
+        elif target in matched_test_ids and source in nodes_by_id:
+            production_id = source
+        else:
+            continue
+        production_node = nodes_by_id[production_id]
+        if _is_test_node(production_node):
+            continue
+        _add_score(
+            scores,
+            evidence_by_node,
+            production_id,
+            160,
+            evidence_type='test_related_production',
+            message='Failing test is connected to this production node in the analysis graph.',
+        )
 
 
 def _weak_issue_evidence(scores: Mapping[str, int], evidence_by_node: Mapping[str, list[dict[str, str]]], ranked_ids: Sequence[str], nodes_by_id: Mapping[str, Mapping[str, Any]]) -> bool:
@@ -758,7 +794,7 @@ def rank_issue_candidates(
     _apply_route_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
     _apply_config_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
     _apply_quoted_string_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
-    _apply_test_boosts_or_penalties(nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_test_boosts_or_penalties(analysis, nodes_by_id, evidence, scores, evidence_by_node)
 
     if not scores:
         fallback_ids = sorted((_entrypoint_ids(analysis) | _key_module_ids(analysis)) & set(nodes_by_id))
