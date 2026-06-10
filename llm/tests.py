@@ -313,12 +313,48 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertIn('parser/services.py', job['file_contents'])
         self.assertNotIn('/etc/passwd', job['file_contents'])
 
+    def test_issue_harness_job_preserves_new_evidence_lists_with_caps(self):
+        analysis = self._analysis()
+        evidence = {
+            'query': 'route config exception test quoted',
+            'exception_mentions': [{'class': f'Value{index}Error'} for index in range(21)],
+            'route_mentions': [{'route': f'/api/items/{index}/'} for index in range(41)],
+            'config_mentions': [{'name': f'SERVICE_{index}_KEY'} for index in range(41)],
+            'test_mentions': [{'name': f'test_case_{index}'} for index in range(41)],
+            'quoted_strings': [{'text': f'quoted output {index}'} for index in range(21)],
+        }
+
+        job = build_issue_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            issue={'number': 42, 'title': 'Parser timeout', 'body': ''},
+            comments=[],
+            evidence=evidence,
+            candidates=[],
+            analysis=analysis,
+        )
+
+        bounded = job['evidence']
+        self.assertEqual(len(bounded['exception_mentions']), 20)
+        self.assertEqual(len(bounded['route_mentions']), 40)
+        self.assertEqual(len(bounded['config_mentions']), 40)
+        self.assertEqual(len(bounded['test_mentions']), 40)
+        self.assertEqual(len(bounded['quoted_strings']), 20)
+
     def test_issue_harness_job_ignores_malformed_artifact_collections(self):
         analysis = self._analysis()
         analysis['nodes'] = {'bad': 'not a node list'}
         analysis['edges'] = {'bad': 'not an edge list'}
         analysis['entrypoints'] = {'bad': 'not an entrypoint list'}
-        evidence = {'query': 'parse_repo', 'file_mentions': {'bad': 'not a mention list'}}
+        evidence = {
+            'query': 'parse_repo',
+            'file_mentions': {'bad': 'not a mention list'},
+            'exception_mentions': {'bad': 'not a mention list'},
+            'route_mentions': {'bad': 'not a mention list'},
+            'config_mentions': {'bad': 'not a mention list'},
+            'test_mentions': {'bad': 'not a mention list'},
+            'quoted_strings': {'bad': 'not a mention list'},
+        }
 
         job = build_issue_harness_job(
             repo_path='owner/repo',
@@ -334,6 +370,11 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertEqual(job['graph']['edges'], [])
         self.assertEqual(job['graph']['entrypoints'], [])
         self.assertEqual(job['evidence']['file_mentions'], [])
+        self.assertEqual(job['evidence']['exception_mentions'], [])
+        self.assertEqual(job['evidence']['route_mentions'], [])
+        self.assertEqual(job['evidence']['config_mentions'], [])
+        self.assertEqual(job['evidence']['test_mentions'], [])
+        self.assertEqual(job['evidence']['quoted_strings'], [])
 
     def test_run_issue_harness_accepts_tool_backed_transcript(self):
         payload = {

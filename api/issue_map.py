@@ -14,9 +14,16 @@ FILE_PATH_RE = re.compile(r'(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py|[A
 PY_STACK_RE = re.compile(r'File "(?P<path>[^"]+\.py)", line (?P<line>\d+), in (?P<symbol>[A-Za-z_][A-Za-z0-9_]*)')
 PYTEST_FRAME_RE = re.compile(r'(?P<path>(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.py):(?P<line>\d+)(?::in\s+(?P<symbol>[A-Za-z_][A-Za-z0-9_]*))?')
 BACKTICK_RE = re.compile(r'`([^`]{2,120})`')
+QUOTED_STRING_RE = re.compile(r'(?P<quote>["\'])(?P<text>[^"\']{4,160})(?P=quote)')
 CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(')
 ERROR_LINE_RE = re.compile(r'(?i)\b(error|exception|traceback|failed|failure|timeout|crash|invalid)\b')
 SYMBOL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+EXCEPTION_RE = re.compile(r'\b(?P<class>[A-Z][A-Za-z0-9_.]*(?:Error|Exception|Timeout))(?::\s*(?P<message>[^\n`]{3,180}))?')
+ROUTE_RE = re.compile(r'(?<![\w.-])(?P<route>/(?:[A-Za-z0-9_.{}:-]+/)*[A-Za-z0-9_.{}:-]*/?)(?![\w.-])')
+CONFIG_NAME_RE = re.compile(r'\b(?P<name>[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b')
+TEST_NAME_RE = re.compile(r'\b(?P<name>test_[A-Za-z0-9_]+)\b')
+TEST_KEYWORD_RE = re.compile(r'(?i)\b(pytest|unittest|assertion|assert|failing test|test failure|tests? failed)\b')
+TEST_PATH_PART_RE = re.compile(r'(^|/)(tests?/|test_[^/]+\.py$|[^/]+_test\.py$|tests\.py$)')
 
 
 def _string(value: Any) -> str:
@@ -114,6 +121,71 @@ def _extract_error_phrases(source: str, text: str) -> list[dict[str, Any]]:
     return phrases
 
 
+def _extract_exception_mentions(source: str, text: str) -> list[dict[str, Any]]:
+    mentions: list[dict[str, Any]] = []
+    for match in EXCEPTION_RE.finditer(text):
+        exception_class = match.group('class')
+        message = (match.group('message') or '').strip()
+        mentions.append(
+            {
+                'class': exception_class,
+                'message': message,
+                'text': f'{exception_class}: {message}' if message else exception_class,
+                'source': source,
+                'confidence': 0.95 if message else 0.8,
+            }
+        )
+    return mentions
+
+
+def _extract_route_mentions(source: str, text: str) -> list[dict[str, Any]]:
+    mentions: list[dict[str, Any]] = []
+    for match in ROUTE_RE.finditer(text):
+        route = match.group('route')
+        if route in {'/', '//'} or route.endswith('.py'):
+            continue
+        if not any(part.isalpha() for part in route):
+            continue
+        mentions.append({'route': route, 'source': source, 'confidence': 0.9})
+    return mentions
+
+
+def _extract_config_mentions(source: str, text: str) -> list[dict[str, Any]]:
+    mentions: list[dict[str, Any]] = []
+    for match in CONFIG_NAME_RE.finditer(text):
+        name = match.group('name')
+        if len(name) < 4:
+            continue
+        mentions.append({'name': name, 'source': source, 'confidence': 0.85})
+    return mentions
+
+
+def _extract_quoted_strings(source: str, text: str) -> list[dict[str, Any]]:
+    mentions: list[dict[str, Any]] = []
+    for regex in (BACKTICK_RE, QUOTED_STRING_RE):
+        for match in regex.finditer(text):
+            quoted = (match.group('text') if 'text' in match.groupdict() else match.group(1)).strip()
+            if not quoted or FILE_PATH_RE.fullmatch(quoted) or SYMBOL_TOKEN_RE.fullmatch(quoted.removesuffix('()')):
+                continue
+            if len(quoted) < 4 or len(identifier_tokens(quoted)) > 12:
+                continue
+            mentions.append({'text': quoted, 'source': source, 'confidence': 0.75})
+    return mentions
+
+
+def _extract_test_mentions(source: str, text: str) -> list[dict[str, Any]]:
+    mentions: list[dict[str, Any]] = []
+    for match in TEST_NAME_RE.finditer(text):
+        mentions.append({'name': match.group('name'), 'source': source, 'confidence': 0.95})
+    for match in FILE_PATH_RE.finditer(text):
+        path = match.group('path')
+        if _is_test_path(path):
+            mentions.append({'path': path, 'source': source, 'confidence': 0.9})
+    if TEST_KEYWORD_RE.search(text):
+        mentions.append({'keyword': 'test_failure', 'source': source, 'confidence': 0.7})
+    return mentions
+
+
 def _issue_labels(issue: Mapping[str, Any]) -> list[dict[str, str]]:
     labels = issue.get('labels')
     if not isinstance(labels, list):
@@ -137,12 +209,22 @@ def extract_issue_evidence(
     stack_frames: list[dict[str, Any]] = []
     symbol_mentions: list[dict[str, Any]] = []
     quoted_errors: list[dict[str, Any]] = []
+    exception_mentions: list[dict[str, Any]] = []
+    route_mentions: list[dict[str, Any]] = []
+    config_mentions: list[dict[str, Any]] = []
+    test_mentions: list[dict[str, Any]] = []
+    quoted_strings: list[dict[str, Any]] = []
 
     for source, text in texts:
         file_mentions.extend(_extract_file_mentions(source, text))
         stack_frames.extend(_extract_stack_frames(source, text))
         symbol_mentions.extend(_extract_symbol_mentions(source, text))
         quoted_errors.extend(_extract_error_phrases(source, text))
+        exception_mentions.extend(_extract_exception_mentions(source, text))
+        route_mentions.extend(_extract_route_mentions(source, text))
+        config_mentions.extend(_extract_config_mentions(source, text))
+        test_mentions.extend(_extract_test_mentions(source, text))
+        quoted_strings.extend(_extract_quoted_strings(source, text))
 
     for frame in stack_frames:
         file_mentions.append(
@@ -170,6 +252,11 @@ def extract_issue_evidence(
         ' '.join(comment.get('body', '') for comment in comments or [] if isinstance(comment.get('body'), str)),
         ' '.join(item['path'] for item in file_mentions),
         ' '.join(item['symbol'] for item in symbol_mentions),
+        ' '.join(item.get('text', '') for item in exception_mentions),
+        ' '.join(item.get('route', '') for item in route_mentions),
+        ' '.join(item.get('name', '') for item in config_mentions),
+        ' '.join(item.get('name', '') or item.get('path', '') or item.get('keyword', '') for item in test_mentions),
+        ' '.join(item.get('text', '') for item in quoted_strings),
     ]
     return {
         'query': ' '.join(part for part in query_parts if part),
@@ -177,6 +264,11 @@ def extract_issue_evidence(
         'symbol_mentions': _dedupe(symbol_mentions, 'symbol', 'source'),
         'stack_frames': _dedupe(stack_frames, 'path', 'line', 'symbol', 'source'),
         'quoted_errors': _dedupe(quoted_errors, 'text', 'source'),
+        'exception_mentions': _dedupe(exception_mentions, 'class', 'message', 'source'),
+        'route_mentions': _dedupe(route_mentions, 'route', 'source'),
+        'config_mentions': _dedupe(config_mentions, 'name', 'source'),
+        'test_mentions': _dedupe(test_mentions, 'name', 'path', 'keyword', 'source'),
+        'quoted_strings': _dedupe(quoted_strings, 'text', 'source'),
         'labels': labels,
         'comments': [
             {
@@ -272,6 +364,38 @@ def _line_matches(node: Mapping[str, Any], line: int | None) -> bool:
     if start is None or end is None:
         return False
     return start <= line <= end
+
+
+def _analysis_file_contents(analysis: Mapping[str, Any]) -> Mapping[str, Any]:
+    file_contents = analysis.get('file_contents')
+    return file_contents if isinstance(file_contents, Mapping) else {}
+
+
+def _node_search_text(node_id: str, node: Mapping[str, Any], file_contents: Mapping[str, Any]) -> str:
+    node_path = _node_path(node) or ''
+    source_text = _string(file_contents.get(node_path))
+    metadata = node.get('metadata') if isinstance(node.get('metadata'), Mapping) else {}
+    metadata_text = ' '.join(_string(value) for value in metadata.values()) if isinstance(metadata, Mapping) else ''
+    return '\n'.join([node_id, _node_label(node), _node_symbol(node), node_path, metadata_text, source_text]).lower()
+
+
+def _is_test_path(path: str | None) -> bool:
+    return bool(path and TEST_PATH_PART_RE.search(path))
+
+
+def _is_test_node(node: Mapping[str, Any]) -> bool:
+    return _is_test_path(_node_path(node))
+
+
+def _issue_is_test_specific(evidence: Mapping[str, Any]) -> bool:
+    if _safe_evidence_list(evidence.get('test_mentions')):
+        return True
+    query = _string(evidence.get('query'))
+    return bool(TEST_KEYWORD_RE.search(query) or TEST_NAME_RE.search(query) or any(_is_test_path(match.group('path')) for match in FILE_PATH_RE.finditer(query)))
+
+
+def _safe_evidence_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _add_score(
@@ -412,6 +536,207 @@ def _apply_label_boosts(
             )
 
 
+def _apply_exception_boosts(
+    analysis: Mapping[str, Any],
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    file_contents = _analysis_file_contents(analysis)
+    for mention in _safe_evidence_list(evidence.get('exception_mentions')):
+        if not isinstance(mention, Mapping):
+            continue
+        exception_class = _string(mention.get('class')).lower()
+        message = _string(mention.get('message')).lower()
+        if not exception_class and not message:
+            continue
+        for node_id, node in nodes_by_id.items():
+            node_text = _node_search_text(node_id, node, file_contents)
+            if message and message in node_text:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    180,
+                    evidence_type='exception_message',
+                    message=f'Issue exception message appears in {_node_path(node) or node_id}.',
+                )
+            elif exception_class and exception_class in node_text:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    90,
+                    evidence_type='exception_class',
+                    message=f'Issue mentions exception {mention.get("class")}.',
+                )
+
+
+def _apply_route_boosts(
+    analysis: Mapping[str, Any],
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    file_contents = _analysis_file_contents(analysis)
+    for mention in _safe_evidence_list(evidence.get('route_mentions')):
+        if not isinstance(mention, Mapping):
+            continue
+        route = _string(mention.get('route'))
+        if not route:
+            continue
+        route_lower = route.lower()
+        route_tokens = identifier_tokens(route)
+        for node_id, node in nodes_by_id.items():
+            node_path = _node_path(node) or ''
+            node_text = _node_search_text(node_id, node, file_contents)
+            path_tokens = identifier_tokens(node_path)
+            is_route_owner = route_lower in node_text
+            is_api_route_module = bool(route_tokens & path_tokens) and any(token in path_tokens for token in {'api', 'url', 'urls', 'view', 'views', 'router'})
+            if is_route_owner:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    180 if _node_kind(node) in {'function', 'method', 'class'} else 110,
+                    evidence_type='route',
+                    message=f'Issue route {route} appears in this file or node context.',
+                )
+            elif is_api_route_module:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    70,
+                    evidence_type='route',
+                    message=f'Issue route {route} matches API/view routing metadata.',
+                )
+
+
+def _apply_config_boosts(
+    analysis: Mapping[str, Any],
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    file_contents = _analysis_file_contents(analysis)
+    for mention in _safe_evidence_list(evidence.get('config_mentions')):
+        if not isinstance(mention, Mapping):
+            continue
+        name = _string(mention.get('name'))
+        if not name:
+            continue
+        lowered = name.lower()
+        for node_id, node in nodes_by_id.items():
+            node_path = _node_path(node) or ''
+            node_text = _node_search_text(node_id, node, file_contents)
+            path_tokens = identifier_tokens(node_path)
+            if lowered in node_text:
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    170,
+                    evidence_type='config',
+                    message=f'Issue mentions config/env name {name} found in this context.',
+                )
+            elif any(token in path_tokens for token in {'config', 'settings', 'env'}):
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    60,
+                    evidence_type='config',
+                    message=f'Issue mentions config/env name {name}; this is a config-related module.',
+                )
+
+
+def _apply_quoted_string_boosts(
+    analysis: Mapping[str, Any],
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    file_contents = _analysis_file_contents(analysis)
+    for key in ('quoted_errors', 'quoted_strings'):
+        for mention in _safe_evidence_list(evidence.get(key)):
+            if not isinstance(mention, Mapping):
+                continue
+            text = _string(mention.get('text')).strip()
+            if len(text) < 4:
+                continue
+            lowered = text.lower()
+            for node_id, node in nodes_by_id.items():
+                node_text = _node_search_text(node_id, node, file_contents)
+                if lowered not in node_text:
+                    continue
+                _add_score(
+                    scores,
+                    evidence_by_node,
+                    node_id,
+                    150 if key == 'quoted_errors' else 110,
+                    evidence_type='quoted_error' if key == 'quoted_errors' else 'quoted_string',
+                    message=f'Issue quoted text appears in {_node_path(node) or node_id}.',
+                )
+
+
+def _apply_test_boosts_or_penalties(
+    nodes_by_id: Mapping[str, Mapping[str, Any]],
+    evidence: Mapping[str, Any],
+    scores: dict[str, int],
+    evidence_by_node: dict[str, list[dict[str, str]]],
+) -> None:
+    test_specific = _issue_is_test_specific(evidence)
+    test_names = {
+        _string(mention.get('name')).lower()
+        for mention in _safe_evidence_list(evidence.get('test_mentions'))
+        if isinstance(mention, Mapping) and mention.get('name')
+    }
+    test_paths = {
+        _string(mention.get('path'))
+        for mention in _safe_evidence_list(evidence.get('test_mentions'))
+        if isinstance(mention, Mapping) and mention.get('path')
+    }
+    for node_id, node in nodes_by_id.items():
+        if not _is_test_node(node):
+            continue
+        if not test_specific:
+            current_score = scores.get(node_id)
+            if current_score is not None:
+                scores[node_id] = max(1, int(current_score * 0.6))
+                evidence_by_node.setdefault(node_id, []).append({'type': 'test_penalty', 'message': 'Test node de-prioritized because issue is not test-specific.'})
+            continue
+        node_path = _node_path(node) or ''
+        final_segment = _final_id_segment(node_id).lower()
+        if node_path in test_paths or final_segment in test_names or _node_label(node).lower() in test_names:
+            _add_score(
+                scores,
+                evidence_by_node,
+                node_id,
+                220,
+                evidence_type='test',
+                message='Issue explicitly names this failing test context.',
+            )
+
+
+def _weak_issue_evidence(scores: Mapping[str, int], evidence_by_node: Mapping[str, list[dict[str, str]]], ranked_ids: Sequence[str], nodes_by_id: Mapping[str, Mapping[str, Any]]) -> bool:
+    if not ranked_ids:
+        return False
+    top_id = ranked_ids[0]
+    top_score = scores.get(top_id, 0)
+    evidence_types = {item.get('type') for item in evidence_by_node.get(top_id, [])}
+    if evidence_types and evidence_types.issubset({'label', 'fallback', 'lexical', 'test_penalty'}):
+        return True
+    if top_score < 40:
+        return True
+    top_kinds = [_node_kind(nodes_by_id[node_id]) for node_id in ranked_ids[: min(3, len(ranked_ids))]]
+    return bool(top_kinds) and all(kind in {'directory', 'file'} for kind in top_kinds)
+
+
 def rank_issue_candidates(
     analysis: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -429,6 +754,11 @@ def rank_issue_candidates(
     _apply_file_boosts(nodes_by_id, evidence, scores, evidence_by_node)
     _apply_symbol_boosts(nodes_by_id, evidence, scores, evidence_by_node)
     _apply_label_boosts(nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_exception_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_route_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_config_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_quoted_string_boosts(analysis, nodes_by_id, evidence, scores, evidence_by_node)
+    _apply_test_boosts_or_penalties(nodes_by_id, evidence, scores, evidence_by_node)
 
     if not scores:
         fallback_ids = sorted((_entrypoint_ids(analysis) | _key_module_ids(analysis)) & set(nodes_by_id))
@@ -446,6 +776,8 @@ def rank_issue_candidates(
     ranked_ids = sorted(scores, key=lambda node_id: (-scores[node_id], _node_path(nodes_by_id[node_id]) or '', node_id))
     if ranked_ids and scores[ranked_ids[0]] < 40:
         warnings.append({'code': 'low_confidence_issue_ranking', 'message': 'Issue evidence produced only weak graph matches.'})
+    if _weak_issue_evidence(scores, evidence_by_node, ranked_ids, nodes_by_id):
+        warnings.append({'code': 'weak_issue_evidence', 'message': 'Top issue match is based on weak or generic evidence.'})
 
     max_score = max([scores[node_id] for node_id in ranked_ids], default=1)
     candidates: list[dict[str, Any]] = []
