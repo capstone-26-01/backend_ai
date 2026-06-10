@@ -211,6 +211,36 @@ class HarnessEvalSampleTests(unittest.TestCase):
         self.assertFalse(checks['required_read_paths']['passed'])
         self.assertTrue(checks['expected_nodes']['passed'])
 
+    def test_read_node_context_satisfies_required_repo_inspection(self):
+        sample = load_json(ROOT / 'samples' / 'repo_same_file_precision.json')
+        transcript = {
+            'sample_id': 'repo_same_file_precision',
+            'variant_id': 'node-context-path',
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'stale analysis'}},
+                {'name': 'read_node_context', 'arguments': {'node_id': 'api/services.py::get_repo_analysis'}},
+            ],
+            'final': {
+                'hypotheses': [
+                    {'node_id': 'api/services.py::get_repo_analysis', 'confidence': 0.8},
+                    {'node_id': 'api/services.py::_build_and_store_analysis', 'confidence': 0.7},
+                ],
+                'investigation_path': [
+                    {'node_id': 'api/services.py::get_repo_analysis', 'path': 'api/services.py'},
+                    {'node_id': 'api/services.py::_build_and_store_analysis', 'path': 'api/services.py'},
+                ],
+                'confidence': {'score': 0.8},
+            },
+        }
+
+        report = evaluate_transcript(sample, transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertTrue(report['passed'])
+        self.assertTrue(checks['required_read_paths']['passed'])
+        self.assertIn('api/services.py', report['read_paths'])
+
     def test_expected_nodes_need_investigation_paths(self):
         sample = load_json(ROOT / 'samples' / 'repo_fetch_none_crash.json')
         transcript = {
@@ -572,7 +602,7 @@ class PiRunnerCommandTests(unittest.TestCase):
 
         command = pi_runner.build_pi_command(args, job)
 
-        self.assertIn('list_repo_files,search_repo_symbols,search_repo_text,read_repo_file,finish_issue_map_transcript', command)
+        self.assertIn('list_repo_files,search_repo_symbols,search_repo_text,read_repo_file,read_node_context,finish_issue_map_transcript', command)
         self.assertNotIn('rank_issue_candidates,load_focus_graph,load_code_context,finish_issue_map_transcript', command)
 
 

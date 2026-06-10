@@ -168,6 +168,9 @@ def _tool_paths(transcript: Mapping[str, Any], tool_name: str) -> set[str]:
             continue
         arguments = call.get('arguments')
         if isinstance(arguments, Mapping):
+            node_id = arguments.get('node_id')
+            if tool_name == 'read_node_context' and isinstance(node_id, str) and '::' in node_id:
+                paths.add(node_id.split('::', 1)[0])
             path = arguments.get('path')
             if isinstance(path, str) and path:
                 paths.add(path)
@@ -225,6 +228,8 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
     found_nodes = {str(value) for value in _collect_values(final, 'node_id') if isinstance(value, str)}
     found_paths = {str(value) for value in _collect_values(final, 'path') if isinstance(value, str) and value}
     read_paths = _tool_paths(transcript, 'read_repo_file')
+    node_context_paths = _tool_paths(transcript, 'read_node_context')
+    inspected_paths = read_paths | node_context_paths
     confidence_values = [
         value
         for key in ('score', 'confidence')
@@ -237,7 +242,7 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
         CheckResult('required_tools', required_tools.issubset(set(tool_names)), 'all required tools must be called'),
         CheckResult('required_tool_order', _is_ordered_subsequence(required_tool_order, tool_names), 'required tools must be called in the expected order'),
         CheckResult('required_tool_first_use_order', _is_first_use_order(required_tool_order, tool_names), 'required tools must appear in first-use order starting with the first required tool'),
-        CheckResult('required_read_paths', required_read_paths.issubset(read_paths), 'required repo files must be read by the harness'),
+        CheckResult('required_read_paths', required_read_paths.issubset(inspected_paths), 'required repo files must be inspected by the harness'),
         CheckResult('forbidden_tools', not (forbidden_tools & set(tool_names)), 'forbidden tools must not be called'),
         CheckResult('expected_nodes', expected_nodes.issubset(found_nodes), 'final output must include expected node ids'),
         CheckResult('expected_investigation_nodes', expected_nodes.issubset(path_nodes), 'investigation_path must include every expected node id'),
@@ -254,7 +259,7 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
         'score': round(sum(1 for check in checks if check.passed) / len(checks), 3),
         'checks': [check.__dict__ for check in checks],
         'tool_calls': tool_names,
-        'read_paths': sorted(read_paths),
+        'read_paths': sorted(inspected_paths),
         'found_node_ids': sorted(found_nodes),
         'found_paths': sorted(found_paths),
     }
