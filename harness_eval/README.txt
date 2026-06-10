@@ -101,7 +101,7 @@ This is not a replacement for a real Pi run with tools. It tests the model/provi
 Live Pi SUT Eval
 ----------------
 
-This is the production-like live check: `run-harness` stays the deterministic judge, while `pi_runner.py` is the system under test. The Pi runner installs/uses `@earendil-works/pi-coding-agent@0.78.0` through `npx`, binds only bounded repo-analysis tools from `pi/issue_map_extension.ts`, and emits the final transcript from a terminating `finish_issue_map_transcript` tool result.
+This is the production-like live check: `run-harness` stays the deterministic judge, while `pi_runner.py` is the system under test. The Pi runner installs/uses `@earendil-works/pi-coding-agent@0.79.1` through `npx`, binds only bounded repo-analysis tools from `pi/issue_map_extension.ts`, and emits the final transcript from a terminating `finish_issue_map_transcript` tool result.
 
 For repo samples, the job packet contains a local repo fixture path and issue text, not a precomputed graph artifact. Pi must call `list_repo_files`, `search_repo_symbols`, and `read_repo_file`; the deterministic evaluator compares the final transcript against hidden `expect` values derived from `golden/repo_issue_consensus.json`. The SUT never receives that golden file or the hidden `expect` block.
 

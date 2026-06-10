@@ -102,10 +102,25 @@ function jsonToolResult(payload: Record<string, unknown>, terminate = false): Ag
 function recordToolCall(name: string, args: unknown) {
   const countedCalls = toolCalls.filter((call) => call.name !== "finish_issue_map_transcript").length;
   if (name !== "finish_issue_map_transcript" && countedCalls >= MAX_TOOL_CALLS) {
+    const job = loadJob();
     return jsonToolResult({
+      sample_id: job.job_id,
+      variant_id: "runtime-pi-issue-harness",
+      tool_calls: toolCalls.filter((call) => call.name !== "finish_issue_map_transcript"),
+      final: {
+        hypotheses: [],
+        investigation_path: [],
+        confidence: {
+          level: "none",
+          score: 0,
+          reasons: ["tool_call_budget_exceeded"],
+        },
+      },
       error: "tool_call_budget_exceeded",
       max_tool_calls: MAX_TOOL_CALLS,
-      instruction: "Stop the run; the backend will fall back to deterministic issue ranking.",
+      attempted_tool: name,
+      attempted_arguments: args,
+      instruction: "Stop the run; the backend will record this as a harness contract failure.",
     }, true);
   }
   toolCalls.push({ name, arguments: args });

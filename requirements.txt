@@ -6,6 +6,7 @@ certifi==2026.2.25
 charset-normalizer==3.4.6
 colorama==0.4.6
 distro==1.9.0
+datasets==5.0.0
 Django
 djangorestframework==3.17.1
 drf-spectacular==0.29.0
@@ -36,5 +37,6 @@ tree-sitter-typescript==0.23.2
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2025.3
+unidiff==0.7.5
 uritemplate==4.2.0
 urllib3==2.6.3
