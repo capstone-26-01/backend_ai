@@ -241,6 +241,30 @@ class HarnessEvalSampleTests(unittest.TestCase):
         self.assertTrue(checks['required_read_paths']['passed'])
         self.assertIn('api/services.py', report['read_paths'])
 
+    def test_read_node_context_uses_explicit_node_paths_for_typescript_sample(self):
+        sample = load_json(ROOT / 'samples' / 'repo_ts_route_bug.json')
+        transcript = {
+            'sample_id': 'repo_ts_route_bug',
+            'variant_id': 'node-context-ts-path',
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'createUser email trim'}},
+                {'name': 'read_node_context', 'arguments': {'node_id': 'src/services/userService.ts::createUser'}},
+            ],
+            'final': {
+                'hypotheses': [{'node_id': 'src/services/userService.ts::createUser', 'confidence': 0.9}],
+                'investigation_path': [{'node_id': 'src/services/userService.ts::createUser', 'path': 'src/services/userService.ts'}],
+                'confidence': {'score': 0.9},
+            },
+        }
+
+        report = evaluate_transcript(sample, transcript)
+        checks = {check['name']: check for check in report['checks']}
+
+        self.assertTrue(report['passed'])
+        self.assertTrue(checks['required_read_paths']['passed'])
+        self.assertIn('src/services/userService.ts', report['read_paths'])
+
     def test_expected_nodes_need_investigation_paths(self):
         sample = load_json(ROOT / 'samples' / 'repo_fetch_none_crash.json')
         transcript = {

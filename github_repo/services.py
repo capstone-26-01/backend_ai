@@ -13,6 +13,8 @@ import subprocess
 from django.conf import settings
 import requests
 
+from parser.language_registry import ignored_reason, language_for_path, normalize_enabled_languages
+
 
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
@@ -735,10 +737,22 @@ def _ensure_local_repo(repo_path: str) -> Path:
     return repo_dir
 
 
-def _enforce_snapshot_limits(files: list[str]) -> None:
+def _enforce_snapshot_limits(files: list[str], *, enabled_languages=None) -> None:
     max_files = _setting_int('GITHUB_REPO_MAX_FILES', 5000)
     max_python_files = _setting_int('GITHUB_REPO_MAX_PYTHON_FILES', 1000)
+    max_js_ts_files = _setting_int('GITHUB_REPO_MAX_JS_TS_FILES', 2500)
+    enabled_languages = normalize_enabled_languages(
+        enabled_languages if enabled_languages is not None else getattr(settings, 'GITHUB_REPO_ENABLED_LANGUAGES', ['python'])
+    )
     python_files = [file_path for file_path in files if file_path.endswith('.py')]
+    js_ts_files = []
+    for file_path in files:
+        spec = language_for_path(file_path, enabled_languages=enabled_languages)
+        if spec is None or spec.family != 'javascript':
+            continue
+        if ignored_reason(file_path, language_spec=spec) is not None:
+            continue
+        js_ts_files.append(file_path)
 
     if len(files) > max_files:
         raise RepoIngestionError(
@@ -752,20 +766,26 @@ def _enforce_snapshot_limits(files: list[str]) -> None:
             'Python 파일 수가 허용 한도를 초과했습니다.',
             metadata={'limit': max_python_files, 'actual': len(python_files), 'limit_type': 'max_python_files'},
         )
+    if len(js_ts_files) > max_js_ts_files:
+        raise RepoIngestionError(
+            'too_large',
+            'JavaScript/TypeScript 파일 수가 허용 한도를 초과했습니다.',
+            metadata={'limit': max_js_ts_files, 'actual': len(js_ts_files), 'limit_type': 'max_analyzed_files:javascript'},
+        )
 
 
-def _repo_snapshot(repo_path: str) -> tuple[Path, str, list[str]]:
+def _repo_snapshot(repo_path: str, *, enabled_languages=None) -> tuple[Path, str, list[str]]:
     with _repo_lock(repo_path):
         repo_dir = _ensure_local_repo(repo_path)
         revision = _run_git('rev-parse', 'HEAD', cwd=repo_dir)
         files_output = _run_git('ls-tree', '-r', '--name-only', 'HEAD', cwd=repo_dir)
     files = [line for line in files_output.splitlines() if line]
     sorted_files = sorted(files)
-    _enforce_snapshot_limits(sorted_files)
+    _enforce_snapshot_limits(sorted_files, enabled_languages=enabled_languages)
     return repo_dir, revision, sorted_files
 
 
-def _repo_snapshot_at_revision(repo_path: str, revision: str) -> tuple[Path, str, list[str]]:
+def _repo_snapshot_at_revision(repo_path: str, revision: str, *, enabled_languages=None) -> tuple[Path, str, list[str]]:
     if not _is_safe_revision(revision):
         raise ValueError('Unsafe revision')
 
@@ -775,36 +795,36 @@ def _repo_snapshot_at_revision(repo_path: str, revision: str) -> tuple[Path, str
         files_output = _run_git('ls-tree', '-r', '--name-only', target_revision, cwd=repo_dir)
     files = [line for line in files_output.splitlines() if line]
     sorted_files = sorted(files)
-    _enforce_snapshot_limits(sorted_files)
+    _enforce_snapshot_limits(sorted_files, enabled_languages=enabled_languages)
     return repo_dir, target_revision, sorted_files
 
 
-def get_repo_snapshot_or_raise(repo_path: str) -> tuple[str, list[str]]:
+def get_repo_snapshot_or_raise(repo_path: str, *, enabled_languages=None) -> tuple[str, list[str]]:
     try:
-        _repo_dir, revision, files = _repo_snapshot(repo_path)
+        _repo_dir, revision, files = _repo_snapshot(repo_path, enabled_languages=enabled_languages)
     except ValueError as exc:
         raise RepoIngestionError('invalid_repo_path', '올바른 repo 경로가 아닙니다.') from exc
     return revision, files
 
 
-def get_repo_snapshot_at_revision_or_raise(repo_path: str, revision: str) -> tuple[str, list[str]]:
+def get_repo_snapshot_at_revision_or_raise(repo_path: str, revision: str, *, enabled_languages=None) -> tuple[str, list[str]]:
     try:
-        _repo_dir, target_revision, files = _repo_snapshot_at_revision(repo_path, revision)
+        _repo_dir, target_revision, files = _repo_snapshot_at_revision(repo_path, revision, enabled_languages=enabled_languages)
     except ValueError as exc:
         raise RepoIngestionError('invalid_repo_path', '올바른 repo 경로 또는 revision이 아닙니다.') from exc
     return target_revision, files
 
 
-def get_repo_snapshot_at_revision(repo_path: str, revision: str) -> tuple[str, list[str]] | None:
+def get_repo_snapshot_at_revision(repo_path: str, revision: str, *, enabled_languages=None) -> tuple[str, list[str]] | None:
     try:
-        return get_repo_snapshot_at_revision_or_raise(repo_path, revision)
+        return get_repo_snapshot_at_revision_or_raise(repo_path, revision, enabled_languages=enabled_languages)
     except RepoIngestionError:
         return None
 
 
-def get_repo_snapshot(repo_path: str) -> tuple[str, list[str]] | None:
+def get_repo_snapshot(repo_path: str, *, enabled_languages=None) -> tuple[str, list[str]] | None:
     try:
-        return get_repo_snapshot_or_raise(repo_path)
+        return get_repo_snapshot_or_raise(repo_path, enabled_languages=enabled_languages)
     except RepoIngestionError:
         return None
 

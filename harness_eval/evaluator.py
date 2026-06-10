@@ -161,7 +161,8 @@ def _final_list(final: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
     return [item for item in value if isinstance(item, Mapping)]
 
 
-def _tool_paths(transcript: Mapping[str, Any], tool_name: str) -> set[str]:
+def _tool_paths(transcript: Mapping[str, Any], tool_name: str, node_paths: Mapping[str, str] | None = None) -> set[str]:
+    node_paths = node_paths or {}
     paths = set()
     for call in transcript.get('tool_calls') or []:
         if not isinstance(call, Mapping) or call.get('name') != tool_name:
@@ -169,8 +170,12 @@ def _tool_paths(transcript: Mapping[str, Any], tool_name: str) -> set[str]:
         arguments = call.get('arguments')
         if isinstance(arguments, Mapping):
             node_id = arguments.get('node_id')
-            if tool_name == 'read_node_context' and isinstance(node_id, str) and '::' in node_id:
-                paths.add(node_id.split('::', 1)[0])
+            if tool_name == 'read_node_context' and isinstance(node_id, str):
+                mapped_path = node_paths.get(node_id)
+                if mapped_path:
+                    paths.add(mapped_path)
+                elif '::' in node_id:
+                    paths.add(node_id.split('::', 1)[0])
             path = arguments.get('path')
             if isinstance(path, str) and path:
                 paths.add(path)
@@ -214,12 +219,18 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
     allowed_nodes = set(expect.get('allowed_node_ids') or expected_nodes)
     allowed_paths = set(expect.get('allowed_paths') or [])
     required_read_paths = set(expect.get('required_read_paths') or [])
+    explicit_node_paths = expect.get('node_paths') if isinstance(expect.get('node_paths'), Mapping) else {}
+    node_paths = {str(node_id): str(path) for node_id, path in explicit_node_paths.items() if isinstance(node_id, str) and isinstance(path, str)}
     required_tool_order = [str(value) for value in expect.get('required_tool_order') or [] if isinstance(value, str)]
 
     hypotheses = _final_list(final, 'hypotheses')
     investigation_path = _final_list(final, 'investigation_path')
     path_nodes = {str(step.get('node_id')) for step in investigation_path if isinstance(step.get('node_id'), str)}
-    expected_node_paths = {node_id: node_id.split('::', 1)[0] for node_id in expected_nodes if '::' in node_id}
+    expected_node_paths = {
+        node_id: node_paths.get(node_id) or node_id.split('::', 1)[0]
+        for node_id in expected_nodes
+        if node_paths.get(node_id) or '::' in node_id
+    }
     path_pairs = {
         (str(step.get('node_id')), str(step.get('path')))
         for step in investigation_path
@@ -227,8 +238,8 @@ def evaluate_transcript(sample: Mapping[str, Any], transcript: Mapping[str, Any]
     }
     found_nodes = {str(value) for value in _collect_values(final, 'node_id') if isinstance(value, str)}
     found_paths = {str(value) for value in _collect_values(final, 'path') if isinstance(value, str) and value}
-    read_paths = _tool_paths(transcript, 'read_repo_file')
-    node_context_paths = _tool_paths(transcript, 'read_node_context')
+    read_paths = _tool_paths(transcript, 'read_repo_file', node_paths)
+    node_context_paths = _tool_paths(transcript, 'read_node_context', node_paths)
     inspected_paths = read_paths | node_context_paths
     confidence_values = [
         value

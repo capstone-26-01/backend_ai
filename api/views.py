@@ -54,20 +54,20 @@ logger = logging.getLogger(__name__)
 api_services = importlib.import_module('api.services')
 
 
-def get_repo_analysis(repo_path: str, revision: str | None = None):
-    return api_services.get_repo_analysis(repo_path, revision)
+def get_repo_analysis(repo_path: str, revision: str | None = None, analysis_profile: str | None = None):
+    return api_services.get_repo_analysis(repo_path, revision, analysis_profile=analysis_profile)
 
 
-def get_analysis_response(repo_path: str, revision: str | None = None):
-    return api_services.get_analysis_response(repo_path, revision)
+def get_analysis_response(repo_path: str, revision: str | None = None, analysis_profile: str | None = None):
+    return api_services.get_analysis_response(repo_path, revision, analysis_profile=analysis_profile)
 
 
 def get_analysis_response_by_id(analysis_id: int):
     return api_services.get_analysis_response_by_id(analysis_id)
 
 
-def get_analysis_run_by_revision(repo_path: str, revision: str):
-    return api_services.get_analysis_run_by_revision(repo_path, revision)
+def get_analysis_run_by_revision(repo_path: str, revision: str, analysis_profile: str | None = None):
+    return api_services.get_analysis_run_by_revision(repo_path, revision, analysis_profile=analysis_profile)
 
 
 def build_tree_response(payload, analysis_run=None):
@@ -102,8 +102,8 @@ def get_issue_map_response(analysis_id: int, issue_number: int, **kwargs):
     return api_services.get_issue_map_response(analysis_id, issue_number, **kwargs)
 
 
-def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None):
-    return api_services.get_diff_response(repo_path, base_revision, head_revision)
+def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None, analysis_profile: str | None = None):
+    return api_services.get_diff_response(repo_path, base_revision, head_revision, analysis_profile=analysis_profile)
 
 
 def get_diff_response_by_analysis_id(head_analysis_id: int, base_analysis_id: int):
@@ -279,6 +279,7 @@ _ANALYSIS_REQUEST_SCHEMA = inline_serializer(
     fields={
         'repo_url': serializers.CharField(help_text='분석할 public GitHub 레포 URL입니다. 예: https://github.com/psf/requests'),
         'revision': serializers.CharField(required=False, help_text='선택. 특정 commit/ref를 고정할 때 사용합니다. 생략하면 최신 HEAD를 분석합니다.'),
+        'analysis_profile': serializers.CharField(required=False, help_text='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.'),
     },
 )
 _ANALYSIS_RESPONSE_SCHEMA = inline_serializer(
@@ -287,6 +288,7 @@ _ANALYSIS_RESPONSE_SCHEMA = inline_serializer(
         'analysis_id': serializers.IntegerField(allow_null=True, help_text='이 분석 run의 ID입니다. summary, node-summary, qa에서 재사용합니다.'),
         'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
         'revision': serializers.CharField(help_text='실제로 분석된 git commit SHA입니다. tree/graph/qa 재조회 시 같은 결과를 고정하는 데 사용합니다.'),
+        'analysis_profile': serializers.CharField(help_text='분석 profile ID입니다.'),
         'status': serializers.CharField(help_text='분석 상태입니다. succeeded면 artifact를 사용할 수 있습니다.'),
         'artifact': serializers.JSONField(allow_null=True, help_text='tree, nodes, edges, entrypoints, key_modules 등을 포함한 전체 분석 결과입니다.'),
         'warnings': serializers.JSONField(help_text='분석 중 일부 파일 제외 등 사용자에게 보여줄 수 있는 경고 목록입니다.'),
@@ -298,6 +300,7 @@ _ANALYSIS_DETAIL_RESPONSE_SCHEMA = inline_serializer(
         'analysis_id': serializers.IntegerField(help_text='조회한 분석 run ID입니다.'),
         'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
         'revision': serializers.CharField(allow_blank=True, help_text='분석된 git commit SHA입니다. 실패/진행 중이면 비어 있을 수 있습니다.'),
+        'analysis_profile': serializers.CharField(help_text='분석 profile ID입니다.'),
         'status': serializers.CharField(help_text='started, succeeded, failed 중 하나입니다.'),
         'artifact': serializers.JSONField(allow_null=True, help_text='성공한 분석의 전체 artifact입니다. 실패/진행 중이면 null입니다.'),
         'warnings': serializers.JSONField(help_text='분석 경고 목록입니다.'),
@@ -320,6 +323,7 @@ _SHARE_CREATE_SCHEMA = inline_serializer(
         'repo_url': serializers.CharField(help_text='공유할 public GitHub 레포 URL입니다.'),
         'mode': serializers.ChoiceField(choices=('fixed', 'latest'), required=False, help_text='fixed는 현재 revision 고정, latest는 조회 시 최신 HEAD로 갱신합니다. 기본값 fixed.'),
         'revision': serializers.CharField(required=False, help_text='fixed 공유에서 특정 revision을 지정할 때 사용합니다. latest 모드에서는 사용할 수 없습니다.'),
+        'analysis_profile': serializers.CharField(required=False, help_text='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.'),
         'title': serializers.CharField(required=False, allow_blank=True, help_text='공유 화면/SVG에 표시할 제목입니다. 생략하면 repo 이름을 사용합니다.'),
         'expires_at': serializers.DateTimeField(required=False, allow_null=True, help_text='선택. 공유 링크 만료 시간입니다.'),
     },
@@ -334,6 +338,7 @@ _SHARE_RESPONSE_SCHEMA = inline_serializer(
         'repository': serializers.JSONField(help_text='owner, name, full_name 등 레포 메타데이터입니다.'),
         'ref': serializers.CharField(help_text='공유가 가리키는 ref입니다. fixed면 revision, latest면 HEAD입니다.'),
         'revision': serializers.CharField(help_text='현재 응답이 실제로 사용하는 분석 revision입니다.'),
+        'analysis_profile': serializers.CharField(help_text='분석 profile ID입니다.'),
         'analysis_id': serializers.IntegerField(help_text='현재 공유 응답에 연결된 분석 run ID입니다.'),
         'graph': serializers.JSONField(help_text='공유 화면에 사용할 공개 graph payload입니다. file_contents는 포함하지 않습니다.'),
         'is_active': serializers.BooleanField(help_text='공유 링크 활성 여부입니다.'),
@@ -739,6 +744,7 @@ _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     parameters=[
         OpenApiParameter(name='url', description='필수. 분석할 public GitHub 레포 URL. 예: https://github.com/psf/requests', required=True, type=str),
         OpenApiParameter(name='revision', description='선택. 특정 commit/ref를 고정할 때 입력합니다. 보통은 생략하고, 재조회 시 응답의 revision을 재사용합니다.', required=False, type=str),
+        OpenApiParameter(name='analysis_profile', description='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.', required=False, type=str),
     ],
     responses=_ANALYSIS_RESPONSE_SCHEMA,
 )
@@ -755,6 +761,8 @@ def analysis(request):
         request_data = {'repo_url': request.GET.get('url')}
         if request.GET.get('revision') is not None:
             request_data['revision'] = request.GET.get('revision')
+        if request.GET.get('analysis_profile') is not None:
+            request_data['analysis_profile'] = request.GET.get('analysis_profile')
         serializer = AnalysisRequestSerializer(data=request_data)
     else:
         serializer = AnalysisRequestSerializer(data=request.data)
@@ -764,8 +772,9 @@ def analysis(request):
     validated_data = cast(dict[str, str], serializer.validated_data)
     repo_path = validated_data['repo_url']
     revision = validated_data.get('revision')
+    analysis_profile = validated_data.get('analysis_profile')
     try:
-        response = get_analysis_response(repo_path, revision)
+        response = get_analysis_response(repo_path, revision, analysis_profile=analysis_profile)
     except RepoIngestionError as error:
         return _repo_ingestion_error_response(error)
 
@@ -818,6 +827,7 @@ def analysis_diff(request, analysis_id: int):
         OpenApiParameter(name='url', description='필수. 비교할 public GitHub 레포 URL.', required=True, type=str),
         OpenApiParameter(name='base', description='필수. 기준 revision 또는 commit SHA.', required=True, type=str),
         OpenApiParameter(name='head', description='선택. 대상 revision. 생략하면 최신 HEAD와 비교합니다.', required=False, type=str),
+        OpenApiParameter(name='analysis_profile', description='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.', required=False, type=str),
     ],
     responses=_DIFF_RESPONSE_SCHEMA,
 )
@@ -829,6 +839,8 @@ def graph_diff(request):
     }
     if request.GET.get('head') is not None:
         request_data['head'] = request.GET.get('head')
+    if request.GET.get('analysis_profile') is not None:
+        request_data['analysis_profile'] = request.GET.get('analysis_profile')
     serializer = DiffRequestSerializer(data=request_data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
@@ -839,6 +851,7 @@ def graph_diff(request):
             validated_data['repo_url'],
             validated_data['base'],
             validated_data.get('head'),
+            analysis_profile=validated_data.get('analysis_profile'),
         )
     except RepoIngestionError as error:
         return _repo_ingestion_error_response(error)
@@ -869,6 +882,7 @@ def share(request):
             str(validated_data['repo_url']),
             mode=str(validated_data.get('mode', 'fixed')),
             revision=validated_data.get('revision'),
+            analysis_profile=str(validated_data.get('analysis_profile') or ''),
             title=str(validated_data.get('title') or ''),
             expires_at=validated_data.get('expires_at'),
         )
@@ -902,6 +916,7 @@ def share(request):
         OpenApiParameter(name='limit', description=f'선택. 모듈 선별 한도 ({MIN_NODE_LIMIT}-{MAX_NODE_LIMIT}). 고급 옵션이며 기본값 권장.', required=False, type=int),
         OpenApiParameter(name='theme', description='선택. light 또는 dark.', required=False, type=str),
         OpenApiParameter(name='title', description='선택. SVG 상단 제목을 직접 지정할 때 사용합니다.', required=False, type=str),
+        OpenApiParameter(name='analysis_profile', description='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.', required=False, type=str),
     ],
     responses={(200, 'image/svg+xml'): OpenApiTypes.STR},
 )
@@ -911,6 +926,8 @@ def readme_graph_svg(request):
     request_data = {'repo_url': request.GET.get('url') or request.GET.get('repo_url')}
     if request.GET.get('revision') is not None:
         request_data['revision'] = request.GET.get('revision')
+    if request.GET.get('analysis_profile') is not None:
+        request_data['analysis_profile'] = request.GET.get('analysis_profile')
     serializer = AnalysisRequestSerializer(data=request_data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
@@ -918,14 +935,15 @@ def readme_graph_svg(request):
     validated_data = cast(dict[str, str], serializer.validated_data)
     repo_path = validated_data['repo_url']
     revision = validated_data.get('revision')
+    analysis_profile = validated_data.get('analysis_profile')
     try:
-        analysis = get_repo_analysis(repo_path, revision)
+        analysis = get_repo_analysis(repo_path, revision, analysis_profile=analysis_profile)
     except RepoIngestionError as error:
         return _repo_ingestion_error_response(error)
     if analysis is None:
         return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
 
-    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']), analysis_profile=analysis_profile)
     graph = build_graph_response(analysis, analysis_run)
     options = normalize_svg_options(
         width=_query_int(request, 'width') or DEFAULT_SVG_WIDTH,
@@ -1105,6 +1123,7 @@ def get_repo_file(request):
     parameters=[
         OpenApiParameter(name='url', description='필수. 트리를 조회할 public GitHub 레포 URL.', required=True, type=str),
         OpenApiParameter(name='revision', description='선택. 특정 분석 결과를 고정할 때 `/api/analysis/` 응답의 revision을 넣습니다.', required=False, type=str),
+        OpenApiParameter(name='analysis_profile', description='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.', required=False, type=str),
     ],
     responses=inline_serializer(
         name='RepoTreeResponse',
@@ -1112,6 +1131,7 @@ def get_repo_file(request):
             'analysis_id': serializers.IntegerField(allow_null=True, help_text='이 tree가 나온 분석 run ID입니다. summary/qa에 재사용할 수 있습니다.'),
             'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
             'revision': serializers.CharField(help_text='실제로 분석된 git commit SHA입니다. 같은 tree를 다시 볼 때 query revision으로 재사용합니다.'),
+            'analysis_profile': serializers.CharField(help_text='분석 profile ID입니다.'),
             'tree': serializers.JSONField(help_text='프런트엔드 파일/심볼 트리 UI에 사용할 계층 구조입니다.'),
             'warnings': serializers.JSONField(help_text='분석 경고 목록입니다.'),
         },
@@ -1119,20 +1139,24 @@ def get_repo_file(request):
 )
 @api_view(['GET'])
 def get_repo_tree(request):
-    serializer = RepoUrlSerializer(data={'repo_url': request.GET.get('url')})
+    request_data = {'repo_url': request.GET.get('url')}
+    if request.GET.get('revision') is not None:
+        request_data['revision'] = request.GET.get('revision')
+    if request.GET.get('analysis_profile') is not None:
+        request_data['analysis_profile'] = request.GET.get('analysis_profile')
+    serializer = AnalysisRequestSerializer(data=request_data)
     if not serializer.is_valid():
         logger.warning(f"잘못된 URL 요청: {request.GET.get('url')}")
         return Response(serializer.errors, status=400)
 
     validated_data = cast(dict[str, str], serializer.validated_data)
     repo_path = validated_data['repo_url']
-    revision = request.GET.get('revision')
-    if revision is not None and not is_safe_revision(revision):
-        return Response({'revision': ['올바른 revision이 아닙니다']}, status=400)
+    revision = validated_data.get('revision')
+    analysis_profile = validated_data.get('analysis_profile')
     logger.info(f"트리 요청: {repo_path}")
 
     try:
-        analysis = get_repo_analysis(repo_path, revision)
+        analysis = get_repo_analysis(repo_path, revision, analysis_profile=analysis_profile)
     except RepoIngestionError as error:
         return _repo_ingestion_error_response(error)
 
@@ -1142,7 +1166,7 @@ def get_repo_tree(request):
 
     logger.info(f"트리 반환 완료: {repo_path}")
 
-    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']), analysis_profile=analysis_profile)
     return Response(build_tree_response(analysis, analysis_run))
 
 
@@ -1151,6 +1175,7 @@ def get_repo_tree(request):
     parameters=[
         OpenApiParameter(name='url', description='필수. 그래프를 조회할 public GitHub 레포 URL.', required=True, type=str),
         OpenApiParameter(name='revision', description='선택. 특정 분석 결과를 고정할 때 `/api/analysis/` 응답의 revision을 넣습니다.', required=False, type=str),
+        OpenApiParameter(name='analysis_profile', description='선택. python-v1 또는 multi-lang-js-ts-v1. 생략하면 서버 기본 profile을 사용합니다.', required=False, type=str),
     ],
     responses=inline_serializer(
         name='RepoGraphResponse',
@@ -1158,6 +1183,7 @@ def get_repo_tree(request):
             'analysis_id': serializers.IntegerField(allow_null=True, help_text='이 graph가 나온 분석 run ID입니다. summary/qa에 재사용할 수 있습니다.'),
             'repo': serializers.CharField(help_text='정규화된 owner/repo 형식의 레포 이름입니다.'),
             'revision': serializers.CharField(help_text='실제로 분석된 git commit SHA입니다. 같은 graph를 다시 볼 때 query revision으로 재사용합니다.'),
+            'analysis_profile': serializers.CharField(help_text='분석 profile ID입니다.'),
             'nodes': serializers.JSONField(help_text='그래프 노드 목록입니다. 각 node의 id는 node-summary/qa selected_node_id에 재사용합니다.'),
             'edges': serializers.JSONField(help_text='그래프 엣지 목록입니다. source/target은 nodes[].id를 참조합니다.'),
             'entrypoints': serializers.JSONField(help_text='파서가 추정한 진입점 목록입니다.'),
@@ -1168,20 +1194,24 @@ def get_repo_tree(request):
 )
 @api_view(['GET'])
 def get_repo_graph(request):
-    serializer = RepoUrlSerializer(data={'repo_url': request.GET.get('url')})
+    request_data = {'repo_url': request.GET.get('url')}
+    if request.GET.get('revision') is not None:
+        request_data['revision'] = request.GET.get('revision')
+    if request.GET.get('analysis_profile') is not None:
+        request_data['analysis_profile'] = request.GET.get('analysis_profile')
+    serializer = AnalysisRequestSerializer(data=request_data)
     if not serializer.is_valid():
         logger.warning(f"잘못된 URL 요청: {request.GET.get('url')}")
         return Response(serializer.errors, status=400)
 
     validated_data = cast(dict[str, str], serializer.validated_data)
     repo_path = validated_data['repo_url']
-    revision = request.GET.get('revision')
-    if revision is not None and not is_safe_revision(revision):
-        return Response({'revision': ['올바른 revision이 아닙니다']}, status=400)
+    revision = validated_data.get('revision')
+    analysis_profile = validated_data.get('analysis_profile')
     logger.info(f"그래프 요청: {repo_path}")
 
     try:
-        analysis = get_repo_analysis(repo_path, revision)
+        analysis = get_repo_analysis(repo_path, revision, analysis_profile=analysis_profile)
     except RepoIngestionError as error:
         return _repo_ingestion_error_response(error)
 
@@ -1191,7 +1221,7 @@ def get_repo_graph(request):
 
     logger.info(f"그래프 반환 완료: {repo_path}")
 
-    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']), analysis_profile=analysis_profile)
     return Response(build_graph_response(analysis, analysis_run))
 
 
@@ -1361,6 +1391,7 @@ def node_summary(request):
             'repo_url': serializers.CharField(required=False, help_text='analysis_id가 없을 때 필요한 GitHub 레포 URL입니다.'),
             'question': serializers.CharField(help_text='레포에 대해 물어볼 질문입니다.'),
             'revision': serializers.CharField(required=False, help_text='repo_url 방식에서 특정 revision을 고정할 때 사용합니다.'),
+            'analysis_profile': serializers.CharField(required=False, help_text='repo_url 방식에서 사용할 분석 profile입니다. python-v1 또는 multi-lang-js-ts-v1.'),
             'analysis_id': serializers.IntegerField(required=False, min_value=1, help_text='/api/analysis/ 응답의 analysis_id입니다. 있으면 repo_url보다 우선 사용합니다.'),
             'selected_node_id': serializers.CharField(required=False, help_text='/api/graph/ 응답의 nodes[].id입니다. 선택 노드 중심으로 답변할 때 사용합니다.'),
             'selected_file_path': serializers.CharField(required=False, help_text='선택 파일 중심으로 답변할 때 사용합니다.'),
@@ -1394,6 +1425,7 @@ def qa(request):
     question = validated_data['question']
     analysis_id = validated_data.get('analysis_id')
     revision = validated_data.get('revision')
+    analysis_profile = validated_data.get('analysis_profile')
     selected_node_id = validated_data.get('selected_node_id')
     selected_file_path = validated_data.get('selected_file_path')
     max_context_files = int(validated_data.get('max_context_files', 4))
@@ -1417,7 +1449,7 @@ def qa(request):
         repo_path = str(analysis_response['repo'])
     else:
         try:
-            analysis = get_repo_analysis(repo_path, revision)
+            analysis = get_repo_analysis(repo_path, revision, analysis_profile=analysis_profile)
         except RepoIngestionError as error:
             return _repo_ingestion_error_response(error)
 

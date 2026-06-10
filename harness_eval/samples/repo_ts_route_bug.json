@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "id": "repo_ts_route_bug",
+  "task": "Analyze the provided TypeScript repository fixture and find the route/service origin for a user creation crash.",
+  "repo": {
+    "kind": "local_fixture",
+    "local_path": "harness_eval/fixtures/repos/ts_route_bug_repo",
+    "language": "typescript"
+  },
+  "issue": {
+    "number": 303,
+    "title": "POST /api/users crashes when email is omitted",
+    "body": "Creating a user through src/routes/user.ts fails with TypeError: Cannot read properties of undefined (reading 'trim') at createUser (src/services/userService.ts:7:25). The health route is fine, and src/services/userService.test.ts is only a passing unit test.",
+    "labels": [{"name": "bug"}, {"name": "typescript"}],
+    "comments": [
+      {
+        "id": 31,
+        "body": "The crash happens after the route delegates to createUser; inspect the service implementation before changing route wiring."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_repo_files",
+      "description": "List bounded source files in the provided repository."
+    },
+    {
+      "name": "search_repo_symbols",
+      "description": "Search source symbols in the repository and rank them against issue evidence."
+    },
+    {
+      "name": "read_node_context",
+      "description": "Read bounded source context for an exact candidate node."
+    }
+  ],
+  "expect": {
+    "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_ts_route_bug",
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_node_context"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_node_context"],
+    "required_read_paths": ["src/services/userService.ts"],
+    "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
+    "node_ids": ["src/services/userService.ts::createUser"],
+    "allowed_node_ids": ["src/services/userService.ts::createUser", "src/routes/user.ts::POST"],
+    "allowed_paths": ["src/services/userService.ts", "src/routes/user.ts"],
+    "node_paths": {
+      "src/services/userService.ts::createUser": "src/services/userService.ts",
+      "src/routes/user.ts::POST": "src/routes/user.ts"
+    }
+  }
+}

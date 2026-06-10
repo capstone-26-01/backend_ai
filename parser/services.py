@@ -5,9 +5,65 @@ from pathlib import PurePosixPath
 import ast
 
 from tree_sitter import Language, Parser
+import tree_sitter_javascript as tsjavascript
 import tree_sitter_python as tspython
+import tree_sitter_typescript as tstypescript
+
+from parser.language_registry import JAVASCRIPT_BUILTINS, ignored_reason, language_for_path, normalize_enabled_languages
+from parser.languages.javascript_resolver import resolve_js_module_path
 
 PY_LANGUAGE = Language(tspython.language())
+JS_LANGUAGE = Language(tsjavascript.language())
+TS_LANGUAGE = Language(tstypescript.language_typescript())
+TSX_LANGUAGE = Language(tstypescript.language_tsx())
+
+JS_TS_DECLARATION_TYPES = {
+    'arrow_function',
+    'class',
+    'class_declaration',
+    'abstract_class_declaration',
+    'enum_declaration',
+    'function_expression',
+    'function_declaration',
+    'interface_declaration',
+    'lexical_declaration',
+    'type_alias_declaration',
+}
+JS_TS_FUNCTION_VALUE_TYPES = {'arrow_function', 'function', 'function_expression'}
+JS_TS_NESTED_CALL_BOUNDARIES = {
+    'arrow_function',
+    'class_declaration',
+    'function',
+    'function_declaration',
+    'function_expression',
+    'method_definition',
+}
+JS_TS_SOURCE_EXTENSIONS = ('.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts')
+JS_TS_MANIFEST_NAMES = {'tsconfig.json', 'jsconfig.json', 'pnpm-workspace.yaml', 'package.json'}
+JS_NAMESPACE_TARGET_PREFIX = 'namespace::'
+JS_TS_TYPE_REFERENCE_BUILTINS = set(JAVASCRIPT_BUILTINS) | {
+    'Array',
+    'Awaited',
+    'NonNullable',
+    'Omit',
+    'Partial',
+    'Pick',
+    'Readonly',
+    'Record',
+    'Required',
+    'ReturnType',
+    'boolean',
+    'bigint',
+    'never',
+    'null',
+    'number',
+    'object',
+    'string',
+    'symbol',
+    'undefined',
+    'unknown',
+    'void',
+}
 
 TREE_TYPE_ORDER = {
     'directory': 0,
@@ -488,6 +544,449 @@ def parse_python_file(code: str, file_path: str):
     return module_tree_node, [*import_nodes.values(), *nodes], edges, warnings
 
 
+def _js_language_for_path(file_path: str):
+    if file_path.endswith('.tsx'):
+        return TSX_LANGUAGE
+    if file_path.endswith(('.ts', '.mts', '.cts')):
+        return TS_LANGUAGE
+    return JS_LANGUAGE
+
+
+def _js_language_id_for_path(file_path: str) -> str:
+    return 'typescript' if file_path.endswith(('.ts', '.tsx', '.mts', '.cts')) else 'javascript'
+
+
+def _module_id_for_source_path(file_path: str) -> str:
+    return f'module::{file_path}'
+
+
+def _clean_js_string_literal(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] in {'"', "'", '`'} and value[-1] == value[0]:
+        return value[1:-1]
+    return value
+
+
+def _js_namespace_target(object_name: str, member_name: str) -> str:
+    return f'{JS_NAMESPACE_TARGET_PREFIX}{object_name}::{member_name}'
+
+
+def _split_js_namespace_target(target: str) -> tuple[str, str] | None:
+    if not target.startswith(JS_NAMESPACE_TARGET_PREFIX):
+        return None
+    parts = target.removeprefix(JS_NAMESPACE_TARGET_PREFIX).split('::', 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
+
+
+def _js_node_name(node, source_bytes: bytes) -> str | None:
+    name_node = node.child_by_field_name('name')
+    if name_node is not None:
+        return _read_text(name_node, source_bytes)
+    for child in node.named_children:
+        if child.type in {'identifier', 'property_identifier', 'type_identifier'}:
+            return _read_text(child, source_bytes)
+    return None
+
+
+def _unwrap_js_export(node):
+    if node.type != 'export_statement':
+        return node, False
+    for child in node.named_children:
+        if child.type in JS_TS_DECLARATION_TYPES:
+            return child, True
+    return node, True
+
+
+def _js_is_default_export(node, source_bytes: bytes) -> bool:
+    return node.type == 'export_statement' and _read_text(node, source_bytes).lstrip().startswith('export default')
+
+
+def _js_is_export_all(node) -> bool:
+    return node.type == 'export_statement' and not any(child.type in {'export_clause', 'namespace_export'} for child in node.named_children)
+
+
+def _js_import_source(node, source_bytes: bytes) -> str | None:
+    source_node = node.child_by_field_name('source')
+    if source_node is not None:
+        return _clean_js_string_literal(_read_text(source_node, source_bytes))
+    for child in reversed(node.named_children):
+        if child.type == 'string':
+            return _clean_js_string_literal(_read_text(child, source_bytes))
+    return None
+
+
+def _js_import_aliases(node, source_bytes: bytes) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    import_clause = next((child for child in node.named_children if child.type == 'import_clause'), None)
+    if import_clause is not None:
+        for child in import_clause.named_children:
+            if child.type == 'identifier':
+                aliases[_read_text(child, source_bytes)] = 'default'
+                continue
+            if child.type == 'namespace_import':
+                name = _js_node_name(child, source_bytes)
+                if name:
+                    aliases[name] = '*'
+                continue
+            if child.type != 'named_imports':
+                continue
+            for specifier in child.named_children:
+                if specifier.type != 'import_specifier':
+                    continue
+                name_node = specifier.child_by_field_name('name')
+                alias_node = specifier.child_by_field_name('alias')
+                if name_node is None:
+                    continue
+                imported = _read_text(name_node, source_bytes)
+                local = _read_text(alias_node, source_bytes) if alias_node is not None else imported
+                aliases[local] = imported
+
+    export_clause = next((child for child in node.named_children if child.type == 'export_clause'), None)
+    if export_clause is not None:
+        for specifier in export_clause.named_children:
+            if specifier.type != 'export_specifier':
+                continue
+            name_node = specifier.child_by_field_name('name')
+            alias_node = specifier.child_by_field_name('alias')
+            if name_node is None:
+                continue
+            imported = _read_text(name_node, source_bytes)
+            local = _read_text(alias_node, source_bytes) if alias_node is not None else imported
+            aliases[local] = imported
+    return aliases
+
+
+def _js_variable_function_name(node, source_bytes: bytes):
+    if node.type != 'lexical_declaration':
+        return None
+    for child in node.named_children:
+        if child.type != 'variable_declarator':
+            continue
+        name_node = child.child_by_field_name('name')
+        value_node = child.child_by_field_name('value')
+        if name_node is None or value_node is None or value_node.type not in JS_TS_FUNCTION_VALUE_TYPES:
+            continue
+        return _read_text(name_node, source_bytes), value_node.type, value_node
+    return None
+
+
+def _first_js_expression_identifier(node, source_bytes: bytes) -> str | None:
+    if node.type in {'identifier', 'property_identifier', 'type_identifier'}:
+        return _read_text(node, source_bytes)
+    if node.type == 'member_expression':
+        object_node = node.child_by_field_name('object')
+        property_node = node.child_by_field_name('property')
+        if property_node is None:
+            return None
+        property_name = _read_text(property_node, source_bytes)
+        if object_node is not None and object_node.type == 'identifier':
+            return _js_namespace_target(_read_text(object_node, source_bytes), property_name)
+        return property_name
+    for child in node.named_children:
+        value = _first_js_expression_identifier(child, source_bytes)
+        if value:
+            return value
+    return None
+
+
+def _js_heritage_edges(node, source_bytes: bytes, source_id: str, file_path: str) -> list[dict[str, object]]:
+    edges: list[dict[str, object]] = []
+    for child in _walk(node):
+        if child.type not in {'extends_clause', 'extends_type_clause', 'implements_clause'}:
+            continue
+        relation = 'implements' if child.type == 'implements_clause' else 'extends'
+        for candidate in child.named_children:
+            name = _first_js_expression_identifier(candidate, source_bytes)
+            if not name:
+                continue
+            edges.append(_make_edge(
+                source_id,
+                name,
+                'inherits',
+                file_path,
+                confidence=0.75 if relation == 'implements' else 0.85,
+                metadata={'ts_relation': relation},
+            ))
+    return edges
+
+
+def _walk_js_callable_body(node, *, is_root: bool = True):
+    yield node
+    for child in node.named_children:
+        if not is_root and child.type in JS_TS_NESTED_CALL_BOUNDARIES:
+            continue
+        yield from _walk_js_callable_body(child, is_root=False)
+
+
+def _js_call_target(node, source_bytes: bytes, caller_class_id: str | None) -> tuple[str | None, float, dict[str, object]]:
+    metadata: dict[str, object] = {}
+    if node.type == 'call_expression':
+        function_node = node.child_by_field_name('function')
+    elif node.type == 'new_expression':
+        function_node = node.child_by_field_name('constructor') or (node.named_children[0] if node.named_children else None)
+        metadata['constructs'] = True
+    else:
+        return None, 0.0, metadata
+    if function_node is None:
+        return None, 0.0, metadata
+
+    if function_node.type == 'identifier':
+        identifier = _read_text(function_node, source_bytes)
+        if identifier in JAVASCRIPT_BUILTINS:
+            return None, 0.0, metadata
+        return identifier, 0.65, metadata
+
+    if function_node.type == 'member_expression':
+        object_node = function_node.child_by_field_name('object')
+        property_node = function_node.child_by_field_name('property')
+        if property_node is None:
+            return None, 0.0, metadata
+        property_name = _read_text(property_node, source_bytes)
+        object_name = _read_text(object_node, source_bytes) if object_node is not None else ''
+        if object_name in JAVASCRIPT_BUILTINS:
+            return None, 0.0, metadata
+        if object_name in {'this', 'super'} and caller_class_id is not None:
+            return f'{caller_class_id}::{property_name}', 0.9, {'object': object_name}
+        if property_name in JAVASCRIPT_BUILTINS:
+            return None, 0.0, metadata
+        if object_node is not None and object_node.type == 'identifier':
+            return _js_namespace_target(object_name, property_name), 0.45, {'member_object': object_name, 'member_name': property_name}
+        return f'attribute::{property_name}', 0.35, {'unresolved_attribute': object_name}
+
+    return None, 0.0, metadata
+
+
+def _extract_js_call_edges(node, source_bytes: bytes, caller_id: str, file_path: str) -> list[dict[str, object]]:
+    call_edges: list[dict[str, object]] = []
+    caller_class_id = '::'.join(caller_id.split('::')[:-1]) if caller_id.count('::') >= 2 else None
+    for child in _walk_js_callable_body(node):
+        if child.type not in {'call_expression', 'new_expression'}:
+            continue
+        target, confidence, metadata = _js_call_target(child, source_bytes, caller_class_id)
+        if target is None:
+            continue
+        call_edges.append(_make_edge(caller_id, target, 'calls', file_path, confidence=confidence, metadata=metadata))
+    return call_edges
+
+
+def _extract_js_reference_edges(
+    node,
+    source_bytes: bytes,
+    source_id: str,
+    file_path: str,
+    *,
+    own_symbol: str | None = None,
+) -> list[dict[str, object]]:
+    edges: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for child in _walk(node):
+        if child.type != 'type_identifier':
+            continue
+        target = _read_text(child, source_bytes)
+        if target == own_symbol or target in JS_TS_TYPE_REFERENCE_BUILTINS or target in seen:
+            continue
+        seen.add(target)
+        edges.append(_make_edge(
+            source_id,
+            target,
+            'references',
+            file_path,
+            confidence=0.75,
+            metadata={'reference_kind': 'type'},
+        ))
+    return edges
+
+
+def _parse_js_class_body(class_node, source_bytes: bytes, class_id: str, file_path: str) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    nodes: list[dict[str, object]] = []
+    edges: list[dict[str, object]] = []
+    tree_children: list[dict[str, object]] = []
+    body = class_node.child_by_field_name('body')
+    if body is None:
+        return nodes, edges, tree_children
+
+    language = _js_language_id_for_path(file_path)
+    for child in body.named_children:
+        if child.type != 'method_definition':
+            continue
+        method_name = _js_node_name(child, source_bytes)
+        if method_name is None:
+            continue
+        method_id = f'{class_id}::{method_name}'
+        start_line, end_line = _line_range(child)
+        nodes.append(_make_graph_node(
+            method_id,
+            'method',
+            method_name,
+            file_path=file_path,
+            path=file_path,
+            parent=class_id,
+            symbol=method_name,
+            language=language,
+            start_line=start_line,
+            end_line=end_line,
+            metadata={'symbol_kind': 'method'},
+        ))
+        edges.append(_make_edge(class_id, method_id, 'contains', file_path))
+        edges.extend(_extract_js_call_edges(child, source_bytes, method_id, file_path))
+        edges.extend(_extract_js_reference_edges(child, source_bytes, method_id, file_path, own_symbol=method_name))
+        tree_children.append(_make_tree_node(method_id, 'method', method_name))
+    return nodes, edges, tree_children
+
+
+def parse_javascript_file(code: str, file_path: str):
+    parser = Parser(_js_language_for_path(file_path))
+    source_bytes = code.encode('utf-8')
+    tree = parser.parse(source_bytes)
+    root = tree.root_node
+
+    language = _js_language_id_for_path(file_path)
+    module_id = _module_id_for_source_path(file_path)
+    module_node = _make_graph_node(
+        module_id,
+        'module',
+        file_path,
+        file_path=file_path,
+        path=file_path,
+        parent=file_path,
+        symbol=file_path,
+        language=language,
+        metadata={'external': False, 'support_level': 'relationships'},
+    )
+    nodes: list[dict[str, object]] = [module_node]
+    edges: list[dict[str, object]] = [_make_edge(file_path, module_id, 'contains', file_path)]
+    module_children: list[dict[str, object]] = []
+    warnings: list[dict[str, object]] = []
+
+    if root.has_error:
+        warnings.append({
+            'code': 'syntax_error',
+            'message': 'JavaScript/TypeScript syntax error; symbol extraction may be incomplete.',
+            'path': file_path,
+        })
+
+    for raw_node in root.children:
+        default_export = _js_is_default_export(raw_node, source_bytes)
+        node, exported = _unwrap_js_export(raw_node)
+        if node.type in {'import_statement', 'export_statement'}:
+            source = _js_import_source(node, source_bytes)
+            if source:
+                import_aliases = _js_import_aliases(node, source_bytes)
+                target_module_id = f'module::{source}'
+                edges.append(_make_edge(
+                    file_path,
+                    target_module_id,
+                    'imports',
+                    file_path,
+                    confidence=0.55 if node.type == 'export_statement' else 0.5,
+                    metadata={
+                        'import_specifier': source,
+                        'import_aliases': import_aliases,
+                        'language_family': 'javascript',
+                        're_export': node.type == 'export_statement',
+                        're_export_all': _js_is_export_all(node),
+                    },
+                ))
+            if node.type == 'export_statement':
+                node, exported = _unwrap_js_export(raw_node)
+                if node.type == 'export_statement':
+                    continue
+            else:
+                continue
+
+        if node.type in {'class', 'class_declaration', 'abstract_class_declaration', 'interface_declaration', 'type_alias_declaration', 'enum_declaration'}:
+            symbol_name = _js_node_name(node, source_bytes)
+            if symbol_name is None and default_export:
+                symbol_name = 'default'
+            if symbol_name is None:
+                continue
+            symbol_id = f'{file_path}::{symbol_name}'
+            start_line, end_line = _line_range(node)
+            node_kind = 'class'
+            metadata = {
+                'symbol_kind': 'class' if node.type in {'class', 'class_declaration', 'abstract_class_declaration'} else node.type.removesuffix('_declaration'),
+                'js_symbol_kind': node.type,
+                'exported': exported,
+                'default_export': default_export,
+            }
+            method_nodes, method_edges, method_tree_children = _parse_js_class_body(node, source_bytes, symbol_id, file_path)
+            nodes.append(_make_graph_node(
+                symbol_id,
+                node_kind,
+                symbol_name,
+                file_path=file_path,
+                path=file_path,
+                parent=module_id,
+                symbol=symbol_name,
+                language=language,
+                start_line=start_line,
+                end_line=end_line,
+                metadata=metadata,
+            ))
+            nodes.extend(method_nodes)
+            edges.append(_make_edge(module_id, symbol_id, 'contains', file_path))
+            edges.extend(method_edges)
+            edges.extend(_js_heritage_edges(node, source_bytes, symbol_id, file_path))
+            edges.extend(_extract_js_reference_edges(node, source_bytes, symbol_id, file_path, own_symbol=symbol_name))
+            module_children.append(_make_tree_node(symbol_id, node_kind, symbol_name, _sort_tree_children(method_tree_children)))
+            continue
+
+        if node.type in {'arrow_function', 'function_declaration', 'function_expression'}:
+            symbol_name = _js_node_name(node, source_bytes)
+            if symbol_name is None:
+                symbol_name = 'default' if default_export else None
+            if symbol_name is None:
+                continue
+            symbol_id = f'{file_path}::{symbol_name}'
+            start_line, end_line = _line_range(node)
+            nodes.append(_make_graph_node(
+                symbol_id,
+                'function',
+                symbol_name,
+                file_path=file_path,
+                path=file_path,
+                parent=module_id,
+                symbol=symbol_name,
+                language=language,
+                start_line=start_line,
+                end_line=end_line,
+                metadata={'symbol_kind': 'function', 'exported': exported, 'default_export': default_export},
+            ))
+            edges.append(_make_edge(module_id, symbol_id, 'contains', file_path))
+            edges.extend(_extract_js_call_edges(node, source_bytes, symbol_id, file_path))
+            edges.extend(_extract_js_reference_edges(node, source_bytes, symbol_id, file_path, own_symbol=symbol_name))
+            module_children.append(_make_tree_node(symbol_id, 'function', symbol_name))
+            continue
+
+        variable_function = _js_variable_function_name(node, source_bytes)
+        if variable_function is not None:
+            symbol_name, value_type, value_node = variable_function
+            symbol_id = f'{file_path}::{symbol_name}'
+            start_line, end_line = _line_range(node)
+            nodes.append(_make_graph_node(
+                symbol_id,
+                'function',
+                symbol_name,
+                file_path=file_path,
+                path=file_path,
+                parent=module_id,
+                symbol=symbol_name,
+                language=language,
+                start_line=start_line,
+                end_line=end_line,
+                metadata={'symbol_kind': value_type, 'exported': exported},
+            ))
+            edges.append(_make_edge(module_id, symbol_id, 'contains', file_path))
+            edges.extend(_extract_js_call_edges(value_node, source_bytes, symbol_id, file_path))
+            edges.extend(_extract_js_reference_edges(node, source_bytes, symbol_id, file_path, own_symbol=symbol_name))
+            module_children.append(_make_tree_node(symbol_id, 'function', symbol_name))
+
+    module_tree_node = _make_tree_node(module_id, 'module', file_path, _sort_tree_children(module_children))
+    return module_tree_node, nodes, edges, warnings
+
+
 def resolve_edges(edges, nodes):
     class_ids_by_name = defaultdict(list)
     symbol_ids_by_name = defaultdict(list)
@@ -544,6 +1043,196 @@ def resolve_edges(edges, nodes):
     ]
 
 
+def _resolve_javascript_import_edges(
+    edges: list[dict[str, object]],
+    all_paths: set[str],
+    resolver_file_contents: dict[str, str],
+    warnings: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    resolved_edges: list[dict[str, object]] = []
+    for edge in edges:
+        if edge.get('type') != 'imports':
+            resolved_edges.append(edge)
+            continue
+        metadata = dict(edge.get('metadata') or {})
+        if metadata.get('language_family') != 'javascript':
+            resolved_edges.append(edge)
+            continue
+        specifier = str(metadata.get('import_specifier') or '')
+        source_path = str(edge.get('file') or '')
+        resolved_path, resolver_name = resolve_js_module_path(source_path, specifier, all_paths, resolver_file_contents)
+        if resolved_path is None:
+            warnings.append({
+                'code': 'unresolved_import',
+                'message': 'JavaScript/TypeScript import could not be resolved to a local source file.',
+                'path': source_path,
+                'target': specifier,
+            })
+            resolved_edges.append(edge)
+            continue
+        metadata['resolver'] = resolver_name
+        metadata['resolved_path'] = resolved_path
+        resolved_edge = dict(edge)
+        resolved_edge['target'] = _module_id_for_source_path(resolved_path)
+        resolved_edge['confidence'] = 0.9 if resolver_name == 'relative' else 0.85
+        resolved_edge['metadata'] = metadata
+        resolved_edges.append(resolved_edge)
+    return resolved_edges
+
+
+def _resolve_javascript_symbol_alias_edges(edges: list[dict[str, object]], nodes: list[dict[str, object]]) -> list[dict[str, object]]:
+    node_ids = {str(node['id']) for node in nodes}
+    default_exports_by_file: dict[str, str] = {}
+    for node in nodes:
+        file_path = str(node.get('file') or '')
+        metadata = node.get('metadata') if isinstance(node.get('metadata'), dict) else {}
+        if file_path and metadata.get('default_export') and file_path not in default_exports_by_file:
+            default_exports_by_file[file_path] = str(node['id'])
+
+    aliases_by_file: dict[tuple[str, str], tuple[str, str]] = {}
+    namespace_aliases_by_file: dict[tuple[str, str], str] = {}
+    reexport_aliases_by_file: dict[tuple[str, str], tuple[str, str]] = {}
+    reexport_all_by_file: list[tuple[str, str]] = []
+    alias_records: list[tuple[str, str, str, str, bool]] = []
+
+    def resolve_imported_symbol(resolved_path: str, imported: str, seen: set[tuple[str, str]] | None = None) -> tuple[str, str] | None:
+        seen = seen or set()
+        marker = (resolved_path, imported)
+        if marker in seen:
+            return None
+        seen.add(marker)
+        if imported == 'default':
+            target_id = default_exports_by_file.get(resolved_path)
+            if target_id is None and f'{resolved_path}::default' in node_ids:
+                target_id = f'{resolved_path}::default'
+            return (target_id, imported) if target_id is not None else None
+        target_id = f'{resolved_path}::{imported}'
+        if target_id in node_ids:
+            return target_id, imported
+        reexported = reexport_aliases_by_file.get((resolved_path, imported))
+        if reexported is not None:
+            return reexported
+        for barrel_path, target_path in reexport_all_by_file:
+            if barrel_path != resolved_path:
+                continue
+            reexported_all_target = resolve_imported_symbol(target_path, imported, seen)
+            if reexported_all_target is not None:
+                return reexported_all_target
+        return None
+
+    for edge in edges:
+        if edge.get('type') != 'imports':
+            continue
+        metadata = dict(edge.get('metadata') or {})
+        if metadata.get('language_family') != 'javascript':
+            continue
+        resolved_path = str(metadata.get('resolved_path') or '')
+        if not resolved_path:
+            continue
+        raw_aliases = metadata.get('import_aliases')
+        source_path = str(edge.get('file') or '')
+        if not isinstance(raw_aliases, dict):
+            if metadata.get('re_export_all'):
+                reexport_all_by_file.append((source_path, resolved_path))
+            continue
+        if metadata.get('re_export_all'):
+            reexport_all_by_file.append((source_path, resolved_path))
+        for local_name, imported_name in raw_aliases.items():
+            local = str(local_name)
+            imported = str(imported_name)
+            if not local or not imported:
+                continue
+            if imported == '*':
+                namespace_aliases_by_file[(source_path, local)] = resolved_path
+                continue
+            alias_records.append((source_path, resolved_path, local, imported, bool(metadata.get('re_export'))))
+
+    changed = True
+    while changed:
+        changed = False
+        for source_path, resolved_path, local, imported, is_re_export in alias_records:
+            alias = resolve_imported_symbol(resolved_path, imported)
+            if alias is None:
+                continue
+            target_map = reexport_aliases_by_file if is_re_export else aliases_by_file
+            key = (source_path, local)
+            if target_map.get(key) != alias:
+                target_map[key] = alias
+                changed = True
+
+    if not aliases_by_file and not namespace_aliases_by_file:
+        return edges
+
+    resolved_edges: list[dict[str, object]] = []
+    for edge in edges:
+        if edge.get('type') not in {'calls', 'inherits', 'references'}:
+            resolved_edges.append(edge)
+            continue
+        source_path = str(edge.get('file') or '')
+        local_target = str(edge.get('target') or '')
+        namespace_target = _split_js_namespace_target(local_target)
+        if namespace_target is not None:
+            local_namespace, imported_name = namespace_target
+            resolved_path = namespace_aliases_by_file.get((source_path, local_namespace))
+            if resolved_path is None:
+                resolved_edges.append(edge)
+                continue
+            alias = resolve_imported_symbol(resolved_path, imported_name)
+            if alias is None:
+                resolved_edges.append(edge)
+                continue
+            target_id, resolved_imported_name = alias
+            metadata = dict(edge.get('metadata') or {})
+            metadata.update({
+                'import_alias': local_namespace,
+                'imported_name': resolved_imported_name,
+                'namespace_alias_resolved': True,
+                'alias_resolved': True,
+            })
+            resolved_edge = dict(edge)
+            resolved_edge['target'] = target_id
+            resolved_edge['metadata'] = metadata
+            resolved_edge['confidence'] = max(float(edge.get('confidence', 0.0)), 0.85)
+            resolved_edges.append(resolved_edge)
+            continue
+        if '::' in local_target:
+            resolved_edges.append(edge)
+            continue
+        alias = aliases_by_file.get((source_path, local_target))
+        if alias is None:
+            resolved_edges.append(edge)
+            continue
+        target_id, imported_name = alias
+        metadata = dict(edge.get('metadata') or {})
+        metadata.update({
+            'import_alias': local_target,
+            'imported_name': imported_name,
+            'alias_resolved': True,
+        })
+        resolved_edge = dict(edge)
+        resolved_edge['target'] = target_id
+        resolved_edge['metadata'] = metadata
+        resolved_edge['confidence'] = max(float(edge.get('confidence', 0.0)), 0.85)
+        resolved_edges.append(resolved_edge)
+    return resolved_edges
+
+
+def _attach_external_import_nodes(nodes: list[dict[str, object]], edges: list[dict[str, object]]) -> list[dict[str, object]]:
+    node_ids = {str(node['id']) for node in nodes}
+    external_nodes: dict[str, dict[str, object]] = {}
+    for edge in edges:
+        if edge.get('type') != 'imports':
+            continue
+        target = str(edge.get('target') or '')
+        if not target or target in node_ids:
+            continue
+        if target.startswith('module::'):
+            external_nodes[target] = _make_module_node(target, target.removeprefix('module::'))
+        else:
+            external_nodes[target] = _make_graph_node(target, 'external', _external_label(target), metadata={'external': True})
+    return [*nodes, *external_nodes.values()]
+
+
 def _normalize_repo_path(file_path: str) -> str | None:
     path = PurePosixPath(file_path)
     if path.is_absolute() or '..' in path.parts:
@@ -551,7 +1240,15 @@ def _normalize_repo_path(file_path: str) -> str | None:
     return path.as_posix()
 
 
-def _make_file_node(file_path: str, parent: str | None, *, analyzed: bool, language: str | None) -> dict[str, object]:
+def _make_file_node(file_path: str, parent: str | None, *, analyzed: bool, language: str | None, skip_reason: str | None = None) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        'analyzed': analyzed,
+        'language': language,
+        'unsupported': language is None,
+    }
+    if skip_reason is not None:
+        metadata['ignored'] = True
+        metadata['skip_reason'] = skip_reason
     return _make_graph_node(
         file_path,
         'file',
@@ -560,11 +1257,7 @@ def _make_file_node(file_path: str, parent: str | None, *, analyzed: bool, langu
         path=file_path,
         parent=parent,
         language=language,
-        metadata={
-            'analyzed': analyzed,
-            'language': language,
-            'unsupported': language is None,
-        },
+        metadata=metadata,
     )
 
 
@@ -582,12 +1275,25 @@ def _external_label(external_id: str) -> str:
     return external_id.split('::')[-1]
 
 
+def _should_warn_unresolved_call(edge: dict[str, object], target: str) -> bool:
+    file_path = str(edge.get('file') or '')
+    metadata = dict(edge.get('metadata') or {})
+    if file_path.endswith(JS_TS_SOURCE_EXTENSIONS) and (
+        target.startswith('attribute::')
+        or target.startswith(JS_NAMESPACE_TARGET_PREFIX)
+        or 'unresolved_attribute' in metadata
+        or 'member_object' in metadata
+    ):
+        return False
+    return True
+
+
 def _attach_external_call_nodes(nodes: list[dict[str, object]], edges: list[dict[str, object]], warnings: list[dict[str, object]]) -> list[dict[str, object]]:
     node_ids = {str(node['id']) for node in nodes}
     external_nodes: dict[str, dict[str, object]] = {}
 
     for edge in edges:
-        if edge['type'] != 'calls':
+        if edge['type'] not in {'calls', 'references'}:
             continue
         target = str(edge['target'])
         if target in node_ids:
@@ -595,7 +1301,10 @@ def _attach_external_call_nodes(nodes: list[dict[str, object]], edges: list[dict
 
         external_id = target if '::' in target else f'external::{target}'
         edge['target'] = external_id
-        edge['confidence'] = min(float(edge.get('confidence', 1.0)), 0.4)
+        if edge['type'] == 'calls':
+            edge['confidence'] = min(float(edge.get('confidence', 1.0)), 0.4)
+        else:
+            edge['confidence'] = min(float(edge.get('confidence', 1.0)), 0.5)
         metadata = dict(edge.get('metadata', {}))
         metadata['unresolved_target'] = target
         edge['metadata'] = metadata
@@ -607,12 +1316,13 @@ def _attach_external_call_nodes(nodes: list[dict[str, object]], edges: list[dict
                 _external_label(external_id),
                 metadata={'original_target': target},
             )
-            warnings.append({
-                'code': 'unresolved_call',
-                'message': 'Call target could not be resolved to a local symbol.',
-                'path': edge['file'],
-                'target': target,
-            })
+            if edge['type'] == 'calls' and _should_warn_unresolved_call(edge, target):
+                warnings.append({
+                    'code': 'unresolved_call',
+                    'message': 'Call target could not be resolved to a local symbol.',
+                    'path': edge['file'],
+                    'target': target,
+                })
 
     return [*nodes, *external_nodes.values()]
 
@@ -650,6 +1360,14 @@ def _detect_entrypoints(nodes: list[dict[str, object]]) -> list[dict[str, object
             add(node, 'django_manage', 0.95, 'manage.py convention')
         if path.endswith(('asgi.py', 'wsgi.py')):
             add(node, 'django_server_entry', 0.8, 'ASGI/WSGI convention')
+        if path.endswith(('src/main.ts', 'src/main.js', 'src/index.ts', 'src/index.js', 'server.ts', 'server.js', 'app.ts', 'app.js')):
+            add(node, 'js_ts_entry_file', 0.75, 'JavaScript/TypeScript entrypoint filename convention')
+        if path.endswith(('/route.ts', '/route.js', '/route.tsx', '/route.jsx')):
+            add(node, 'js_ts_route_file', 0.8, 'JavaScript/TypeScript route file convention')
+        if path.endswith(('vite.config.ts', 'vite.config.js', 'next.config.js', 'next.config.ts')):
+            add(node, 'js_ts_config_entry', 0.65, 'JavaScript/TypeScript framework config convention')
+        if node_type in {'function', 'method'} and label in {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'} and '/api/' in path:
+            add(node, 'js_ts_route_handler', 0.85, 'HTTP method export in route file')
         decorators = metadata.get('decorators') if isinstance(metadata, dict) else None
         if isinstance(decorators, list) and any(str(decorator).startswith(('app.get', 'app.post', 'app.put', 'app.delete', 'router.', 'app.route')) for decorator in decorators):
             add(node, 'web_route', 0.85, 'route decorator')
@@ -679,7 +1397,12 @@ def _score_key_modules(nodes: list[dict[str, object]], edges: list[dict[str, obj
     scored: list[dict[str, object]] = []
     for module_id, node in module_nodes.items():
         path = str(node.get('file') or '')
-        path_tokens = set(path.removesuffix('.py').replace('/', '.').replace('_', '.').split('.'))
+        path_stem = path
+        for suffix in JS_TS_SOURCE_EXTENSIONS + ('.py',):
+            if path_stem.endswith(suffix):
+                path_stem = path_stem.removesuffix(suffix)
+                break
+        path_tokens = set(path_stem.replace('/', '.').replace('_', '.').replace('-', '.').split('.'))
         score = fan_in[module_id] * 2 + fan_out[module_id]
         reasons = []
         if fan_in[module_id]:
@@ -705,12 +1428,15 @@ def _score_key_modules(nodes: list[dict[str, object]], edges: list[dict[str, obj
     return sorted(scored, key=lambda item: (-int(item['score']), str(item['path']), str(item['id'])))[:10]
 
 
-def parse_repo(repo_path, files, get_content_func):
+def parse_repo(repo_path, files, get_content_func, *, enabled_languages=None, resolver_file_contents: dict[str, str] | None = None):
+    enabled_languages = normalize_enabled_languages(enabled_languages)
+    resolver_file_contents = resolver_file_contents or {}
     root_tree_children: list[dict[str, object]] = []
     directory_tree_nodes: dict[str, dict[str, object]] = {}
     all_nodes: list[dict[str, object]] = []
     all_edges: list[dict[str, object]] = []
     warnings: list[dict[str, object]] = []
+    normalized_file_paths: set[str] = set()
 
     def ensure_directory(dir_path: str, label: str, parent_path: str | None, siblings: list[dict[str, object]]) -> dict[str, object]:
         existing = directory_tree_nodes.get(dir_path)
@@ -734,6 +1460,7 @@ def parse_repo(repo_path, files, get_content_func):
                 'path': raw_file_path,
             })
             continue
+        normalized_file_paths.add(file_path)
 
         parts = file_path.split('/')
         parent_path: str | None = None
@@ -744,12 +1471,15 @@ def parse_repo(repo_path, files, get_content_func):
             parent_path = dir_path
             siblings = directory_node['children']
 
-        is_python = file_path.endswith('.py')
-        language = 'python' if is_python else None
+        language_spec = language_for_path(file_path, enabled_languages=enabled_languages)
+        language = language_spec.id if language_spec is not None else None
+        skip_reason = ignored_reason(file_path, language_spec=language_spec) if language_spec is not None else None
         file_tree_node = _make_tree_node(file_path, 'file', parts[-1])
         analyzed = False
 
-        if is_python:
+        if skip_reason is not None:
+            pass
+        elif language == 'python':
             code = get_content_func(repo_path, file_path)
             if code is None:
                 warnings.append({
@@ -764,16 +1494,34 @@ def parse_repo(repo_path, files, get_content_func):
                 all_edges.extend(edges)
                 warnings.extend(file_warnings)
                 analyzed = not any(warning.get('code') == 'syntax_error' for warning in file_warnings)
+        elif language in {'javascript', 'typescript'}:
+            code = get_content_func(repo_path, file_path)
+            if code is None:
+                warnings.append({
+                    'code': 'missing_content',
+                    'message': 'JavaScript/TypeScript file content was not available for analysis.',
+                    'path': file_path,
+                })
+            else:
+                module_tree_node, nodes, edges, file_warnings = parse_javascript_file(code, file_path)
+                file_tree_node['children'].append(module_tree_node)
+                all_nodes.extend(nodes)
+                all_edges.extend(edges)
+                warnings.extend(file_warnings)
+                analyzed = not any(warning.get('code') == 'syntax_error' for warning in file_warnings)
 
         siblings.append(file_tree_node)
-        all_nodes.append(_make_file_node(file_path, parent_path, analyzed=analyzed, language=language))
+        all_nodes.append(_make_file_node(file_path, parent_path, analyzed=analyzed, language=language, skip_reason=skip_reason))
         if parent_path is not None:
             all_edges.append(_make_edge(parent_path, file_path, 'contains', file_path))
 
     deduplicated_nodes = _deduplicate_nodes(all_nodes)
+    all_edges = _resolve_javascript_import_edges(all_edges, normalized_file_paths, resolver_file_contents, warnings)
+    all_edges = _resolve_javascript_symbol_alias_edges(all_edges, deduplicated_nodes)
     sorted_nodes = _sort_nodes(deduplicated_nodes)
     resolved_edges = resolve_edges(all_edges, sorted_nodes)
-    nodes_with_external = _sort_nodes(_attach_external_call_nodes(sorted_nodes, resolved_edges, warnings))
+    nodes_with_imports = _sort_nodes(_attach_external_import_nodes(sorted_nodes, resolved_edges))
+    nodes_with_external = _sort_nodes(_attach_external_call_nodes(nodes_with_imports, resolved_edges, warnings))
     entrypoints = _detect_entrypoints(nodes_with_external)
     key_modules = _score_key_modules(nodes_with_external, resolved_edges, entrypoints)
 

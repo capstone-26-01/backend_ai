@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import PurePosixPath
 from typing import Any, cast
 import html
 import os
@@ -10,9 +11,13 @@ from api.readme_svg import select_overview_cards
 from llm.context_selection import identifier_tokens, score_nodes
 
 
-FILE_PATH_RE = re.compile(r'(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py|[A-Za-z0-9_.-]+\.py)(?::(?P<line>\d+))?')
+SOURCE_EXTENSIONS = ('py', 'jsx', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'js', 'ts')
+SOURCE_EXTENSION_RE = r'(?:jsx|tsx|mjs|cjs|mts|cts|py|js|ts)(?=$|[^A-Za-z0-9_./-])'
+FILE_PATH_RE = re.compile(rf'(?P<path>(?:[A-Za-z0-9_@.-]+/)*[A-Za-z0-9_@.-]+\.{SOURCE_EXTENSION_RE})(?::(?P<line>\d+))?(?::(?P<column>\d+))?')
 PY_STACK_RE = re.compile(r'File "(?P<path>[^"]+\.py)", line (?P<line>\d+), in (?P<symbol>[A-Za-z_][A-Za-z0-9_]*)')
-PYTEST_FRAME_RE = re.compile(r'(?P<path>(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.py):(?P<line>\d+)(?::in\s+(?P<symbol>[A-Za-z_][A-Za-z0-9_]*))?')
+PYTEST_FRAME_RE = re.compile(r'(?P<path>(?:[A-Za-z0-9_@.-]+/)*[A-Za-z0-9_@.-]+\.py):(?P<line>\d+)(?::in\s+(?P<symbol>[A-Za-z_][A-Za-z0-9_]*))?')
+JS_STACK_PAREN_RE = re.compile(rf'\bat\s+(?P<symbol>[A-Za-z_$][A-Za-z0-9_.$]*)\s+\((?P<path>[^()\s]+\.{SOURCE_EXTENSION_RE}):(?P<line>\d+):(?P<column>\d+)\)')
+JS_STACK_BARE_RE = re.compile(rf'\bat\s+(?P<path>[^()\s]+\.{SOURCE_EXTENSION_RE}):(?P<line>\d+):(?P<column>\d+)')
 BACKTICK_RE = re.compile(r'`([^`]{2,120})`')
 QUOTED_STRING_RE = re.compile(r'(?P<quote>["\'])(?P<text>[^"\']{4,160})(?P=quote)')
 CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(')
@@ -21,9 +26,20 @@ SYMBOL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 EXCEPTION_RE = re.compile(r'\b(?P<class>(?:[A-Z][A-Za-z0-9_.]*(?:Error|Exception|Timeout|Failure)|Exception|Timeout|Failure))\b(?::\s*(?P<message>[^\n`]{3,180}))?')
 ROUTE_RE = re.compile(r'(?<![\w.-])(?P<route>/(?:[A-Za-z0-9_.{}:-]+/)*[A-Za-z0-9_.{}:-]*/?)(?![\w.-])')
 CONFIG_NAME_RE = re.compile(r'\b(?P<name>[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b')
-TEST_NAME_RE = re.compile(r'\b(?P<name>test_[A-Za-z0-9_]+)\b')
-TEST_KEYWORD_RE = re.compile(r'(?i)\b(pytest|unittest|assertion|assert|failing test|test failure|tests? failed)\b')
-TEST_PATH_PART_RE = re.compile(r'(^|/)(tests?/|test_[^/]+\.py$|[^/]+_test\.py$|tests\.py$)')
+TEST_NAME_RE = re.compile(r'\b(?P<pyname>test_[A-Za-z0-9_]+)\b|\b(?:it|test|describe)\s*\(\s*(?P<quote>["\'])(?P<jsname>[^"\']{2,120})(?P=quote)')
+TEST_KEYWORD_RE = re.compile(r'(?i)\b(pytest|unittest|assertion|assert|failing test|test failure|tests? failed|jest|vitest|mocha|playwright|ts-jest|tsx|tsc)\b')
+TEST_PATH_PART_RE = re.compile(r'(^|/)(__tests__/|tests?/|test_[^/]+\.py$|[^/]+_test\.py$|tests\.py$|[^/]+\.(?:test|spec)\.(?:js|jsx|ts|tsx)$)')
+
+
+def _is_safe_issue_path(path: str) -> bool:
+    if not path or path.startswith('/') or '\\' in path or '\x00' in path:
+        return False
+    candidate = PurePosixPath(path)
+    return not candidate.is_absolute() and all(part not in {'', '.', '..'} for part in candidate.parts)
+
+
+def _is_source_path(path: str) -> bool:
+    return _is_safe_issue_path(path) and path.rsplit('.', 1)[-1] in SOURCE_EXTENSIONS
 
 
 def _string(value: Any) -> str:
@@ -65,11 +81,15 @@ def _extract_file_mentions(source: str, text: str) -> list[dict[str, Any]]:
     mentions: list[dict[str, Any]] = []
     for match in FILE_PATH_RE.finditer(text):
         path = match.group('path')
+        if not _is_source_path(path):
+            continue
         line = match.group('line')
+        column = match.group('column')
         mentions.append(
             {
                 'path': path,
                 'line': int(line) if line else None,
+                'column': int(column) if column else None,
                 'source': source,
                 'confidence': 1.0 if '/' in path else 0.75,
             }
@@ -79,12 +99,16 @@ def _extract_file_mentions(source: str, text: str) -> list[dict[str, Any]]:
 
 def _extract_stack_frames(source: str, text: str) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
-    for regex in (PY_STACK_RE, PYTEST_FRAME_RE):
+    for regex in (PY_STACK_RE, PYTEST_FRAME_RE, JS_STACK_PAREN_RE, JS_STACK_BARE_RE):
         for match in regex.finditer(text):
+            path = match.group('path')
+            if not _is_source_path(path):
+                continue
             frames.append(
                 {
-                    'path': match.group('path'),
+                    'path': path,
                     'line': int(match.group('line')),
+                    'column': int(match.groupdict().get('column') or 0) or None,
                     'symbol': match.groupdict().get('symbol') or None,
                     'source': source,
                     'confidence': 1.0,
@@ -146,7 +170,7 @@ def _extract_route_mentions(source: str, text: str) -> list[dict[str, Any]]:
     mentions: list[dict[str, Any]] = []
     for match in ROUTE_RE.finditer(text):
         route = match.group('route')
-        if route in {'/', '//'} or route.endswith('.py'):
+        if route in {'/', '//'} or _is_source_path(route.lstrip('/')):
             continue
         if not any(part.isalpha() for part in route):
             continue
@@ -180,7 +204,9 @@ def _extract_quoted_strings(source: str, text: str) -> list[dict[str, Any]]:
 def _extract_test_mentions(source: str, text: str) -> list[dict[str, Any]]:
     mentions: list[dict[str, Any]] = []
     for match in TEST_NAME_RE.finditer(text):
-        mentions.append({'name': match.group('name'), 'source': source, 'confidence': 0.95})
+        name = match.groupdict().get('pyname') or match.groupdict().get('jsname')
+        if name:
+            mentions.append({'name': name, 'source': source, 'confidence': 0.95})
     for match in FILE_PATH_RE.finditer(text):
         path = match.group('path')
         if _is_test_path(path):
@@ -235,6 +261,7 @@ def extract_issue_evidence(
             {
                 'path': frame['path'],
                 'line': frame['line'],
+                'column': frame.get('column'),
                 'source': frame['source'],
                 'confidence': 1.0,
             }

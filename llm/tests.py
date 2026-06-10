@@ -56,6 +56,30 @@ class SelectiveQuestionAnsweringTests(TestCase):
         self.assertNotIn('sample_pkg/runner.py', messages[1]['content'])
         self.assertEqual(response['answer'], 'builder.py에서 처리합니다.')
 
+    @patch('llm.services._answer_with_opencode_zen')
+    def test_answer_question_uses_typescript_symbol_context(self, answer_with_opencode_zen):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {
+                'src/services/userService.ts': 'export function createUser(input: UserInput) {\n  return input.email!.trim();\n}\n',
+                'src/routes/health.ts': 'export function GET() { return Response.json({ ok: true }); }\n',
+            },
+            'nodes': [
+                {'id': 'src/services/userService.ts::createUser', 'label': 'createUser', 'type': 'function', 'file': 'src/services/userService.ts', 'language': 'typescript'},
+                {'id': 'src/routes/health.ts::GET', 'label': 'GET', 'type': 'function', 'file': 'src/routes/health.ts', 'language': 'typescript'},
+            ],
+            'edges': [],
+        }
+        answer_with_opencode_zen.return_value = 'createUser에서 처리합니다.'
+
+        with patch.dict(os.environ, {'OPENCODE_API_KEY': 'test-opencode-key'}, clear=False):
+            response = answer_question('owner/repo', analysis, 'Where is createUser defined?')
+
+        self.assertEqual(response['citations'], ['src/services/userService.ts'])
+        messages = answer_with_opencode_zen.call_args.args[0]
+        self.assertIn('src/services/userService.ts', messages[1]['content'])
+        self.assertNotIn('src/routes/health.ts', messages[1]['content'])
+
     def test_build_context_reports_only_included_files(self):
         analysis = {
             'file_contents': {
@@ -254,7 +278,7 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['event'], 'final')
-        self.assertEqual(events[0]['data']['answer'], '분석 가능한 Python 코드 문맥을 찾지 못했습니다.')
+        self.assertEqual(events[0]['data']['answer'], '분석 가능한 source 코드 문맥을 찾지 못했습니다.')
         self.assertEqual(events[0]['data']['warnings'][0]['code'], 'no_context')
         stream_generate_answer.assert_not_called()
 
@@ -314,6 +338,56 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertIn('parser/services.py::parse_repo', {node['id'] for node in job['graph']['nodes']})
         self.assertIn('parser/services.py', job['file_contents'])
         self.assertNotIn('/etc/passwd', job['file_contents'])
+
+    def test_issue_harness_job_preserves_typescript_language_manifest(self):
+        analysis = {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'analysis_profile': 'multi-lang-js-ts-v1',
+            'languages': ['typescript'],
+            'file_contents': {
+                'src/services/userService.ts': 'export function createUser() { return true; }\n',
+            },
+            'file_manifest': {
+                'src/services/userService.ts': {
+                    'path': 'src/services/userService.ts',
+                    'language': 'typescript',
+                    'language_family': 'javascript',
+                    'support_level': 'relationships',
+                    'content_stored': True,
+                    'byte_size': 45,
+                },
+            },
+            'nodes': [
+                {
+                    'id': 'src/services/userService.ts::createUser',
+                    'kind': 'function',
+                    'label': 'createUser',
+                    'path': 'src/services/userService.ts',
+                    'start_line': 1,
+                    'end_line': 1,
+                    'language': 'typescript',
+                    'support_level': 'relationships',
+                },
+            ],
+            'edges': [],
+        }
+
+        job = build_issue_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            issue={'number': 303, 'title': 'TypeScript user crash', 'body': ''},
+            comments=[],
+            evidence={'query': 'createUser TypeScript crash'},
+            candidates=[],
+            analysis=analysis,
+        )
+
+        self.assertEqual(job['repo']['primary_language'], 'typescript')
+        self.assertEqual(job['repo']['analysis_profile'], 'multi-lang-js-ts-v1')
+        self.assertEqual(job['repo']['languages'], ['typescript'])
+        self.assertEqual(job['graph']['nodes'][0]['language'], 'typescript')
+        self.assertEqual(job['file_manifest']['src/services/userService.ts']['language'], 'typescript')
 
     def test_issue_harness_job_preserves_new_evidence_lists_with_caps(self):
         analysis = self._analysis()
@@ -694,7 +768,7 @@ class CachedQaSnapshotTests(TestCase):
         self.assertIn('service/worker.py', ranked_files)
         self.assertNotEqual(ranked_files[0], 'serve/api.py')
 
-    def test_answer_question_returns_non_answer_when_no_python_context_exists(self):
+    def test_answer_question_returns_non_answer_when_no_source_context_exists(self):
         analysis = {
             'revision': 'abc123',
             'file_contents': {},
@@ -705,7 +779,7 @@ class CachedQaSnapshotTests(TestCase):
         response = answer_question('owner/repo', analysis, 'What does this repo do?')
 
         self.assertEqual(response['citations'], [])
-        self.assertEqual(response['answer'], '분석 가능한 Python 코드 문맥을 찾지 못했습니다.')
+        self.assertEqual(response['answer'], '분석 가능한 source 코드 문맥을 찾지 못했습니다.')
 
     @patch('llm.services._generate_answer')
     def test_answer_question_does_not_call_model_without_python_context(self, generate_answer):
