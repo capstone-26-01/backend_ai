@@ -41,3 +41,22 @@ class SvgRenderer(BaseRenderer):
   <text x="60" y="120" font-family="ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="700" fill="#d05a2f">HTTP {status_code}</text>
   <text x="60" y="158" font-family="ui-sans-serif, system-ui, sans-serif" font-size="14" fill="#667161">{escaped_message}</text>
 </svg>'''
+
+
+class SseRenderer(BaseRenderer):
+    media_type = 'text/event-stream'
+    format = 'event-stream'
+    charset = 'utf-8'
+
+    def render(self, data: Any, accepted_media_type: str | None = None, renderer_context: dict[str, Any] | None = None) -> bytes:
+        if data is None:
+            return b''
+
+        status_code = 500
+        if renderer_context and renderer_context.get('response') is not None:
+            status_code = int(getattr(renderer_context['response'], 'status_code', status_code))
+
+        event_name = 'error' if status_code >= 400 else 'message'
+        payload = data if isinstance(data, dict) else {'data': data}
+        text = json.dumps(payload, ensure_ascii=False)
+        return f'event: {event_name}\ndata: {text}\n\n'.encode(self.charset)

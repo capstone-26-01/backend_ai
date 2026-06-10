@@ -3,7 +3,7 @@ Issue Map Ranking Eval Baseline
 Scope
 -----
 
-This baseline measures deterministic issue-to-node ranking on the synthetic issue-map fixture. It does not call GitHub, any live LLM, Pi SDK, smolagents, or cache-backed request path.
+This baseline measures deterministic issue-to-node ranking on the synthetic issue-map fixture. It does not call GitHub, any live LLM, Pi SDK, tool-agent, or cache-backed request path.
 
 Fixture
 -------

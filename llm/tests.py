@@ -12,20 +12,27 @@ from typing import cast
 
 from api.services import get_repo_analysis
 from api.test_utils import create_git_fixture_repo
-from llm.agents import AgentTimedOut, AgentUnavailable, answer_question_with_smolagents
 from llm.issue_harness import (
     IssueHarnessUnavailable,
     build_issue_harness_job,
     run_issue_harness,
 )
-from llm.services import answer_question, _build_context, _question_tokens, _rank_files
+from llm.services import (
+    _build_context,
+    _generate_answer,
+    _question_tokens,
+    _rank_files,
+    _stream_generate_answer,
+    answer_question,
+    stream_answer_question,
+)
 from llm.summaries import SUMMARY_KIND_ONBOARDING, SummaryUnavailable, generate_summary
 from llm.tools import ArtifactToolbox, ToolLimitExceeded
 
 
 class SelectiveQuestionAnsweringTests(TestCase):
-    @patch('llm.services._answer_with_openai')
-    def test_answer_question_limits_context_to_ranked_files(self, answer_with_openai):
+    @patch('llm.services._answer_with_opencode_zen')
+    def test_answer_question_limits_context_to_ranked_files(self, answer_with_opencode_zen):
         analysis = {
             'revision': 'abc123',
             'file_contents': {
@@ -38,13 +45,13 @@ class SelectiveQuestionAnsweringTests(TestCase):
             ],
             'edges': [],
         }
-        answer_with_openai.return_value = 'builder.py에서 처리합니다.'
+        answer_with_opencode_zen.return_value = 'builder.py에서 처리합니다.'
 
-        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+        with patch.dict(os.environ, {'OPENCODE_API_KEY': 'test-opencode-key'}, clear=False):
             response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
 
         self.assertEqual(response['citations'], ['sample_pkg/factory.py'])
-        messages = answer_with_openai.call_args.args[0]
+        messages = answer_with_opencode_zen.call_args.args[0]
         self.assertIn('sample_pkg/factory.py', messages[1]['content'])
         self.assertNotIn('sample_pkg/runner.py', messages[1]['content'])
         self.assertEqual(response['answer'], 'builder.py에서 처리합니다.')
@@ -195,7 +202,7 @@ class SelectiveQuestionAnsweringTests(TestCase):
         self.assertIn('entrypoints', messages[1]['content'])
         self.assertIn('key_modules', messages[1]['content'])
 
-    @patch('llm.summaries._generate_answer', side_effect=RuntimeError('사용 가능한 AI API 키가 없습니다.'))
+    @patch('llm.summaries._generate_answer', side_effect=RuntimeError('OPENCODE_API_KEY가 설정되지 않았습니다.'))
     def test_generate_summary_maps_model_unavailable(self, generate_answer):
         analysis = {
             'repo': 'owner/repo',
@@ -210,6 +217,46 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         with self.assertRaises(SummaryUnavailable):
             generate_summary(analysis, SUMMARY_KIND_ONBOARDING)
+
+    @patch('llm.services._stream_generate_answer')
+    def test_stream_answer_question_yields_meta_tokens_and_final_payload(self, stream_generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {
+                'pkg/app.py': 'def main():\n    return "ok"\n',
+            },
+            'nodes': [
+                {'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [],
+        }
+        stream_generate_answer.return_value = iter(['main', '입니다'])
+
+        events = list(stream_answer_question('owner/repo', analysis, 'main은 무엇인가요?'))
+
+        self.assertEqual([event['event'] for event in events], ['meta', 'token', 'token', 'final'])
+        self.assertEqual(events[0]['data']['context_files'], ['pkg/app.py'])
+        self.assertEqual(events[1]['data']['text'], 'main')
+        self.assertEqual(events[2]['data']['text'], '입니다')
+        self.assertEqual(events[3]['data']['answer'], 'main입니다')
+        self.assertEqual(events[3]['data']['citations'], ['pkg/app.py'])
+
+    @patch('llm.services._stream_generate_answer')
+    def test_stream_answer_question_returns_final_without_model_when_no_context(self, stream_generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {},
+            'nodes': [{'id': 'README.md', 'label': 'README.md', 'type': 'file', 'file': 'README.md'}],
+            'edges': [],
+        }
+
+        events = list(stream_answer_question('owner/repo', analysis, '무엇을 하나요?'))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['event'], 'final')
+        self.assertEqual(events[0]['data']['answer'], '분석 가능한 Python 코드 문맥을 찾지 못했습니다.')
+        self.assertEqual(events[0]['data']['warnings'][0]['code'], 'no_context')
+        stream_generate_answer.assert_not_called()
 
 
 class IssueHarnessRuntimeTests(TestCase):
@@ -431,7 +478,7 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertEqual(metadata['event_count'], 1)
 
 
-class SmolagentsToolAgentTests(TestCase):
+class ArtifactToolboxTests(TestCase):
     def _analysis(self):
         return {
             'repo': 'owner/repo',
@@ -479,57 +526,6 @@ class SmolagentsToolAgentTests(TestCase):
         with self.assertRaises(ToolLimitExceeded):
             toolbox.get_entrypoints()
 
-    @patch('llm.agents._run_smolagents_agent', return_value='agent 답변입니다.')
-    def test_smolagents_engine_returns_tool_trace_and_citations(self, run_agent):
-        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
-            response = answer_question(
-                'owner/repo',
-                self._analysis(),
-                'main은 무엇을 호출하나요?',
-                selected_node_id='pkg/app.py::main',
-                max_context_files=2,
-            )
-
-        self.assertEqual(response['answer'], 'agent 답변입니다.')
-        self.assertEqual(response['citations'], ['pkg/app.py', 'pkg/utils.py'])
-        self.assertIn('pkg/app.py::main', response['selected_nodes'])
-        self.assertTrue(response['tool_trace'])
-        run_agent.assert_called_once()
-
-    @patch('llm.agents._run_smolagents_agent')
-    @patch('llm.services._generate_answer', return_value='classic 답변입니다.')
-    def test_classic_engine_does_not_invoke_smolagents(self, generate_answer, run_agent):
-        with patch.dict(os.environ, {'QA_ENGINE': 'classic', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
-            response = answer_question('owner/repo', self._analysis(), 'Where is helper defined?')
-
-        self.assertEqual(response['answer'], 'classic 답변입니다.')
-        self.assertEqual(response['tool_trace'], [])
-        run_agent.assert_not_called()
-
-    @patch('llm.agents._run_smolagents_agent', side_effect=RuntimeError('agent failed'))
-    @patch('llm.services._generate_answer', return_value='fallback 답변입니다.')
-    def test_smolagents_failure_falls_back_to_classic_qa(self, generate_answer, run_agent):
-        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
-            response = answer_question('owner/repo', self._analysis(), 'Where is helper defined?')
-
-        self.assertEqual(response['answer'], 'fallback 답변입니다.')
-        self.assertEqual(response['warnings'][-1]['code'], 'smolagents_fallback')
-
-    @patch('llm.agents._run_smolagents_agent', side_effect=AgentTimedOut('timeout'))
-    @patch('llm.services._generate_answer', return_value='timeout fallback입니다.')
-    def test_smolagents_timeout_falls_back_to_classic_qa(self, generate_answer, run_agent):
-        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents', 'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
-            response = answer_question('owner/repo', self._analysis(), 'Where is helper defined?')
-
-        self.assertEqual(response['answer'], 'timeout fallback입니다.')
-        self.assertEqual(response['warnings'][-1]['code'], 'smolagents_fallback')
-        self.assertIn('timeout', response['warnings'][-1]['message'])
-
-    def test_smolagents_engine_requires_openai_key(self):
-        with patch.dict(os.environ, {'QA_ENGINE': 'smolagents'}, clear=True):
-            with self.assertRaises(AgentUnavailable):
-                answer_question_with_smolagents('owner/repo', self._analysis(), 'Where is helper defined?')
-
 
 @override_settings(
     TEMP_DIR=settings.BASE_DIR / 'temp' / 'llm-snapshot-tests',
@@ -547,20 +543,20 @@ class CachedQaSnapshotTests(TestCase):
         shutil.rmtree(settings.TEMP_DIR, ignore_errors=True)
 
     @patch('github_repo.services._repo_clone_url')
-    @patch('llm.services._answer_with_openai')
-    def test_cached_analysis_supports_qa_after_playground_cleanup(self, answer_with_openai, repo_clone_url):
+    @patch('llm.services._answer_with_opencode_zen')
+    def test_cached_analysis_supports_qa_after_playground_cleanup(self, answer_with_opencode_zen, repo_clone_url):
         repo_clone_url.return_value = str(self.source_repo)
         analysis = get_repo_analysis('owner/repo')
         self.assertIsNotNone(analysis)
         analysis = cast(dict[str, object], analysis)
         shutil.rmtree(settings.PLAYGROUND_DIR, ignore_errors=True)
-        answer_with_openai.return_value = 'builder.py입니다.'
+        answer_with_opencode_zen.return_value = 'builder.py입니다.'
 
-        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-openai-key'}, clear=False):
+        with patch.dict(os.environ, {'OPENCODE_API_KEY': 'test-opencode-key'}, clear=False):
             response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
 
         self.assertEqual(response['citations'], ['pkg/builder.py'])
-        messages = answer_with_openai.call_args.args[0]
+        messages = answer_with_opencode_zen.call_args.args[0]
         self.assertIn('pkg/builder.py', messages[1]['content'])
 
     def test_rank_files_prefers_exact_symbol_match(self):
@@ -633,63 +629,76 @@ class CachedQaSnapshotTests(TestCase):
         generate_answer.assert_not_called()
 
     @patch('llm.services.requests.post')
-    @patch('llm.services._answer_with_openai')
-    def test_answer_question_falls_back_to_gemini_when_openai_call_fails(self, answer_with_openai, requests_post):
-        analysis = {
-            'revision': 'abc123',
-            'file_contents': {
-                'sample_pkg/factory.py': 'def load_component():\n    return "ok"\n',
-            },
-            'nodes': [
-                {'id': 'sample_pkg/factory.py::load_component', 'label': 'load_component', 'type': 'function', 'file': 'sample_pkg/factory.py'},
-            ],
-            'edges': [],
-        }
-        answer_with_openai.side_effect = RuntimeError('401 not_authorized_invalid_project')
-        gemini_response = Mock()
-        gemini_response.json.return_value = {
-            'candidates': [
-                {'content': {'parts': [{'text': 'Gemini가 대신 답변했습니다.'}]}}
+    def test_generate_answer_calls_opencode_zen_chat_completion(self, requests_post):
+        zen_response = Mock()
+        zen_response.json.return_value = {
+            'choices': [
+                {'message': {'content': 'Zen 답변입니다.'}}
             ]
         }
-        gemini_response.raise_for_status.return_value = None
-        requests_post.return_value = gemini_response
+        zen_response.raise_for_status.return_value = None
+        requests_post.return_value = zen_response
 
-        with patch.dict(os.environ, {'OPENAI_API_KEY': 'bad-key', 'GEMINI_API_KEY': 'gemini-key'}, clear=False):
-            response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
+        with (
+            patch.dict(os.environ, {'OPENCODE_API_KEY': 'zen-key'}, clear=True),
+            patch(
+                'llm.services._opencode_config',
+                return_value={
+                    'chat_completions_url': 'https://opencode.ai/zen/v1/chat/completions',
+                    'model': 'kimi-k2.6',
+                    'max_tokens': 777,
+                    'timeout_seconds': 60,
+                },
+            ),
+        ):
+            answer = _generate_answer([{'role': 'user', 'content': 'ping'}])
 
-        self.assertEqual(response['answer'], 'Gemini가 대신 답변했습니다.')
-        self.assertEqual(response['citations'], ['sample_pkg/factory.py'])
+        self.assertEqual(answer, 'Zen 답변입니다.')
         requests_post.assert_called_once()
-        self.assertEqual(requests_post.call_args.kwargs['headers']['x-goog-api-key'], 'gemini-key')
+        self.assertIn('opencode.ai/zen/v1/chat/completions', requests_post.call_args.args[0])
+        self.assertEqual(requests_post.call_args.kwargs['headers']['Authorization'], 'Bearer zen-key')
+        self.assertEqual(requests_post.call_args.kwargs['headers']['Accept'], 'application/json')
         payload = requests_post.call_args.kwargs['json']
-        self.assertIn('질문: Where is load_component defined?', payload['contents'][0]['parts'][0]['text'])
+        self.assertEqual(payload['model'], 'kimi-k2.6')
+        self.assertEqual(payload['max_tokens'], 777)
+        self.assertNotIn('stream', payload)
+
+    def test_generate_answer_requires_opencode_api_key(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesMessage(RuntimeError, 'OPENCODE_API_KEY'):
+                _generate_answer([{'role': 'user', 'content': 'ping'}])
 
     @patch('llm.services.requests.post')
-    @patch('llm.services._answer_with_openai')
-    def test_answer_question_uses_gemini_when_openai_key_is_missing(self, answer_with_openai, requests_post):
-        analysis = {
-            'revision': 'abc123',
-            'file_contents': {
-                'sample_pkg/factory.py': 'def load_component():\n    return "ok"\n',
-            },
-            'nodes': [
-                {'id': 'sample_pkg/factory.py::load_component', 'label': 'load_component', 'type': 'function', 'file': 'sample_pkg/factory.py'},
-            ],
-            'edges': [],
-        }
-        gemini_response = Mock()
-        gemini_response.json.return_value = {
-            'candidates': [
-                {'content': {'parts': [{'text': 'Gemini direct response'}]}}
+    def test_stream_generate_answer_parses_opencode_zen_sse_chunks(self, requests_post):
+        zen_response = Mock()
+        zen_response.iter_lines.return_value = iter(
+            [
+                'data: {"choices":[{"delta":{"content":"안"}}]}',
+                'data: {"choices":[{"delta":{"content":"녕"}}]}',
+                'data: [DONE]',
             ]
-        }
-        gemini_response.raise_for_status.return_value = None
-        requests_post.return_value = gemini_response
+        )
+        zen_response.raise_for_status.return_value = None
+        requests_post.return_value = zen_response
 
-        with patch.dict(os.environ, {'GEMINI_API_KEY': 'gemini-key'}, clear=True):
-            response = answer_question('owner/repo', analysis, 'Where is load_component defined?')
+        with patch.dict(os.environ, {'OPENCODE_API_KEY': 'zen-key'}, clear=True):
+            chunks = list(_stream_generate_answer([{'role': 'user', 'content': 'ping'}], model='opencode/kimi-k2.5'))
 
-        self.assertEqual(response['answer'], 'Gemini direct response')
-        answer_with_openai.assert_not_called()
-        requests_post.assert_called_once()
+        self.assertEqual(chunks, ['안', '녕'])
+        self.assertTrue(requests_post.call_args.kwargs['stream'])
+        self.assertEqual(requests_post.call_args.kwargs['headers']['Accept'], 'text/event-stream')
+        payload = requests_post.call_args.kwargs['json']
+        self.assertEqual(payload['model'], 'kimi-k2.5')
+        self.assertTrue(payload['stream'])
+        zen_response.close.assert_called_once()
+
+    @patch('llm.services.requests.post')
+    def test_generate_answer_rejects_model_outside_allowlist(self, requests_post):
+        with (
+            patch.dict(os.environ, {'OPENCODE_API_KEY': 'zen-key'}, clear=True),
+            patch('llm.services._opencode_config', return_value={'model': 'kimi-k2.5', 'allowed_models': ['kimi-k2.5']}),
+        ):
+            with self.assertRaisesMessage(RuntimeError, '허용되지 않은 OpenCode Zen 모델입니다.'):
+                _generate_answer([{'role': 'user', 'content': 'ping'}], model='kimi-k2.6')
+
+        requests_post.assert_not_called()

@@ -38,7 +38,7 @@ class ArtifactToolbox:
 
     def _record(self, tool: str, arguments: dict[str, Any], result: Any) -> Any:
         if len(self.tool_trace) >= self.max_tool_calls:
-            raise ToolLimitExceeded('smolagents tool call limit exceeded')
+            raise ToolLimitExceeded('artifact tool call limit exceeded')
         self.tool_trace.append(
             {
                 'tool': tool,
@@ -131,86 +131,3 @@ class ArtifactToolbox:
             if isinstance(summary, Mapping) and summary.get('kind') == kind:
                 return self._record('get_summary', {'kind': kind}, dict(summary))
         return self._record('get_summary', {'kind': kind}, {'error': 'summary_not_found', 'kind': kind})
-
-
-def build_smolagents_tools(toolbox: ArtifactToolbox):
-    from smolagents import Tool
-
-    class SearchSymbolsTool(Tool):
-        name = 'search_symbols'
-        description = 'Search graph symbols by natural language or code token query.'
-        inputs = {
-            'query': {'type': 'string', 'description': 'Search query'},
-            'limit': {'type': 'integer', 'description': 'Maximum results', 'nullable': True},
-        }
-        output_type = 'object'
-
-        def forward(self, query: str, limit: int = 8):
-            return toolbox.search_symbols(query, limit)
-
-    class GetNodeTool(Tool):
-        name = 'get_node'
-        description = 'Return one graph node by id from the stored analysis artifact.'
-        inputs = {'node_id': {'type': 'string', 'description': 'Graph node id'}}
-        output_type = 'object'
-
-        def forward(self, node_id: str):
-            return toolbox.get_node(node_id)
-
-    class GetNeighborsTool(Tool):
-        name = 'get_neighbors'
-        description = 'Return incoming and outgoing graph neighbors for a node id.'
-        inputs = {
-            'node_id': {'type': 'string', 'description': 'Graph node id'},
-            'limit': {'type': 'integer', 'description': 'Maximum edges', 'nullable': True},
-        }
-        output_type = 'object'
-
-        def forward(self, node_id: str, limit: int = 20):
-            return toolbox.get_neighbors(node_id, limit)
-
-    class GetFileExcerptTool(Tool):
-        name = 'get_file_excerpt'
-        description = 'Return a bounded excerpt from file_contents stored in the artifact. Never reads the filesystem.'
-        inputs = {'file_path': {'type': 'string', 'description': 'Repository file path'}}
-        output_type = 'object'
-
-        def forward(self, file_path: str):
-            return toolbox.get_file_excerpt(file_path)
-
-    class GetEntrypointsTool(Tool):
-        name = 'get_entrypoints'
-        description = 'Return deterministic entrypoint metadata from the artifact.'
-        inputs = {}
-        output_type = 'object'
-
-        def forward(self):
-            return toolbox.get_entrypoints()
-
-    class GetKeyModulesTool(Tool):
-        name = 'get_key_modules'
-        description = 'Return deterministic key module metadata from the artifact.'
-        inputs = {}
-        output_type = 'object'
-
-        def forward(self):
-            return toolbox.get_key_modules()
-
-    class GetSummaryTool(Tool):
-        name = 'get_summary'
-        description = 'Return a cached artifact summary by kind if present.'
-        inputs = {'kind': {'type': 'string', 'description': 'Summary kind such as repo_overview or onboarding_guide', 'nullable': True}}
-        output_type = 'object'
-
-        def forward(self, kind: str = 'repo_overview'):
-            return toolbox.get_summary(kind)
-
-    return [
-        SearchSymbolsTool(),
-        GetNodeTool(),
-        GetNeighborsTool(),
-        GetFileExcerptTool(),
-        GetEntrypointsTool(),
-        GetKeyModulesTool(),
-        GetSummaryTool(),
-    ]

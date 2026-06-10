@@ -5,7 +5,7 @@ import logging
 from typing import Any, cast
 
 from django.conf import settings
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.views.decorators.clickjacking import xframe_options_exempt
 from rest_framework.decorators import api_view
 from rest_framework.decorators import renderer_classes
@@ -17,7 +17,7 @@ from drf_spectacular.utils import OpenApiExample, extend_schema, OpenApiParamete
 from rest_framework import serializers
 
 from github_repo.services import GithubIssueApiError, RepoIngestionError, get_file_tree_or_raise
-from llm.services import answer_question
+from llm.services import answer_question, stream_answer_question
 from .readme_svg import (
     DEFAULT_NODE_LIMIT,
     DEFAULT_SVG_HEIGHT,
@@ -31,7 +31,7 @@ from .readme_svg import (
     normalize_svg_options,
     render_share_graph_svg,
 )
-from .renderers import SvgRenderer
+from .renderers import SseRenderer, SvgRenderer
 from .throttles import ShareCreateRateThrottle
 from .serializers import (
     AnalysisDiffRequestSerializer,
@@ -206,6 +206,61 @@ def _svg_response(svg: str) -> HttpResponse:
     response_obj = HttpResponse(svg, content_type='image/svg+xml; charset=utf-8')
     response_obj['Cache-Control'] = 'public, max-age=300, stale-while-revalidate=3600'
     response_obj['X-Content-Type-Options'] = 'nosniff'
+    return response_obj
+
+
+def _sse_event(event_name: str, data: Any) -> str:
+    return f'event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n'
+
+
+def _accepts_event_stream(request) -> bool:
+    return 'text/event-stream' in str(request.headers.get('Accept', '')).lower()
+
+
+def _qa_stream_requested(request, validated_data: dict[str, Any]) -> bool:
+    return bool(validated_data.get('stream')) or _accepts_event_stream(request)
+
+
+def _qa_streaming_response(
+    repo_path: str,
+    analysis: dict[str, Any],
+    question: str,
+    *,
+    selected_node_id: str | None = None,
+    selected_file_path: str | None = None,
+    max_context_files: int = 4,
+    model: str | None = None,
+) -> StreamingHttpResponse:
+    def stream():
+        try:
+            for item in stream_answer_question(
+                repo_path,
+                analysis,
+                question,
+                selected_node_id=selected_node_id,
+                selected_file_path=selected_file_path,
+                max_context_files=max_context_files,
+                model=model,
+            ):
+                if not isinstance(item, dict):
+                    continue
+                event_name = str(item.get('event') or 'message')
+                yield _sse_event(event_name, item.get('data') or {})
+        except Exception as error:
+            logger.exception('QA streaming failed: %s', error)
+            yield _sse_event(
+                'error',
+                {
+                    'error': 'QA 스트리밍 중 오류가 발생했습니다.',
+                    'code': 'qa_stream_error',
+                    'detail': str(error),
+                },
+            )
+
+    response_obj = StreamingHttpResponse(stream(), content_type='text/event-stream; charset=utf-8')
+    response_obj['Cache-Control'] = 'no-cache'
+    response_obj['X-Accel-Buffering'] = 'no'
+    response_obj['Vary'] = 'Accept'
     return response_obj
 
 
@@ -407,6 +462,8 @@ _QA_DESCRIPTION = '''
 - 이미 `/api/analysis/`를 호출했다면 `analysis_id`를 보내세요. repo URL 재분석을 피할 수 있습니다.
 - 특정 그래프 노드를 선택한 상태라면 `selected_node_id`를 함께 보내면 답변 범위가 좁아집니다.
 - `repo_url`만 보내도 동작하지만, 프런트엔드에서는 `analysis_id` 재사용이 더 안정적입니다.
+- 기본은 기존 JSON 응답입니다. `Accept: text/event-stream` 또는 `stream=true`를 보내면 같은 endpoint에서 SSE로 token/meta/final event를 반환합니다.
+- LLM 호출은 OpenCode Zen만 사용합니다. `model`을 보내면 해당 Zen 모델을 요청하고, `config.yaml`의 `opencode.allowed_models`가 설정되어 있으면 그 목록 안에서만 허용됩니다.
 '''
 _REPO_FILES_DESCRIPTION = '''
 GitHub 레포의 파일 경로 목록만 빠르게 반환합니다.
@@ -1276,6 +1333,8 @@ def node_summary(request):
             'selected_node_id': serializers.CharField(required=False, help_text='/api/graph/ 응답의 nodes[].id입니다. 선택 노드 중심으로 답변할 때 사용합니다.'),
             'selected_file_path': serializers.CharField(required=False, help_text='선택 파일 중심으로 답변할 때 사용합니다.'),
             'max_context_files': serializers.IntegerField(required=False, min_value=1, max_value=10, help_text='답변에 사용할 최대 context 파일 수입니다. 기본값 4.'),
+            'stream': serializers.BooleanField(required=False, help_text='true이거나 Accept: text/event-stream이면 SSE로 token/meta/final event를 반환합니다. 생략하면 기존 JSON 응답입니다.'),
+            'model': serializers.CharField(required=False, help_text='선택할 OpenCode Zen 모델 ID입니다. 생략하면 config.yaml의 opencode.model을 사용합니다.'),
         }
     ),
     responses=inline_serializer(
@@ -1292,6 +1351,7 @@ def node_summary(request):
     ),
 )
 @api_view(['POST'])
+@renderer_classes([JSONRenderer, SseRenderer])
 def qa(request):
     serializer = QASerializer(data=request.data)
     if not serializer.is_valid():
@@ -1305,6 +1365,7 @@ def qa(request):
     selected_node_id = validated_data.get('selected_node_id')
     selected_file_path = validated_data.get('selected_file_path')
     max_context_files = int(validated_data.get('max_context_files', 4))
+    model = validated_data.get('model')
     repo_path = str(validated_data.get('repo_url') or '')
 
     if analysis_id is not None:
@@ -1333,6 +1394,18 @@ def qa(request):
             return Response({'error': '레포를 찾을 수 없습니다'}, status=404)
 
     logger.info(f"QA 요청: {repo_path} / 질문: {question}")
+    if _qa_stream_requested(request, validated_data):
+        logger.info(f"QA 스트리밍 시작: {repo_path}")
+        return _qa_streaming_response(
+            repo_path,
+            cast(dict[str, Any], analysis),
+            question,
+            selected_node_id=selected_node_id,
+            selected_file_path=selected_file_path,
+            max_context_files=max_context_files,
+            model=model,
+        )
+
     answer = answer_question(
         repo_path,
         cast(dict[str, Any], analysis),
@@ -1340,6 +1413,7 @@ def qa(request):
         selected_node_id=selected_node_id,
         selected_file_path=selected_file_path,
         max_context_files=max_context_files,
+        model=model,
     )
     logger.info(f"QA 완료: {repo_path}")
 
