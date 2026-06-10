@@ -321,7 +321,7 @@ class IssueNavigationStartSerializer(serializers.Serializer):
 
 
 class IssueNavigationStepSerializer(serializers.Serializer):
-    node_id = serializers.CharField(help_text='다음으로 확인할 graph node ID입니다.')
+    node_id = serializers.CharField(allow_blank=True, allow_null=True, required=False, help_text='다음으로 확인할 graph node ID입니다. low-confidence search step에서는 없을 수 있습니다.')
     path = serializers.CharField(allow_null=True, required=False, help_text='다음으로 확인할 repository-relative file path입니다.')
     start_line = serializers.IntegerField(allow_null=True, required=False, help_text='시작 줄 번호입니다.')
     end_line = serializers.IntegerField(allow_null=True, required=False, help_text='끝 줄 번호입니다.')

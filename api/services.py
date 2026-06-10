@@ -867,6 +867,16 @@ def _guide_node_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     return dict(node) if isinstance(node, dict) else {}
 
 
+def _guide_start_priority(candidate: dict[str, Any]) -> int | None:
+    node = _guide_node_from_candidate(candidate)
+    kind = str(node.get('kind') or node.get('type') or '')
+    if kind in {'function', 'method', 'class', 'module'}:
+        return 0
+    if kind == 'file':
+        return 1
+    return None
+
+
 def _guide_entry(
     candidate: dict[str, Any],
     *,
@@ -902,26 +912,24 @@ def _guide_start_candidate(
     investigation_path: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     candidates_by_id = _guide_candidate_by_id(candidates)
+    ordered_sources: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
     for step in investigation_path:
         if not isinstance(step, dict) or not step.get('path'):
             continue
         candidate = candidates_by_id.get(str(step.get('node_id')))
         if candidate:
-            return candidate, step
+            ordered_sources.append((candidate, step))
     for hypothesis in hypotheses:
         if not isinstance(hypothesis, dict):
             continue
         candidate = candidates_by_id.get(str(hypothesis.get('node_id')))
         if candidate:
-            return candidate, hypothesis
-    for candidate in candidates:
-        node = _guide_node_from_candidate(candidate)
-        if str(node.get('kind') or node.get('type') or '') in {'function', 'method', 'class', 'module'}:
-            return candidate, None
-    for candidate in candidates:
-        node = _guide_node_from_candidate(candidate)
-        if str(node.get('kind') or node.get('type') or '') == 'file':
-            return candidate, None
+            ordered_sources.append((candidate, hypothesis))
+    ordered_sources.extend((candidate, None) for candidate in candidates)
+    for priority in (0, 1):
+        for candidate, source in ordered_sources:
+            if _guide_start_priority(candidate) == priority:
+                return candidate, source
     return None, None
 
 
@@ -953,12 +961,7 @@ def build_issue_navigation_guide(
             seen_paths.add(str(path))
             exploratory_steps.append(
                 {
-                    'node_id': str(candidate.get('node_id') or node.get('id') or ''),
                     'path': path,
-                    'start_line': node.get('start_line'),
-                    'end_line': node.get('end_line'),
-                    'label': node.get('label') or candidate.get('node_id'),
-                    'kind': node.get('kind') or node.get('type') or '',
                     'action': 'search',
                     'why': f'Issue evidence is weak; reproduce the issue and search this file for {term_text}.',
                 }
