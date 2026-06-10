@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 
-DEFAULT_PI_PACKAGE = '@earendil-works/pi-coding-agent@0.78.0'
+DEFAULT_PI_PACKAGE = '@earendil-works/pi-coding-agent@0.79.1'
 DEFAULT_MODEL = 'kimi-k2.5'
 DEFAULT_PROVIDER = 'opencode'
 DEFAULT_EXTENSION = Path(__file__).resolve().parent / 'pi' / 'issue_map_extension.ts'

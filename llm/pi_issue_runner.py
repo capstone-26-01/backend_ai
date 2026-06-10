@@ -10,7 +10,7 @@ import sys
 import time
 
 
-DEFAULT_PI_PACKAGE = '@earendil-works/pi-coding-agent@0.78.0'
+DEFAULT_PI_PACKAGE = '@earendil-works/pi-coding-agent@0.79.1'
 DEFAULT_PROVIDER = 'opencode'
 DEFAULT_MODEL = 'kimi-k2.5'
 DEFAULT_EXTENSION = Path(__file__).resolve().parent / 'pi_issue_extension.ts'
@@ -35,11 +35,11 @@ def _error(job: Mapping[str, Any] | None, message: str, *, details: Mapping[str,
 
 
 def _decode_finish_tool_payload(tool_result: Mapping[str, Any]) -> dict[str, Any] | None:
-    if tool_result.get('toolName') != 'finish_issue_map_transcript':
-        return None
     details = tool_result.get('details')
     if isinstance(details, Mapping) and isinstance(details.get('final'), Mapping):
         return dict(details)
+    if tool_result.get('toolName') != 'finish_issue_map_transcript':
+        return None
     for item in tool_result.get('content') or []:
         if not isinstance(item, Mapping) or item.get('type') != 'text':
             continue

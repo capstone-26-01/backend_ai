@@ -485,6 +485,7 @@ def run_issue_harness(
     metadata = {
         'returncode': completed.returncode,
         'variant_id': payload.get('variant_id'),
+        'harness_error': payload.get('error'),
         'pi_metadata': payload.get('pi_metadata') or {},
     }
     return IssueHarnessResult(output=final, tool_calls=tool_calls, metadata=metadata)

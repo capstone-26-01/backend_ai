@@ -618,7 +618,7 @@ class PiRunnerCommandTests(unittest.TestCase):
         job = build_job_packet(load_json(ROOT / 'samples' / 'repo_parser_timeout.json'))
         args = Namespace(
             pi_bin='npx',
-            pi_package='@earendil-works/pi-coding-agent@0.78.0',
+            pi_package='@earendil-works/pi-coding-agent@0.79.1',
             extension=ROOT / 'pi' / 'issue_map_extension.ts',
             provider='opencode',
             model='kimi-k2.5',
