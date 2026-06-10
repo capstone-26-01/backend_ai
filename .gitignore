@@ -8,6 +8,7 @@ db.sqlite3
 .DS_Store
 private_docs/
 AGENTS.md
+frontend_requirements.md
 *.md
 PLAN.md
 temp/*

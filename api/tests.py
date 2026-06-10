@@ -1601,6 +1601,7 @@ class AnalysisEndpointReuseTests(TestCase):
                     'selected_node_id': 'pkg/app.py::main',
                     'selected_file_path': 'pkg/app.py',
                     'max_context_files': 2,
+                    'model': 'kimi-k2.5',
                 },
                 content_type='application/json',
             ),
@@ -1614,6 +1615,133 @@ class AnalysisEndpointReuseTests(TestCase):
         self.assertEqual(answer_question_mock.call_args.kwargs['selected_node_id'], 'pkg/app.py::main')
         self.assertEqual(answer_question_mock.call_args.kwargs['selected_file_path'], 'pkg/app.py')
         self.assertEqual(answer_question_mock.call_args.kwargs['max_context_files'], 2)
+        self.assertEqual(answer_question_mock.call_args.kwargs['model'], 'kimi-k2.5')
+
+    @patch('api.views.answer_question')
+    @patch('api.views.stream_answer_question')
+    @patch('api.views.get_analysis_response_by_id')
+    def test_qa_endpoint_streams_when_client_accepts_sse(self, get_analysis_response_by_id_mock, stream_answer_question_mock, answer_question_mock):
+        get_analysis_response_by_id_mock.return_value = {
+            'analysis_id': 7,
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'status': AnalysisRun.STATUS_SUCCEEDED,
+            'artifact': {
+                'repo': 'owner/repo',
+                'revision': 'abc123',
+                'tree': [],
+                'nodes': [{'id': 'pkg/app.py::main', 'path': 'pkg/app.py', 'label': 'main'}],
+                'edges': [],
+                'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            },
+            'warnings': [],
+        }
+        stream_answer_question_mock.return_value = iter(
+            [
+                {'event': 'meta', 'data': {'context_files': ['pkg/app.py']}},
+                {'event': 'token', 'data': {'text': 'main'}},
+                {'event': 'token', 'data': {'text': '입니다'}},
+                {
+                    'event': 'final',
+                    'data': {
+                        'answer': 'main입니다',
+                        'citations': ['pkg/app.py'],
+                        'selected_nodes': ['pkg/app.py::main'],
+                        'context_files': ['pkg/app.py'],
+                        'context_summary': {'strategy': 'selected_node'},
+                        'tool_trace': [],
+                        'warnings': [],
+                    },
+                },
+            ]
+        )
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={
+                    'analysis_id': 7,
+                    'question': 'main은 무엇인가요?',
+                    'selected_node_id': 'pkg/app.py::main',
+                    'model': 'opencode/kimi-k2.5',
+                },
+                content_type='application/json',
+                HTTP_ACCEPT='text/event-stream',
+            ),
+        )
+        body = b''.join(
+            chunk if isinstance(chunk, bytes) else chunk.encode('utf-8')
+            for chunk in response.streaming_content
+        ).decode('utf-8')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.streaming)
+        self.assertIn('text/event-stream', response.headers.get('Content-Type', ''))
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
+        self.assertEqual(response.headers.get('X-Accel-Buffering'), 'no')
+        self.assertIn('event: meta', body)
+        self.assertIn('event: token', body)
+        self.assertIn('main입니다', body)
+        self.assertIn('event: final', body)
+        answer_question_mock.assert_not_called()
+        stream_answer_question_mock.assert_called_once()
+        self.assertEqual(stream_answer_question_mock.call_args.args[0], 'owner/repo')
+        self.assertEqual(stream_answer_question_mock.call_args.kwargs['selected_node_id'], 'pkg/app.py::main')
+        self.assertEqual(stream_answer_question_mock.call_args.kwargs['model'], 'opencode/kimi-k2.5')
+
+    @patch('api.views.answer_question')
+    @patch('api.views.stream_answer_question')
+    @patch('api.views.get_repo_analysis')
+    def test_qa_endpoint_streams_when_body_stream_flag_is_true(self, get_repo_analysis_mock, stream_answer_question_mock, answer_question_mock):
+        get_repo_analysis_mock.return_value = {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'tree': [],
+            'nodes': [],
+            'edges': [],
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+        }
+        stream_answer_question_mock.return_value = iter(
+            [
+                {
+                    'event': 'final',
+                    'data': {
+                        'answer': 'stream flag answer',
+                        'citations': ['pkg/app.py'],
+                        'selected_nodes': [],
+                        'context_files': ['pkg/app.py'],
+                        'context_summary': {},
+                        'tool_trace': [],
+                        'warnings': [],
+                    },
+                }
+            ]
+        )
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={
+                    'repo_url': 'https://github.com/owner/repo',
+                    'question': '무엇을 하나요?',
+                    'stream': True,
+                },
+                content_type='application/json',
+            ),
+        )
+        body = b''.join(
+            chunk if isinstance(chunk, bytes) else chunk.encode('utf-8')
+            for chunk in response.streaming_content
+        ).decode('utf-8')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.streaming)
+        self.assertIn('text/event-stream', response.headers.get('Content-Type', ''))
+        self.assertIn('stream flag answer', body)
+        answer_question_mock.assert_not_called()
+        stream_answer_question_mock.assert_called_once()
 
     def test_qa_endpoint_requires_repo_url_or_analysis_id(self):
         response = cast(
@@ -1646,6 +1774,24 @@ class AnalysisEndpointReuseTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('selected_file_path', payload)
+
+    def test_qa_endpoint_rejects_unsafe_model_id(self):
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={
+                    'repo_url': 'https://github.com/owner/repo',
+                    'question': '무엇을 하나요?',
+                    'model': 'kimi k2.5',
+                },
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload['model'], ['올바른 모델 ID가 아닙니다'])
 
 
 class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, cast
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Iterator, Mapping, cast
 
 import requests
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+import yaml
 
 from llm.context_selection import build_context_for_files, build_qa_context, identifier_tokens, question_tokens, rank_files
 
 logger = logging.getLogger(__name__)
 
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
-GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+OPENCODE_DEFAULT_MODEL = 'kimi-k2.5'
+OPENCODE_DEFAULT_CHAT_COMPLETIONS_URL = 'https://opencode.ai/zen/v1/chat/completions'
+APP_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config.yaml'
 
 
 def _identifier_tokens(value: str) -> set[str]:
@@ -47,87 +49,217 @@ def _build_messages(context: str, question: str) -> list[dict[str, str]]:
     ]
 
 
-def _get_openai_client() -> OpenAI | None:
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+def _opencode_api_key() -> str:
+    return os.getenv('OPENCODE_API_KEY', '').strip()
 
 
-def _extract_gemini_text(payload: dict[str, Any]) -> str:
-    for candidate in payload.get('candidates', []):
-        parts = candidate.get('content', {}).get('parts', [])
-        texts = [part.get('text', '') for part in parts if part.get('text')]
-        if texts:
-            return '\n'.join(texts)
-    raise RuntimeError('Gemini 응답에서 텍스트를 찾지 못했습니다.')
+@lru_cache(maxsize=1)
+def _load_app_config() -> Mapping[str, Any]:
+    if not APP_CONFIG_PATH.exists():
+        return {}
+    with APP_CONFIG_PATH.open(encoding='utf-8') as file:
+        payload = yaml.safe_load(file) or {}
+    if not isinstance(payload, Mapping):
+        raise RuntimeError('config.yaml은 YAML object여야 합니다.')
+    return cast(Mapping[str, Any], payload)
 
 
-def _answer_with_openai(messages: list[dict[str, str]]) -> str:
-    client = _get_openai_client()
-    if client is None:
-        raise RuntimeError('OPENAI_API_KEY가 설정되지 않았습니다.')
-
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=cast(list[ChatCompletionMessageParam], messages),
-    )
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError('OpenAI 응답이 비어 있습니다.')
-    return content
+def _opencode_config() -> Mapping[str, Any]:
+    config = _load_app_config().get('opencode', {})
+    if config is None:
+        return {}
+    if not isinstance(config, Mapping):
+        raise RuntimeError('config.yaml의 opencode 설정은 YAML object여야 합니다.')
+    return cast(Mapping[str, Any], config)
 
 
-def _answer_with_gemini(messages: list[dict[str, str]]) -> str:
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
+def _normalize_opencode_model_id(model: str) -> str:
+    value = model.strip()
+    if value.startswith('opencode/'):
+        return value.removeprefix('opencode/').strip()
+    return value
 
-    system_prompt = '\n\n'.join(message['content'] for message in messages if message['role'] == 'system')
-    user_prompt = '\n\n'.join(message['content'] for message in messages if message['role'] == 'user')
 
-    payload: dict[str, Any] = {
-        'contents': [
-            {
-                'role': 'user',
-                'parts': [{'text': user_prompt}],
-            }
-        ]
+def _allowed_opencode_models() -> set[str]:
+    raw = _opencode_config().get('allowed_models', [])
+    if isinstance(raw, str):
+        raw_models = raw.split(',')
+    elif isinstance(raw, list):
+        raw_models = [str(item) for item in raw]
+    else:
+        return set()
+    return {_normalize_opencode_model_id(model) for model in raw_models if _normalize_opencode_model_id(model)}
+
+
+def _resolve_opencode_model(model: str | None = None) -> str:
+    configured_model = str(_opencode_config().get('model') or OPENCODE_DEFAULT_MODEL)
+    selected = _normalize_opencode_model_id(model or configured_model)
+    if not selected:
+        raise RuntimeError('config.yaml에 OpenCode Zen 모델이 설정되지 않았습니다.')
+    allowed = _allowed_opencode_models()
+    if allowed and selected not in allowed:
+        raise RuntimeError('허용되지 않은 OpenCode Zen 모델입니다.')
+    return selected
+
+
+def _opencode_timeout_seconds() -> int:
+    return max(1, int(_opencode_config().get('timeout_seconds') or 60))
+
+
+def _opencode_max_tokens() -> int:
+    return max(1, int(_opencode_config().get('max_tokens') or 1200))
+
+
+def _opencode_chat_completions_url() -> str:
+    return str(_opencode_config().get('chat_completions_url') or OPENCODE_DEFAULT_CHAT_COMPLETIONS_URL)
+
+
+def opencode_model_metadata(model: str | None = None) -> dict[str, str]:
+    return {
+        'provider': 'opencode_zen',
+        'model': _resolve_opencode_model(model),
+        'endpoint': _opencode_chat_completions_url(),
     }
-    if system_prompt:
-        payload['system_instruction'] = {
-            'parts': [{'text': system_prompt}],
-        }
 
+
+def _opencode_headers(*, accept: str) -> dict[str, str]:
+    api_key = _opencode_api_key()
+    if not api_key:
+        raise RuntimeError('OPENCODE_API_KEY가 설정되지 않았습니다.')
+    return {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+        'Accept': accept,
+        'User-Agent': 'capstone-backend-ai/1.0',
+    }
+
+
+def _build_opencode_payload(messages: list[dict[str, str]], *, model: str | None = None, stream: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        'model': _resolve_opencode_model(model),
+        'messages': messages,
+        'temperature': 0,
+        'max_tokens': _opencode_max_tokens(),
+    }
+    if stream:
+        payload['stream'] = True
+    return payload
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, Mapping) and isinstance(part.get('text'), str):
+                texts.append(cast(str, part['text']))
+        return ''.join(texts)
+    return ''
+
+
+def _extract_opencode_text(payload: Mapping[str, Any]) -> str:
+    for choice in payload.get('choices') or []:
+        if not isinstance(choice, Mapping):
+            continue
+        message = choice.get('message')
+        if isinstance(message, Mapping):
+            text = _content_to_text(message.get('content'))
+            if text:
+                return text
+        text = _content_to_text(choice.get('text'))
+        if text:
+            return text
+    raise RuntimeError('OpenCode Zen 응답에서 텍스트를 찾지 못했습니다.')
+
+
+def _extract_opencode_delta(payload: Mapping[str, Any]) -> str:
+    for choice in payload.get('choices') or []:
+        if not isinstance(choice, Mapping):
+            continue
+        delta = choice.get('delta')
+        if isinstance(delta, Mapping):
+            text = _content_to_text(delta.get('content'))
+            if text:
+                return text
+        message = choice.get('message')
+        if isinstance(message, Mapping):
+            text = _content_to_text(message.get('content'))
+            if text:
+                return text
+        text = _content_to_text(choice.get('text'))
+        if text:
+            return text
+    return ''
+
+
+def _answer_with_opencode_zen(messages: list[dict[str, str]], *, model: str | None = None) -> str:
     response = requests.post(
-        GEMINI_API_URL.format(model=GEMINI_MODEL),
-        headers={
-            'x-goog-api-key': api_key,
-            'Content-Type': 'application/json',
-        },
-        json=payload,
-        timeout=60,
+        _opencode_chat_completions_url(),
+        headers=_opencode_headers(accept='application/json'),
+        json=_build_opencode_payload(messages, model=model),
+        timeout=(10, _opencode_timeout_seconds()),
     )
     response.raise_for_status()
-    return _extract_gemini_text(cast(dict[str, Any], response.json()))
+    return _extract_opencode_text(cast(Mapping[str, Any], response.json()))
 
 
-def _generate_answer(messages: list[dict[str, str]]) -> str:
-    openai_key = os.getenv('OPENAI_API_KEY')
-    gemini_key = os.getenv('GEMINI_API_KEY')
+def _iter_opencode_sse_data(response) -> Iterator[str]:
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode('utf-8', errors='replace')
+        else:
+            line = str(raw_line)
+        line = line.strip()
+        if not line or line.startswith(':'):
+            continue
+        if not line.startswith('data:'):
+            continue
+        data = line[len('data:'):].strip()
+        if data == '[DONE]':
+            break
+        if data:
+            yield data
 
-    if openai_key:
-        try:
-            return _answer_with_openai(messages)
-        except Exception:
-            if not gemini_key:
-                raise
-            logger.warning('OpenAI 호출 실패로 Gemini 폴백을 사용합니다.', exc_info=True)
 
-    if gemini_key:
-        return _answer_with_gemini(messages)
+def _stream_answer_with_opencode_zen(messages: list[dict[str, str]], *, model: str | None = None) -> Iterator[str]:
+    response = requests.post(
+        _opencode_chat_completions_url(),
+        headers=_opencode_headers(accept='text/event-stream'),
+        json=_build_opencode_payload(messages, model=model, stream=True),
+        timeout=(10, _opencode_timeout_seconds()),
+        stream=True,
+    )
+    try:
+        response.raise_for_status()
+        for data in _iter_opencode_sse_data(response):
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                logger.debug('OpenCode Zen SSE JSON parse skipped: %s', data)
+                continue
+            text = _extract_opencode_delta(cast(Mapping[str, Any], payload))
+            if text:
+                yield text
+    finally:
+        close = getattr(response, 'close', None)
+        if callable(close):
+            close()
 
-    raise RuntimeError('사용 가능한 AI API 키가 없습니다.')
+
+def _generate_answer(messages: list[dict[str, str]], *, model: str | None = None) -> str:
+    return _answer_with_opencode_zen(messages, model=model)
+
+
+def _stream_generate_answer(messages: list[dict[str, str]], *, model: str | None = None) -> Iterator[str]:
+    emitted = False
+    for chunk in _stream_answer_with_opencode_zen(messages, model=model):
+        emitted = True
+        yield chunk
+    if not emitted:
+        raise RuntimeError('OpenCode Zen 스트리밍 응답이 비어 있습니다.')
 
 
 def _answer_question_classic(
@@ -138,6 +270,7 @@ def _answer_question_classic(
     selected_node_id: str | None = None,
     selected_file_path: str | None = None,
     max_context_files: int = 4,
+    model: str | None = None,
 ) -> dict[str, object]:
     qa_context = build_qa_context(
         analysis,
@@ -159,7 +292,7 @@ def _answer_question_classic(
         }
 
     messages = _build_messages(qa_context.context, question)
-    answer = _generate_answer(messages)
+    answer = _generate_answer(messages, model=model)
 
     return {
         'answer': answer,
@@ -180,34 +313,8 @@ def answer_question(
     selected_node_id: str | None = None,
     selected_file_path: str | None = None,
     max_context_files: int = 4,
+    model: str | None = None,
 ) -> dict[str, object]:
-    if os.getenv('QA_ENGINE', 'classic').lower() == 'smolagents':
-        try:
-            from llm.agents import answer_question_with_smolagents
-
-            return answer_question_with_smolagents(
-                repo_path,
-                analysis,
-                question,
-                selected_node_id=selected_node_id,
-                selected_file_path=selected_file_path,
-                max_context_files=max_context_files,
-            )
-        except Exception as exc:
-            logger.warning('smolagents QA failed; falling back to classic QA.', exc_info=True)
-            response = _answer_question_classic(
-                repo_path,
-                analysis,
-                question,
-                selected_node_id=selected_node_id,
-                selected_file_path=selected_file_path,
-                max_context_files=max_context_files,
-            )
-            warnings = list(response.get('warnings', []))
-            warnings.append({'code': 'smolagents_fallback', 'message': str(exc)})
-            response['warnings'] = warnings
-            return response
-
     return _answer_question_classic(
         repo_path,
         analysis,
@@ -215,4 +322,72 @@ def answer_question(
         selected_node_id=selected_node_id,
         selected_file_path=selected_file_path,
         max_context_files=max_context_files,
+        model=model,
     )
+
+
+def stream_answer_question(
+    repo_path: str,
+    analysis: dict[str, Any],
+    question: str,
+    *,
+    selected_node_id: str | None = None,
+    selected_file_path: str | None = None,
+    max_context_files: int = 4,
+    model: str | None = None,
+) -> Iterator[dict[str, object]]:
+    qa_context = build_qa_context(
+        analysis,
+        question,
+        selected_node_id=selected_node_id,
+        selected_file_path=selected_file_path,
+        max_context_files=max_context_files,
+    )
+
+    meta = {
+        'repo': repo_path,
+        'citations': qa_context.citations,
+        'selected_nodes': qa_context.selected_nodes,
+        'context_files': qa_context.context_files,
+        'context_summary': qa_context.context_summary,
+        'warnings': qa_context.warnings,
+    }
+
+    if not qa_context.context_files or not qa_context.context.strip():
+        warnings = [{'code': 'no_context'}, *qa_context.warnings]
+        yield {
+            'event': 'final',
+            'data': {
+                'answer': '분석 가능한 Python 코드 문맥을 찾지 못했습니다.',
+                'citations': [],
+                'selected_nodes': qa_context.selected_nodes,
+                'context_files': qa_context.context_files,
+                'context_summary': qa_context.context_summary,
+                'tool_trace': [],
+                'warnings': warnings,
+            },
+        }
+        return
+
+    yield {'event': 'meta', 'data': meta}
+
+    messages = _build_messages(qa_context.context, question)
+    answer_parts: list[str] = []
+    for text in _stream_generate_answer(messages, model=model):
+        if not text:
+            continue
+        answer_parts.append(text)
+        yield {'event': 'token', 'data': {'text': text}}
+
+    yield {
+        'event': 'final',
+        'data': {
+            'answer': ''.join(answer_parts),
+            'citations': qa_context.citations,
+            'selected_nodes': qa_context.selected_nodes,
+            'context_files': qa_context.context_files,
+            'context_summary': qa_context.context_summary,
+            'tool_trace': [],
+            'warnings': qa_context.warnings,
+        },
+    }

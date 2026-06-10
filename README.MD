@@ -144,8 +144,8 @@ github_repo/  GitHub repository cloning, git snapshotting, GitHub issue REST
               calls, issue normalization, repo/file safety checks
 parser/       Python tree-sitter parsing, tree/graph construction, static edge
               resolution, entrypoint and key-module scoring
-llm/          QA context selection, OpenAI/Gemini calls, optional smolagents QA,
-              summaries, bounded runtime issue harness
+llm/          QA context selection, OpenCode Zen calls, summaries,
+              bounded runtime issue harness
 harness_eval/ Deterministic issue-map runner evaluation suite and optional live
               Pi/OpenCode adapters
 config/       Django settings, OpenAPI/Swagger routing, WSGI/ASGI entrypoints
@@ -246,6 +246,18 @@ pip install -r requirements.txt
 python manage.py migrate
 python manage.py runserver
 ```
+
+Runtime env:
+
+- `SECRET_KEY`: required outside Django tests.
+- `OPENCODE_API_KEY`: required for QA, summaries, and issue explanations.
+
+OpenCode Zen model settings live in `config.yaml`:
+
+- `opencode.model`: default QA/summary/issue-explanation model.
+- `opencode.allowed_models`: optional allowlist for request-level QA model
+  selection.
+- `opencode.max_tokens` and `opencode.timeout_seconds`: provider call limits.
 
 ## Testing
 

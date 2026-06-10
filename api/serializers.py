@@ -9,6 +9,7 @@ REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 GRAPH_ID_UNSAFE_PATTERN = re.compile(r'[\x00-\x1f\x7f\\]')
 SHARE_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
 UNSAFE_REF_PATTERN = re.compile(r'[\s\\~^:?*\[\]\x00-\x1f]')
+LLM_MODEL_PATTERN = re.compile(r'^[A-Za-z0-9._:/+-]+$')
 
 
 def _is_safe_repo_segment(segment: str) -> bool:
@@ -51,6 +52,10 @@ def is_safe_repo_file_path(file_path: str) -> bool:
 
 def is_safe_share_id(share_id: str) -> bool:
     return 16 <= len(share_id) <= 128 and SHARE_ID_PATTERN.fullmatch(share_id) is not None
+
+
+def is_safe_llm_model(model: str) -> bool:
+    return 1 <= len(model) <= 128 and LLM_MODEL_PATTERN.fullmatch(model) is not None
 
 
 def extract_repo_path(repo_url):
@@ -135,6 +140,8 @@ class QASerializer(serializers.Serializer):
     selected_node_id = serializers.CharField(required=False)
     selected_file_path = serializers.CharField(required=False)
     max_context_files = serializers.IntegerField(required=False, min_value=1, max_value=10, default=4)
+    stream = serializers.BooleanField(required=False, default=False)
+    model = serializers.CharField(required=False)
 
     def validate_repo_url(self, value):
         repo_path = extract_repo_path(value)
@@ -155,6 +162,11 @@ class QASerializer(serializers.Serializer):
     def validate_selected_file_path(self, value):
         if not is_safe_repo_file_path(value):
             raise serializers.ValidationError('올바른 selected_file_path가 아닙니다')
+        return value
+
+    def validate_model(self, value):
+        if not is_safe_llm_model(value):
+            raise serializers.ValidationError('올바른 모델 ID가 아닙니다')
         return value
 
     def validate(self, attrs):

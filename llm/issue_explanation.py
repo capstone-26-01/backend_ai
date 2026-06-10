@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Mapping, Sequence, cast
 
-from llm.services import _generate_answer
+from llm.services import _generate_answer, opencode_model_metadata
 
 
 ISSUE_EXPLANATION_PROMPT_VERSION = 'issue_explanation.v1'
@@ -286,6 +285,5 @@ def generate_issue_explanation(
 def issue_explanation_model_metadata() -> dict[str, str]:
     return {
         'prompt_version': ISSUE_EXPLANATION_PROMPT_VERSION,
-        'openai': os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
-        'gemini': os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
+        **opencode_model_metadata(),
     }

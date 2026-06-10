@@ -13,7 +13,7 @@ Provider
 --------
 
 - Harness: Pi harness review runner.
-- Provider style: OpenAI-compatible.
+- Provider style: chat-completions-compatible.
 - Model: opencode/kimi-k2.5.
 - OpenCode Zen model id: kimi-k2.5.
 - Endpoint: https://opencode.ai/zen/v1/chat/completions.

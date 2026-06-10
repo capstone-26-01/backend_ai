@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from collections import Counter
 import json
-import os
 from typing import Any, Mapping, cast
 
 from llm.context_selection import build_context_for_files
-from llm.services import _generate_answer
+from llm.services import _generate_answer, opencode_model_metadata
 
 
 SUMMARY_PROMPT_VERSION = 'summary.v2'
@@ -322,10 +321,7 @@ def generate_summary(analysis: Mapping[str, Any], kind: str, *, node_id: str | N
     return {
         'kind': kind,
         'prompt_version': SUMMARY_PROMPT_VERSION,
-        'model': {
-            'openai': os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
-            'gemini': os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
-        },
+        'model': opencode_model_metadata(),
         'target_id': node_id,
         'text': text,
         'source_nodes': source_nodes,
