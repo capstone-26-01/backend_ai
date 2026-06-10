@@ -2191,6 +2191,7 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
     def test_extract_issue_evidence_matches_bare_exception_timeout_and_failure(self):
         issue = github_issue_payload(
             body=(
+                'TimeoutError: Parser timed out while reading files.\n'
                 'Exception: generic failure while mapping the issue.\n'
                 'Timeout: repo parsing exceeded the limit.\n'
                 'Failure: harness result was incomplete.\n'
@@ -2199,7 +2200,9 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
 
         evidence = extract_issue_evidence(issue)
 
-        exception_classes = {item['class'] for item in cast(list[dict[str, object]], evidence['exception_mentions'])}
+        exception_mentions = cast(list[dict[str, object]], evidence['exception_mentions'])
+        exception_classes = {item['class'] for item in exception_mentions}
+        self.assertTrue(any(item['class'] == 'TimeoutError' and item['message'] == 'Parser timed out while reading files.' for item in exception_mentions))
         self.assertIn('Exception', exception_classes)
         self.assertIn('Timeout', exception_classes)
         self.assertIn('Failure', exception_classes)
