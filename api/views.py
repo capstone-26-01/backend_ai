@@ -502,7 +502,8 @@ _ISSUE_RELATED_NODES_DESCRIPTION = '''
 1. `/api/analysis/` 응답의 `analysis_id`를 보관합니다.
 2. `/api/issues/`에서 받은 issue의 `number`를 사용자가 선택한 issue로 저장합니다.
 3. 이 API에 `analysis_id`, `issue_number`, 선택적으로 `max_nodes`, `include_comments`, `max_context_files`를 POST합니다.
-4. 응답의 `selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 바로 쓰고, `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
+4. 응답의 `start_here`는 초보자용 "먼저 열 파일/노드" 패널에 바로 쓰고, `selected_node_ids`와 `focus_graph.highlight_node_ids`는 graph highlight에 사용합니다.
+5. `candidates[].node_id`는 `/api/node-summary/`의 `node_id`로 재사용할 수 있습니다.
 
 현재 동작:
 - 기본값은 live GitHub issue detail/comment를 읽고 deterministic evidence/ranking으로 seed 후보를 만듭니다.
@@ -510,7 +511,7 @@ _ISSUE_RELATED_NODES_DESCRIPTION = '''
 - harness는 built-in filesystem/shell/network tools 없이 backend가 넘긴 bounded graph/file_contents만 읽고, 실패하면 deterministic ranking으로 폴백합니다.
 - `mock=true`이면 기존 프런트엔드 선작업용 mock 응답을 반환합니다.
 - 반환되는 `node_id`는 실제 `/api/graph/`의 `nodes[].id`와 연결됩니다.
-- 새 필드는 additive입니다: `overview_graph`, `focus_graph`, `hypotheses`, `investigation_path`, `code_context`, `confidence`, `harness`.
+- 새 필드는 additive입니다: `overview_graph`, `focus_graph`, `hypotheses`, `investigation_path`, `start_here`, `next_steps`, `avoid`, `guidance_summary`, `code_context`, `confidence`, `harness`.
 
 요청 예시:
 ```json
@@ -695,6 +696,34 @@ _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     'focus_graph': {'nodes': [], 'edges': [], 'node_ids': [], 'highlight_node_ids': []},
     'hypotheses': [],
     'investigation_path': [],
+    'start_here': {
+        'node_id': 'api/views.py::analysis',
+        'path': 'api/views.py',
+        'start_line': 180,
+        'end_line': 220,
+        'label': 'analysis',
+        'kind': 'function',
+        'why': 'Issue evidence points to this API entrypoint.',
+        'confidence': 1.0,
+    },
+    'next_steps': [
+        {
+            'node_id': 'api/services.py::get_repo_analysis',
+            'path': 'api/services.py',
+            'start_line': 620,
+            'end_line': 710,
+            'label': 'get_repo_analysis',
+            'kind': 'function',
+            'action': 'inspect',
+            'why': 'This service path performs repository analysis work.',
+        }
+    ],
+    'avoid': [],
+    'guidance_summary': {
+        'mode': 'deterministic',
+        'message': 'Start with api/views.py::analysis, then inspect api/services.py::get_repo_analysis.',
+        'warning_codes': [],
+    },
     'code_context': {'files': [], 'file_count': 0, 'max_context_files': 4, 'truncated': False},
     'confidence': {'level': 'medium', 'score': 0.7, 'reasons': []},
 }

@@ -309,6 +309,39 @@ class IssueRelatedNodeCandidateSerializer(serializers.Serializer):
     evidence = IssueRelatedEvidenceSerializer(many=True, help_text='추천 근거 목록입니다.')
 
 
+class IssueNavigationStartSerializer(serializers.Serializer):
+    node_id = serializers.CharField(help_text='처음 확인할 graph node ID입니다.')
+    path = serializers.CharField(allow_null=True, required=False, help_text='처음 확인할 repository-relative file path입니다.')
+    start_line = serializers.IntegerField(allow_null=True, required=False, help_text='시작 줄 번호입니다.')
+    end_line = serializers.IntegerField(allow_null=True, required=False, help_text='끝 줄 번호입니다.')
+    label = serializers.CharField(help_text='프런트엔드 표시용 node label입니다.')
+    kind = serializers.CharField(help_text='function, method, class, module, file 등 node 종류입니다.')
+    why = serializers.CharField(help_text='왜 여기서 시작해야 하는지에 대한 짧은 설명입니다.')
+    confidence = serializers.FloatField(help_text='0-1 범위의 시작점 신뢰도입니다.')
+
+
+class IssueNavigationStepSerializer(serializers.Serializer):
+    node_id = serializers.CharField(help_text='다음으로 확인할 graph node ID입니다.')
+    path = serializers.CharField(allow_null=True, required=False, help_text='다음으로 확인할 repository-relative file path입니다.')
+    start_line = serializers.IntegerField(allow_null=True, required=False, help_text='시작 줄 번호입니다.')
+    end_line = serializers.IntegerField(allow_null=True, required=False, help_text='끝 줄 번호입니다.')
+    label = serializers.CharField(required=False, help_text='프런트엔드 표시용 node label입니다.')
+    kind = serializers.CharField(required=False, help_text='function, method, class, module, file 등 node 종류입니다.')
+    action = serializers.CharField(required=False, help_text='inspect, trace_call, search 등 권장 확인 방식입니다.')
+    why = serializers.CharField(help_text='왜 이 node를 다음에 확인해야 하는지에 대한 짧은 설명입니다.')
+
+
+class IssueNavigationAvoidSerializer(serializers.Serializer):
+    node_id = serializers.CharField(help_text='피해야 할 graph node ID입니다.')
+    reason = serializers.CharField(help_text='피해야 하는 이유입니다.')
+
+
+class IssueGuidanceSummarySerializer(serializers.Serializer):
+    mode = serializers.CharField(help_text='deterministic 또는 harness 안내 생성 모드입니다.')
+    message = serializers.CharField(help_text='프런트엔드에 바로 표시 가능한 짧은 안내 문장입니다.')
+    warning_codes = serializers.ListField(child=serializers.CharField(), required=False, help_text='안내 생성에 영향을 준 warning code 목록입니다.')
+
+
 class IssueRelatedNodesResponseSerializer(serializers.Serializer):
     analysis_id = serializers.IntegerField(help_text='추천 기준 분석 run ID입니다.')
     repo = serializers.CharField(help_text='분석 run이 속한 owner/repo입니다.')
@@ -325,6 +358,10 @@ class IssueRelatedNodesResponseSerializer(serializers.Serializer):
     focus_graph = serializers.JSONField(required=False, help_text='선택 issue 해결에 직접 관련된 후보/주변 노드 중심 graph입니다.')
     hypotheses = serializers.JSONField(required=False, help_text='Issue가 어디서 시작됐을 가능성이 높은지에 대한 deterministic 또는 bounded issue harness 가설 목록입니다.')
     investigation_path = serializers.JSONField(required=False, help_text='첫 기여자가 순서대로 확인하면 좋은 deterministic 또는 bounded issue harness node/file 조사 경로입니다.')
+    start_here = IssueNavigationStartSerializer(allow_null=True, required=False, help_text='초보 기여자가 가장 먼저 열어볼 node/file 안내입니다.')
+    next_steps = IssueNavigationStepSerializer(many=True, required=False, help_text='start_here 다음에 확인할 최대 3개 안내입니다.')
+    avoid = IssueNavigationAvoidSerializer(many=True, required=False, help_text='현재 PR에서는 항상 빈 목록입니다. 향후 명확한 제외 근거가 생기면 사용합니다.')
+    guidance_summary = IssueGuidanceSummarySerializer(required=False, help_text='초보자용 안내 요약입니다.')
     code_context = serializers.JSONField(required=False, help_text='관련 후보 파일의 bounded code excerpt입니다.')
     confidence = serializers.JSONField(required=False, help_text='Deterministic ranking 또는 bounded issue harness confidence 요약입니다.')
     harness = serializers.JSONField(required=False, help_text='Issue investigation harness 실행 metadata와 bounded tool call trace입니다.')
