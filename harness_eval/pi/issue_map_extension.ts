@@ -265,6 +265,42 @@ const readRepoFile = defineTool({
   },
 });
 
+const readNodeContext = defineTool({
+  name: "read_node_context",
+  label: "Read Node Context",
+  description: "Read bounded source context for a repository fixture symbol node.",
+  promptSnippet: "Inspect one exact candidate node with surrounding source lines",
+  parameters: Type.Object({
+    node_id: Type.String(),
+    before: Type.Optional(Type.Number()),
+    after: Type.Optional(Type.Number()),
+  }),
+  async execute(_toolCallId, params) {
+    toolCalls.push({ name: "read_node_context", arguments: params });
+    const job = loadJob();
+    const nodeId = String(params.node_id || "");
+    const node = rankRepoSymbols(job).find((candidate) => candidate.node_id === nodeId);
+    if (!node) {
+      const result = { error: "node_not_found", node_id: nodeId };
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    }
+    const before = Math.max(0, Math.min(80, Number(params.before ?? 8)));
+    const after = Math.max(0, Math.min(80, Number(params.after ?? 20)));
+    const text = readRepoFileText(job, node.path);
+    const lines = text.split(/\r?\n/);
+    const start = Math.max(1, Number(node.line || 1) - before);
+    const end = Math.min(lines.length, Number(node.line || 1) + after);
+    const excerpt = lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 4000);
+    const result = {
+      node: { id: node.node_id, kind: node.kind, label: node.name, path: node.path, start_line: node.line, end_line: node.line },
+      context: { path: node.path, start_line: start, end_line: end, excerpt },
+      neighbors: { incoming: [], outgoing: [], nodes: [] },
+      warnings: [],
+    };
+    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+  },
+});
+
 const rankIssueCandidates = defineTool({
   name: "rank_issue_candidates",
   label: "Rank Issue Candidates",
@@ -463,6 +499,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(searchRepoSymbols);
   pi.registerTool(searchRepoText);
   pi.registerTool(readRepoFile);
+  pi.registerTool(readNodeContext);
   pi.registerTool(rankIssueCandidates);
   pi.registerTool(loadFocusGraph);
   pi.registerTool(loadCodeContext);

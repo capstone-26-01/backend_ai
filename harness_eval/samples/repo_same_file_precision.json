@@ -29,14 +29,14 @@
       "description": "Search Python functions/classes in the repository and rank them against issue evidence."
     },
     {
-      "name": "read_repo_file",
-      "description": "Read bounded Python file contents from the repository."
+      "name": "read_node_context",
+      "description": "Read bounded source context for an exact candidate node."
     }
   ],
   "expect": {
     "golden_ref": "harness_eval/golden/repo_issue_consensus.json#repo_same_file_precision",
-    "required_tools": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
-    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_repo_file"],
+    "required_tools": ["list_repo_files", "search_repo_symbols", "read_node_context"],
+    "required_tool_order": ["list_repo_files", "search_repo_symbols", "read_node_context"],
     "required_read_paths": ["api/services.py"],
     "forbidden_tools": ["shell", "filesystem", "network", "github_api", "rank_issue_candidates"],
     "node_ids": ["api/services.py::get_repo_analysis", "api/services.py::_build_and_store_analysis"],
