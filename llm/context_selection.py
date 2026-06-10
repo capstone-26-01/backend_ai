@@ -5,6 +5,8 @@ import os
 import re
 from typing import Any, Mapping, cast
 
+from parser.language_registry import LANGUAGE_BY_ID, language_for_path
+
 
 DEFAULT_MAX_CONTEXT_CHARS = 8000
 DEFAULT_MAX_CONTEXT_FILES = 4
@@ -18,6 +20,18 @@ STOPWORDS = {
 ENTRYPOINT_HINTS = {'main', 'run', 'cli', 'entry', 'entrypoint', 'app'}
 ENTRYPOINT_QUESTION_TOKENS = {'entry', 'entrypoint', 'point', 'main', 'start', '시작', '진입', '엔트리', '실행'}
 RELATIONSHIP_EDGE_KINDS = {'calls', 'imports', 'inherits', 'references'}
+
+
+def _is_supported_source_file(file_path: str) -> bool:
+    return language_for_path(file_path, enabled_languages=LANGUAGE_BY_ID.keys()) is not None
+
+
+def _source_basename_stem(file_path: str) -> str:
+    basename = os.path.basename(file_path.lower())
+    for suffix in ('.d.ts', '.tsx', '.jsx', '.mts', '.cts', '.mjs', '.cjs', '.ts', '.js', '.py'):
+        if basename.endswith(suffix):
+            return basename.removesuffix(suffix)
+    return os.path.splitext(basename)[0]
 
 
 @dataclass(frozen=True)
@@ -181,13 +195,14 @@ def _score_node(
     label = _node_label(node)
     label_lower = label.lower()
     basename = os.path.basename(file_path.lower())
+    basename_stem = _source_basename_stem(file_path)
     file_tokens = identifier_tokens(file_path)
     label_tokens = identifier_tokens(label)
     id_tokens = identifier_tokens(node_id)
 
     score = 0
     for token in tokens:
-        if token == label_lower or token == basename.removesuffix('.py'):
+        if token == label_lower or token == basename_stem:
             score += 70
         if token in label_tokens:
             score += 35
@@ -326,7 +341,7 @@ def rank_files(analysis: Mapping[str, Any], question: str, max_files: int = DEFA
     ranked_files: list[str] = []
     for node_id in ranked_nodes:
         file_path = _node_file(nodes_by_id[node_id])
-        if file_path and file_path.endswith('.py') and file_path not in ranked_files:
+        if file_path and _is_supported_source_file(file_path) and file_path not in ranked_files:
             ranked_files.append(file_path)
         if len(ranked_files) >= max_files:
             return ranked_files
@@ -336,7 +351,7 @@ def rank_files(analysis: Mapping[str, Any], question: str, max_files: int = DEFA
     fallback_files = sorted({
         _node_file(cast(Mapping[str, Any], node))
         for node in analysis.get('nodes', [])
-        if (_node_file(cast(Mapping[str, Any], node)) or '').endswith('.py')
+        if _is_supported_source_file(_node_file(cast(Mapping[str, Any], node)) or '')
     })
     for file_path in fallback_files:
         if file_path and file_path not in ranked_files:
@@ -494,7 +509,7 @@ def build_qa_context(
 
     for node_id in ranked_node_ids:
         file_path = _node_file(nodes_by_id[node_id])
-        if file_path and file_path.endswith('.py') and file_path not in files:
+        if file_path and _is_supported_source_file(file_path) and file_path not in files:
             files.append(file_path)
         if len(files) >= max_context_files:
             break

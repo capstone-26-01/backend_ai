@@ -1,10 +1,16 @@
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { Type } from "typebox";
 
 type IssueHarnessJob = {
   job_id?: string;
+  repo?: {
+    language?: string;
+    primary_language?: string;
+    languages?: string[];
+    analysis_profile?: string;
+  };
   issue?: {
     title?: string;
     body?: string;
@@ -23,16 +29,29 @@ type IssueHarnessJob = {
       parent_id?: string;
       start_line?: number;
       end_line?: number;
+      language?: string;
+      support_level?: string;
     }>;
     edges?: Array<{ source?: string; target?: string; kind?: string; type?: string; path?: string }>;
   };
   file_contents?: Record<string, string>;
+  file_manifest?: Record<string, {
+    path?: string;
+    language?: string;
+    language_family?: string;
+    support_level?: string;
+    content_stored?: boolean;
+    byte_size?: number;
+    truncated?: boolean;
+  }>;
 };
 
 type ToolCall = {
   name: string;
   arguments: unknown;
 };
+
+type GraphNode = NonNullable<NonNullable<IssueHarnessJob["graph"]>["nodes"]>[number];
 
 const toolCalls: ToolCall[] = [];
 const MAX_TOOL_CALLS = 30;
@@ -72,9 +91,9 @@ function loadJob(): IssueHarnessJob {
   return JSON.parse(fs.readFileSync(jobPath, "utf8"));
 }
 
-function jsonToolResult(payload: Record<string, unknown>, terminate = false) {
+function jsonToolResult(payload: Record<string, unknown>, terminate = false): AgentToolResult<Record<string, unknown>> {
   return {
-    content: [{ type: "text", text: JSON.stringify(payload) }],
+    content: [{ type: "text" as const, text: JSON.stringify(payload) }],
     details: payload,
     ...(terminate ? { terminate: true } : {}),
   };
@@ -187,7 +206,7 @@ function safeFilePath(job: IssueHarnessJob, rawPath: string): string {
   return filePath;
 }
 
-function scoreNode(job: IssueHarnessJob, node: NonNullable<IssueHarnessJob["graph"]>["nodes"][number], query = "") {
+function scoreNode(job: IssueHarnessJob, node: GraphNode, query = "") {
   const text = `${issueText(job)}\n${query}`.toLowerCase();
   const nodeId = String(node.id || "");
   const nodePathValue = String(node.path || "");
@@ -224,6 +243,7 @@ function scoreNode(job: IssueHarnessJob, node: NonNullable<IssueHarnessJob["grap
     path: nodePathValue || undefined,
     kind: node.kind || node.type,
     label,
+    language: node.language,
     start_line: node.start_line,
     end_line: node.end_line,
     score: Math.min(1, Number(score.toFixed(3))),
@@ -247,13 +267,13 @@ const getIssueContext = defineTool({
       evidence: job.evidence || {},
       seed_candidates: job.seed_candidates || [],
     };
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    return jsonToolResult(result);
   },
 });
 
 function rankedSymbols(job: IssueHarnessJob, query = "") {
   return (job.graph?.nodes || [])
-    .filter((node) => node.id && node.path && ["class", "function", "method", "module", "file"].includes(String(node.kind || node.type || "")))
+    .filter((node) => node.id && node.path && !["directory"].includes(String(node.kind || node.type || "")))
     .map((node) => scoreNode(job, node, query))
     .filter((candidate) => candidate.score > 0.05 || (job.seed_candidates || []).some((seed) => seed.node_id === candidate.node_id))
     .sort((left, right) => right.score - left.score || String(left.path || "").localeCompare(String(right.path || "")) || left.node_id.localeCompare(right.node_id));
@@ -275,7 +295,7 @@ function searchText(job: IssueHarnessJob, query: string) {
   return matches.slice(0, 40);
 }
 
-function compactNode(node: NonNullable<IssueHarnessJob["graph"]>["nodes"][number] | undefined) {
+function compactNode(node: GraphNode | undefined) {
   if (!node) return undefined;
   return {
     id: node.id,
@@ -287,10 +307,25 @@ function compactNode(node: NonNullable<IssueHarnessJob["graph"]>["nodes"][number
     parent_id: node.parent_id,
     start_line: node.start_line,
     end_line: node.end_line,
+    language: node.language,
+    support_level: node.support_level,
   };
 }
 
-function findContainer(job: IssueHarnessJob, node: NonNullable<IssueHarnessJob["graph"]>["nodes"][number]) {
+function listedFiles(job: IssueHarnessJob) {
+  return Object.keys(job.file_contents || {}).sort().map((filePath) => {
+    const manifest = job.file_manifest?.[filePath] || {};
+    return {
+      path: filePath,
+      language: manifest.language ?? null,
+      support_level: manifest.support_level ?? null,
+      byte_size: manifest.byte_size ?? String((job.file_contents || {})[filePath] || "").length,
+      truncated: Boolean(manifest.truncated),
+    };
+  });
+}
+
+function findContainer(job: IssueHarnessJob, node: GraphNode) {
   const nodes = job.graph?.nodes || [];
   if (node.parent_id) {
     const parent = nodes.find((candidate) => candidate.id === node.parent_id);
@@ -308,15 +343,15 @@ function findContainer(job: IssueHarnessJob, node: NonNullable<IssueHarnessJob["
 const listRepoFiles = defineTool({
   name: "list_repo_files",
   label: "List Repo Files",
-  description: "List Python files available in the bounded analysis artifact.",
+  description: "List source files available in the bounded analysis artifact.",
   promptSnippet: "List bounded repository files before investigating the issue",
   parameters: Type.Object({}),
   async execute(_toolCallId, params) {
     const budgetError = recordToolCall("list_repo_files", params);
     if (budgetError) return budgetError;
     const job = loadJob();
-    const files = Object.keys(job.file_contents || {}).sort();
-    return { content: [{ type: "text", text: JSON.stringify({ files }) }], details: { files } };
+    const files = listedFiles(job);
+    return jsonToolResult({ files });
   },
 });
 
@@ -331,7 +366,7 @@ const searchRepoSymbols = defineTool({
     if (budgetError) return budgetError;
     const job = loadJob();
     const candidates = rankedSymbols(job, String(params.query || "")).slice(0, 20);
-    return { content: [{ type: "text", text: JSON.stringify({ candidates }) }], details: { candidates } };
+    return jsonToolResult({ candidates });
   },
 });
 
@@ -346,7 +381,7 @@ const searchRepoText = defineTool({
     if (budgetError) return budgetError;
     const job = loadJob();
     const matches = searchText(job, String(params.query || ""));
-    return { content: [{ type: "text", text: JSON.stringify({ matches }) }], details: { matches } };
+    return jsonToolResult({ matches });
   },
 });
 
@@ -370,7 +405,7 @@ const readRepoFile = defineTool({
     const end = Math.min(lines.length, Number(params.end_line || Math.min(lines.length, start + 120)));
     const excerpt = lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 8000);
     const result = { path: filePath, start_line: start, end_line: end, excerpt };
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    return jsonToolResult(result);
   },
 });
 
@@ -447,7 +482,7 @@ const readNodeContext = defineTool({
       },
       warnings,
     };
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    return jsonToolResult(result);
   },
 });
 
@@ -463,7 +498,7 @@ const getNode = defineTool({
     const job = loadJob();
     const node = nodeById(job, params.node_id);
     const result = node ? { node } : { error: "node_not_found", node_id: params.node_id };
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    return jsonToolResult(result);
   },
 });
 
@@ -484,7 +519,7 @@ const getNeighbors = defineTool({
     const neighborIds = new Set(edges.flatMap((edge) => [edge.source || "", edge.target || ""]).filter((nodeId) => nodeId && nodeId !== params.node_id));
     const nodes = (job.graph?.nodes || []).filter((node) => neighborIds.has(node.id || ""));
     const result = { node_id: params.node_id, nodes, edges };
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    return jsonToolResult(result);
   },
 });
 
@@ -532,28 +567,28 @@ const finishIssueMapTranscript = defineTool({
         error: "missing_tool_work",
         instruction: "Call get_issue_context, list_repo_files, then search_repo_symbols or search_repo_text before finishing.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
     if (!toolNames.includes("get_issue_context")) {
       const error = {
         error: "missing_issue_context",
         instruction: "Retry after reading bounded issue context with get_issue_context.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
     if (!toolNames.includes("list_repo_files")) {
       const error = {
         error: "missing_file_listing",
         instruction: "Retry after listing bounded repository files with list_repo_files.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
     if (!toolNames.includes("search_repo_symbols") && !toolNames.includes("search_repo_text")) {
       const error = {
         error: "missing_search",
         instruction: "Retry after searching repository symbols or text for issue evidence.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
     const hasInspection =
       toolNames.includes("read_repo_file") ||
@@ -564,7 +599,7 @@ const finishIssueMapTranscript = defineTool({
         error: "missing_inspection",
         instruction: "Retry after inspecting a candidate with read_node_context, read_repo_file, or get_neighbors.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
 
     const invalidNodes = Array.from(new Set(allNodeIds.filter((nodeId) => !validNodes.has(nodeId))));
@@ -575,7 +610,7 @@ const finishIssueMapTranscript = defineTool({
         valid_node_id_examples: Array.from(validNodes).slice(0, 20),
         instruction: "Retry finish_issue_map_transcript using exact node_id values returned by search_repo_symbols/get_node.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
 
     const text = issueText(job);
@@ -589,7 +624,7 @@ const finishIssueMapTranscript = defineTool({
         negated_node_ids: negatedNodes,
         instruction: "Retry without nodes the issue text explicitly marks unrelated or excluded.",
       };
-      return { content: [{ type: "text", text: JSON.stringify(error) }], details: error };
+      return jsonToolResult(error);
     }
 
     const paths = validPaths(job);
@@ -620,11 +655,7 @@ const finishIssueMapTranscript = defineTool({
         confidence: params.confidence || {},
       },
     };
-    return {
-      content: [{ type: "text", text: JSON.stringify(transcript) }],
-      details: transcript,
-      terminate: true,
-    };
+    return jsonToolResult(transcript, true);
   },
 });
 

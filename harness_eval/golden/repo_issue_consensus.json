@@ -11,7 +11,8 @@
     "graph label transformation bug",
     "parser class visitor bug",
     "background worker/cache-key mismatch",
-    "negative needs-info issue with no actionable code node"
+    "negative needs-info issue with no actionable code node",
+    "TypeScript route/service crash localization"
   ],
   "judges": [
     {
@@ -179,6 +180,22 @@
       "allowed_paths": [],
       "reference_bug": "No planted bug: the issue has no stack trace, endpoint, repo operation, or reproducible symptom.",
       "rationale": "A correct harness should search enough to determine that no actionable code node is justified, then return an empty result."
+    },
+    {
+      "sample_id": "repo_ts_route_bug",
+      "node_ids": [
+        "src/services/userService.ts::createUser"
+      ],
+      "allowed_node_ids": [
+        "src/services/userService.ts::createUser",
+        "src/routes/user.ts::POST"
+      ],
+      "allowed_paths": [
+        "src/services/userService.ts",
+        "src/routes/user.ts"
+      ],
+      "reference_bug": "createUser dereferences input.email with a non-null assertion and calls trim(), so POST /api/users crashes when the route passes a body without email.",
+      "rationale": "The route is investigation context, but the service function is the precise TypeScript crash origin. The health route and passing test file are decoys."
     }
   ]
 }

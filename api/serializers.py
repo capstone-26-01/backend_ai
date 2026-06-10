@@ -3,6 +3,8 @@ from pathlib import PurePosixPath
 from urllib.parse import urlparse
 import re
 
+from api.analysis_profiles import get_active_analysis_profile, is_known_analysis_profile
+
 
 REPO_SEGMENT_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
 REVISION_PATTERN = re.compile(r'^[A-Za-z0-9_.-]+$')
@@ -89,16 +91,27 @@ class RepoUrlSerializer(serializers.Serializer):
 
 class AnalysisRequestSerializer(RepoUrlSerializer):
     revision = serializers.CharField(required=False)
+    analysis_profile = serializers.CharField(required=False)
 
     def validate_revision(self, value):
         if not is_safe_revision(value):
             raise serializers.ValidationError('올바른 revision이 아닙니다')
         return value
 
+    def validate_analysis_profile(self, value):
+        if not is_known_analysis_profile(value):
+            raise serializers.ValidationError('지원하지 않는 analysis_profile입니다')
+        return value
+
+    def validate(self, attrs):
+        attrs.setdefault('analysis_profile', get_active_analysis_profile())
+        return attrs
+
 
 class DiffRequestSerializer(RepoUrlSerializer):
     base = serializers.CharField()
     head = serializers.CharField(required=False)
+    analysis_profile = serializers.CharField(required=False)
 
     def validate_base(self, value):
         if not is_safe_revision(value):
@@ -110,6 +123,15 @@ class DiffRequestSerializer(RepoUrlSerializer):
             raise serializers.ValidationError('올바른 head revision이 아닙니다')
         return value
 
+    def validate_analysis_profile(self, value):
+        if not is_known_analysis_profile(value):
+            raise serializers.ValidationError('지원하지 않는 analysis_profile입니다')
+        return value
+
+    def validate(self, attrs):
+        attrs.setdefault('analysis_profile', get_active_analysis_profile())
+        return attrs
+
 
 class AnalysisDiffRequestSerializer(serializers.Serializer):
     base = serializers.IntegerField(min_value=1)
@@ -118,6 +140,7 @@ class AnalysisDiffRequestSerializer(serializers.Serializer):
 class ShareCreateSerializer(RepoUrlSerializer):
     mode = serializers.ChoiceField(choices=('fixed', 'latest'), required=False, default='fixed')
     revision = serializers.CharField(required=False)
+    analysis_profile = serializers.CharField(required=False)
     title = serializers.CharField(required=False, allow_blank=True, max_length=255)
     expires_at = serializers.DateTimeField(required=False, allow_null=True)
 
@@ -126,9 +149,15 @@ class ShareCreateSerializer(RepoUrlSerializer):
             raise serializers.ValidationError('올바른 revision이 아닙니다')
         return value
 
+    def validate_analysis_profile(self, value):
+        if not is_known_analysis_profile(value):
+            raise serializers.ValidationError('지원하지 않는 analysis_profile입니다')
+        return value
+
     def validate(self, attrs):
         if attrs.get('mode') == 'latest' and attrs.get('revision'):
             raise serializers.ValidationError({'revision': ['latest share에는 revision을 지정할 수 없습니다']})
+        attrs.setdefault('analysis_profile', get_active_analysis_profile())
         return attrs
 
 
@@ -136,6 +165,7 @@ class QASerializer(serializers.Serializer):
     repo_url = serializers.CharField(required=False)
     question = serializers.CharField()
     revision = serializers.CharField(required=False)
+    analysis_profile = serializers.CharField(required=False)
     analysis_id = serializers.IntegerField(required=False, min_value=1)
     selected_node_id = serializers.CharField(required=False)
     selected_file_path = serializers.CharField(required=False)
@@ -169,9 +199,15 @@ class QASerializer(serializers.Serializer):
             raise serializers.ValidationError('올바른 모델 ID가 아닙니다')
         return value
 
+    def validate_analysis_profile(self, value):
+        if not is_known_analysis_profile(value):
+            raise serializers.ValidationError('지원하지 않는 analysis_profile입니다')
+        return value
+
     def validate(self, attrs):
         if not attrs.get('repo_url') and not attrs.get('analysis_id'):
             raise serializers.ValidationError({'repo_url': ['repo_url 또는 analysis_id가 필요합니다']})
+        attrs.setdefault('analysis_profile', get_active_analysis_profile())
         return attrs
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from parser.language_registry import LANGUAGE_BY_ID, language_for_path
+
 
 GRAPH_ARTIFACT_SCHEMA_VERSION = 'graph-artifact.v1'
 
@@ -55,6 +57,7 @@ REQUIRED_EDGE_FIELDS = frozenset({
 DEFAULT_LIMITS = {
     'max_files': None,
     'max_python_files': None,
+    'max_js_ts_files': None,
     'max_single_file_bytes': None,
     'max_total_analyzed_bytes': None,
 }
@@ -87,6 +90,13 @@ def _line_or_none(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ArtifactValidationError('line fields must be integers or null')
     return value
+
+
+def _language_from_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    spec = language_for_path(path, enabled_languages=LANGUAGE_BY_ID.keys())
+    return spec.id if spec is not None else None
 
 
 def _legacy_node_kind(node: Mapping[str, Any], nodes_by_id: Mapping[str, Mapping[str, Any]]) -> str:
@@ -126,7 +136,7 @@ def _normalize_node(node: Mapping[str, Any], nodes_by_id: Mapping[str, Mapping[s
         'path': path,
         'parent_id': parent_id,
         'symbol': _string_or_none(node.get('symbol', label if kind in {'class', 'function', 'method'} else None)),
-        'language': _string_or_none(node.get('language', 'python' if path and path.endswith('.py') else None)),
+        'language': _string_or_none(node.get('language', _language_from_path(path))),
         'start_line': _line_or_none(node.get('start_line')),
         'end_line': _line_or_none(node.get('end_line')),
         'metadata': metadata,
@@ -178,6 +188,9 @@ def build_graph_artifact(
     key_modules: list[dict[str, Any]] | None = None,
     summaries: Mapping[str, Any] | None = None,
     warnings: list[dict[str, Any]] | None = None,
+    analysis_profile: str = 'python-v1',
+    languages: list[str] | tuple[str, ...] | None = None,
+    file_manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     owner, name = _repo_parts(repo_path)
     raw_nodes = list(graph.get('nodes', []))
@@ -196,7 +209,10 @@ def build_graph_artifact(
         'default_branch': default_branch,
         'generated_at': generated_at or _utc_now(),
         'status': status,
+        'analysis_profile': analysis_profile,
         'limits': {**DEFAULT_LIMITS, **dict(limits or {})},
+        'languages': list(languages or []),
+        'file_manifest': dict(file_manifest or {}),
         'file_contents': dict(file_contents or {}),
         'tree': list(graph.get('tree', [])),
         'nodes': nodes,
@@ -213,6 +229,9 @@ def build_graph_artifact(
 def coerce_graph_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
     if payload.get('schema_version') == GRAPH_ARTIFACT_SCHEMA_VERSION:
         artifact = dict(payload)
+        artifact.setdefault('analysis_profile', 'python-v1')
+        artifact.setdefault('languages', [])
+        artifact.setdefault('file_manifest', {})
         validate_graph_artifact(artifact)
         return artifact
 
@@ -231,6 +250,9 @@ def coerce_graph_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
         ref=str(payload.get('ref') or 'HEAD'),
         default_branch=payload.get('default_branch'),
         generated_at=payload.get('generated_at'),
+        analysis_profile=str(payload.get('analysis_profile') or 'python-v1'),
+        languages=payload.get('languages') or [],
+        file_manifest=payload.get('file_manifest') or {},
     )
 
 

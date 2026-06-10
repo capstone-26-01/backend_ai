@@ -5,13 +5,20 @@ import os
 import re
 import secrets
 import tempfile
+from pathlib import PurePosixPath
 from typing import Any
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from api.artifacts import GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
+from api.analysis_profiles import (
+    MULTI_LANG_JS_TS_PROFILE_ID,
+    PYTHON_PROFILE_ID,
+    get_active_analysis_profile as _active_analysis_profile,
+    normalize_analysis_profile,
+)
+from api.artifacts import ArtifactValidationError, GRAPH_ARTIFACT_SCHEMA_VERSION, build_graph_artifact, coerce_graph_artifact
 from api.diff import GraphDiffInputError, compare_graph_artifacts
 from api.issue_map import (
     build_code_context,
@@ -50,6 +57,11 @@ from llm.summaries import (
     summary_cache_key,
 )
 from parser.services import parse_repo
+from parser.language_registry import (
+    ignored_reason,
+    language_for_path,
+    normalize_enabled_languages,
+)
 
 
 class ShareInputError(ValueError):
@@ -206,6 +218,7 @@ MOCK_ISSUE_TEMPLATES: list[dict[str, Any]] = [
 ]
 
 PREFERRED_RELATED_NODE_KINDS = {'function', 'method', 'class', 'module'}
+RESOLVER_MANIFEST_NAMES = {'tsconfig.json', 'jsconfig.json', 'pnpm-workspace.yaml', 'package.json'}
 
 
 def _analysis_parts(repo_path: str) -> tuple[str, str]:
@@ -218,6 +231,21 @@ def _analysis_parts(repo_path: str) -> tuple[str, str]:
     return owner, repo
 
 
+def get_active_analysis_profile() -> str:
+    return _active_analysis_profile()
+
+
+def _profile_or_active(analysis_profile: str | None = None) -> str:
+    profile = normalize_analysis_profile(analysis_profile)
+    return profile or get_active_analysis_profile()
+
+
+def _enabled_languages_for_profile(analysis_profile: str) -> tuple[str, ...]:
+    if analysis_profile == MULTI_LANG_JS_TS_PROFILE_ID:
+        return ('python', 'javascript', 'typescript')
+    return normalize_enabled_languages(['python'])
+
+
 def _analysis_key(repo_path: str, revision: str) -> str:
     if not is_safe_revision(revision):
         raise ValueError('Unsafe revision')
@@ -225,8 +253,11 @@ def _analysis_key(repo_path: str, revision: str) -> str:
     return f'{owner}/{repo}@{revision}'
 
 
-def _analysis_path(repo_path: str, revision: str):
+def _analysis_path(repo_path: str, revision: str, analysis_profile: str | None = None):
+    profile = _profile_or_active(analysis_profile)
     analysis_dir = settings.TEMP_DIR / 'analysis' / _analysis_key(repo_path, revision)
+    if profile != PYTHON_PROFILE_ID:
+        analysis_dir = analysis_dir / profile
     analysis_dir.mkdir(parents=True, exist_ok=True)
     return analysis_dir / 'graph.json'
 
@@ -266,11 +297,12 @@ def get_or_create_repository(repo_path: str, *, provider: str = 'github', defaul
     return repository
 
 
-def start_analysis_run(repository: Repository, *, ref: str = 'HEAD', revision: str = '') -> AnalysisRun:
+def start_analysis_run(repository: Repository, *, ref: str = 'HEAD', revision: str = '', analysis_profile: str | None = None) -> AnalysisRun:
     return AnalysisRun.objects.create(
         repository=repository,
         ref=ref,
         revision=revision,
+        analysis_profile=_profile_or_active(analysis_profile),
         status=AnalysisRun.STATUS_STARTED,
     )
 
@@ -320,7 +352,11 @@ def store_failed_run(analysis_run: AnalysisRun, error: Exception) -> AnalysisRun
     return analysis_run
 
 
-def get_artifact_by_revision(repo_path: str, revision: str) -> dict[str, Any] | None:
+def _coerced_payload(artifact: AnalysisArtifact) -> dict[str, Any]:
+    return coerce_graph_artifact(artifact.payload if isinstance(artifact.payload, dict) else {})
+
+
+def get_artifact_by_revision(repo_path: str, revision: str, analysis_profile: str | None = None) -> dict[str, Any] | None:
     try:
         _analysis_parts(repo_path)
     except ValueError:
@@ -335,6 +371,7 @@ def get_artifact_by_revision(repo_path: str, revision: str) -> dict[str, Any] | 
             analysis_run__repository__provider='github',
             analysis_run__repository__full_name=repo_path,
             analysis_run__revision=revision,
+            analysis_run__analysis_profile=_profile_or_active(analysis_profile),
             analysis_run__status=AnalysisRun.STATUS_SUCCEEDED,
         )
         .order_by('-created_at')
@@ -342,10 +379,10 @@ def get_artifact_by_revision(repo_path: str, revision: str) -> dict[str, Any] | 
     )
     if artifact is None:
         return None
-    return artifact.payload
+    return _coerced_payload(artifact)
 
 
-def get_analysis_run_by_revision(repo_path: str, revision: str) -> AnalysisRun | None:
+def get_analysis_run_by_revision(repo_path: str, revision: str, analysis_profile: str | None = None) -> AnalysisRun | None:
     try:
         _analysis_parts(repo_path)
     except ValueError:
@@ -360,6 +397,7 @@ def get_analysis_run_by_revision(repo_path: str, revision: str) -> AnalysisRun |
             repository__provider='github',
             repository__full_name=repo_path,
             revision=revision,
+            analysis_profile=_profile_or_active(analysis_profile),
             status=AnalysisRun.STATUS_SUCCEEDED,
         )
         .order_by('-finished_at', '-started_at')
@@ -372,6 +410,7 @@ def build_analysis_response(payload: dict[str, Any], analysis_run: AnalysisRun |
         'analysis_id': analysis_run.id if analysis_run is not None else None,
         'repo': payload['repo'],
         'revision': payload['revision'],
+        'analysis_profile': payload.get('analysis_profile', PYTHON_PROFILE_ID),
         'status': analysis_run.status if analysis_run is not None else payload.get('status', 'succeeded'),
         'artifact': payload,
         'warnings': payload.get('warnings', []),
@@ -383,6 +422,7 @@ def build_tree_response(payload: dict[str, Any], analysis_run: AnalysisRun | Non
         'analysis_id': analysis_run.id if analysis_run is not None else None,
         'repo': payload['repo'],
         'revision': payload['revision'],
+        'analysis_profile': payload.get('analysis_profile', PYTHON_PROFILE_ID),
         'tree': payload['tree'],
         'warnings': payload.get('warnings', []),
     }
@@ -393,6 +433,7 @@ def build_graph_response(payload: dict[str, Any], analysis_run: AnalysisRun | No
         'analysis_id': analysis_run.id if analysis_run is not None else None,
         'repo': payload['repo'],
         'revision': payload['revision'],
+        'analysis_profile': payload.get('analysis_profile', PYTHON_PROFILE_ID),
         'nodes': payload['nodes'],
         'edges': payload['edges'],
         'entrypoints': payload.get('entrypoints', []),
@@ -401,11 +442,12 @@ def build_graph_response(payload: dict[str, Any], analysis_run: AnalysisRun | No
     }
 
 
-def get_analysis_response(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
-    payload = get_repo_analysis(repo_path, revision)
+def get_analysis_response(repo_path: str, revision: str | None = None, analysis_profile: str | None = None) -> dict[str, Any] | None:
+    profile = _profile_or_active(analysis_profile)
+    payload = get_repo_analysis(repo_path, revision, analysis_profile=profile)
     if payload is None:
         return None
-    analysis_run = get_analysis_run_by_revision(repo_path, str(payload['revision']))
+    analysis_run = get_analysis_run_by_revision(repo_path, str(payload['revision']), analysis_profile=profile)
     return build_analysis_response(payload, analysis_run)
 
 
@@ -423,6 +465,7 @@ def get_analysis_response_by_id(analysis_id: int) -> dict[str, Any] | None:
             'analysis_id': analysis_run.id,
             'repo': analysis_run.repository.full_name,
             'revision': analysis_run.revision,
+            'analysis_profile': analysis_run.analysis_profile,
             'status': analysis_run.status,
             'artifact': None,
             'warnings': [],
@@ -435,7 +478,7 @@ def get_analysis_response_by_id(analysis_id: int) -> dict[str, Any] | None:
         artifact = analysis_run.artifact
     except AnalysisArtifact.DoesNotExist:
         return None
-    return build_analysis_response(artifact.payload, analysis_run)
+    return build_analysis_response(_coerced_payload(artifact), analysis_run)
 
 
 def _get_succeeded_artifact_record_by_id(analysis_id: int) -> tuple[AnalysisRun, AnalysisArtifact] | None:
@@ -475,7 +518,10 @@ def _get_issue_map_artifact_record(analysis_id: int) -> tuple[AnalysisRun, Analy
         artifact = analysis_run.artifact
     except AnalysisArtifact.DoesNotExist as exc:
         raise IssueMapResponseError('analysis_artifact_missing', '분석 artifact를 찾을 수 없습니다.', status_code=500, metadata={'analysis_id': analysis_id}) from exc
-    payload = artifact.payload
+    try:
+        payload = _coerced_payload(artifact)
+    except ArtifactValidationError as exc:
+        raise IssueMapResponseError('analysis_artifact_invalid', '분석 artifact 형식이 올바르지 않습니다.', status_code=500, metadata={'analysis_id': analysis_id}) from exc
     if not isinstance(payload, dict) or not isinstance(payload.get('nodes'), list) or not isinstance(payload.get('edges'), list):
         raise IssueMapResponseError('analysis_artifact_invalid', '분석 artifact 형식이 올바르지 않습니다.', status_code=500, metadata={'analysis_id': analysis_id})
     return analysis_run, artifact, payload
@@ -570,6 +616,7 @@ def _node_display_payload(node: dict[str, Any]) -> dict[str, Any]:
         'start_line': node.get('start_line'),
         'end_line': node.get('end_line'),
         'metadata': dict(node.get('metadata') or {}),
+        'language': node.get('language'),
     }
 
 
@@ -620,7 +667,7 @@ def get_mock_issue_related_nodes_response(analysis_id: int, issue_number: int, *
         return None
 
     analysis_run, artifact = record
-    analysis = dict(artifact.payload)
+    analysis = _coerced_payload(artifact)
     repo_path = analysis_run.repository.full_name
     issue = _mock_issue_payload(repo_path, issue_template)
     issue_query = f'{issue["title"]} {issue["body_excerpt"]} {issue_template["search_text"]}'
@@ -1147,7 +1194,7 @@ def _issue_map_cache_enabled(*, include_comments: bool, harness_enabled: bool) -
 
 
 def _cached_issue_map_response(artifact: AnalysisArtifact, cache_key: str) -> dict[str, Any] | None:
-    payload = artifact.payload if isinstance(artifact.payload, dict) else {}
+    payload = _coerced_payload(artifact)
     summaries = payload.get('summaries')
     if not isinstance(summaries, dict):
         return None
@@ -1162,7 +1209,7 @@ def _cached_issue_map_response(artifact: AnalysisArtifact, cache_key: str) -> di
 
 
 def _store_issue_map_response_cache(artifact: AnalysisArtifact, cache_key: str, response: dict[str, Any]) -> None:
-    payload = dict(artifact.payload)
+    payload = _coerced_payload(artifact)
     summaries = dict(payload.get('summaries') or {})
     summaries[cache_key] = dict(response)
     payload['summaries'] = summaries
@@ -1356,7 +1403,7 @@ def get_or_create_summary_response(analysis_id: int, kind: str = SUMMARY_KIND_RE
     if record is None:
         return None
     analysis_run, artifact = record
-    payload = dict(artifact.payload)
+    payload = _coerced_payload(artifact)
     summaries = dict(payload.get('summaries') or {})
     cache_key = summary_cache_key(kind)
     cached_summary = summaries.get(cache_key)
@@ -1376,7 +1423,7 @@ def get_or_create_node_summary_response(analysis_id: int, node_id: str) -> dict[
     if record is None:
         return None
     analysis_run, artifact = record
-    payload = dict(artifact.payload)
+    payload = _coerced_payload(artifact)
     summaries = dict(payload.get('summaries') or {})
     cache_key = summary_cache_key(SUMMARY_KIND_NODE, node_id=node_id)
     cached_summary = summaries.get(cache_key)
@@ -1391,9 +1438,11 @@ def get_or_create_node_summary_response(analysis_id: int, node_id: str) -> dict[
     return _summary_response(analysis_run, summary, cached=False)
 
 
-def _persist_succeeded_artifact(repo_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _persist_succeeded_artifact(repo_path: str, payload: dict[str, Any], analysis_profile: str | None = None) -> dict[str, Any]:
     revision = str(payload['revision'])
-    existing_payload = get_artifact_by_revision(repo_path, revision)
+    profile = _profile_or_active(analysis_profile or str(payload.get('analysis_profile') or PYTHON_PROFILE_ID))
+    payload = {**payload, 'analysis_profile': profile}
+    existing_payload = get_artifact_by_revision(repo_path, revision, analysis_profile=profile)
     if existing_payload is not None:
         return existing_payload
 
@@ -1403,11 +1452,11 @@ def _persist_succeeded_artifact(repo_path: str, payload: dict[str, Any]) -> dict
         default_branch=payload.get('default_branch'),
         clone_url=_repo_clone_url(repo_path),
     )
-    analysis_run = start_analysis_run(repository, ref=str(payload.get('ref') or 'HEAD'), revision=revision)
+    analysis_run = start_analysis_run(repository, ref=str(payload.get('ref') or 'HEAD'), revision=revision, analysis_profile=profile)
     try:
         return store_artifact(analysis_run, payload)
     except IntegrityError:
-        existing_payload = get_artifact_by_revision(repo_path, revision)
+        existing_payload = get_artifact_by_revision(repo_path, revision, analysis_profile=profile)
         if existing_payload is not None:
             analysis_run.delete()
             return existing_payload
@@ -1433,14 +1482,60 @@ def _max_total_analyzed_bytes() -> int:
     return int(getattr(settings, 'GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES', 5_000_000))
 
 
-def _analysis_from_cache(repo_path: str, revision: str) -> dict[str, Any] | None:
-    artifact = get_artifact_by_revision(repo_path, revision)
+def _source_file_manifest(files: list[str], enabled_languages: tuple[str, ...]) -> tuple[list[str], list[str], dict[str, Any], list[dict[str, Any]]]:
+    selected_files: list[str] = []
+    detected_languages: set[str] = set()
+    manifest: dict[str, Any] = {}
+    warnings: list[dict[str, Any]] = []
+
+    for file_path in sorted(files):
+        spec = language_for_path(file_path, enabled_languages=enabled_languages)
+        skip_reason = ignored_reason(file_path, language_spec=spec) if spec is not None else None
+        if spec is not None:
+            detected_languages.add(spec.id)
+        content_stored = spec is not None and skip_reason is None
+        manifest[file_path] = {
+            'path': file_path,
+            'language': spec.id if spec is not None else None,
+            'language_family': spec.family if spec is not None else None,
+            'support_level': spec.support_level if spec is not None else 'file_only',
+            'content_stored': content_stored,
+            'skip_reason': skip_reason if spec is not None else 'unsupported_language',
+        }
+        if spec is None:
+            continue
+        if skip_reason is not None:
+            warnings.append({
+                'code': f'{skip_reason}_file_skipped',
+                'message': '분석 source context에서 제외된 파일입니다.',
+                'path': file_path,
+                'language': spec.id,
+                'skip_reason': skip_reason,
+            })
+            continue
+        selected_files.append(file_path)
+
+    return selected_files, sorted(detected_languages), manifest, warnings
+
+
+def _resolver_manifest_paths(files: list[str]) -> list[str]:
+    paths: list[str] = []
+    for file_path in sorted(files):
+        name = PurePosixPath(file_path).name
+        if name in RESOLVER_MANIFEST_NAMES:
+            paths.append(file_path)
+    return paths
+
+
+def _analysis_from_cache(repo_path: str, revision: str, analysis_profile: str | None = None) -> dict[str, Any] | None:
+    profile = _profile_or_active(analysis_profile)
+    artifact = get_artifact_by_revision(repo_path, revision, analysis_profile=profile)
     if artifact is not None:
         return artifact
 
-    artifact_path = _analysis_path(repo_path, revision)
+    artifact_path = _analysis_path(repo_path, revision, profile)
     if artifact_path.exists():
-        return _persist_succeeded_artifact(repo_path, _read_analysis_artifact(artifact_path))
+        return _persist_succeeded_artifact(repo_path, _read_analysis_artifact(artifact_path), analysis_profile=profile)
     return None
 
 
@@ -1451,27 +1546,48 @@ def _build_and_store_analysis(
     files: list[str],
     *,
     ref: str = 'HEAD',
+    analysis_profile: str | None = None,
 ) -> dict[str, Any]:
-    cached_analysis = _analysis_from_cache(repo_path, revision)
+    profile = _profile_or_active(analysis_profile)
+    cached_analysis = _analysis_from_cache(repo_path, revision, analysis_profile=profile)
     if cached_analysis is not None:
         return cached_analysis
 
-    artifact_path = _analysis_path(repo_path, revision)
-    analysis_run = start_analysis_run(repository, ref=ref, revision=revision)
+    artifact_path = _analysis_path(repo_path, revision, profile)
+    analysis_run = start_analysis_run(repository, ref=ref, revision=revision, analysis_profile=profile)
     try:
-        python_files = [file_path for file_path in files if file_path.endswith('.py')]
+        enabled_languages = _enabled_languages_for_profile(profile)
+        selected_source_files, languages, file_manifest, selection_warnings = _source_file_manifest(files, enabled_languages)
         file_contents = {}
+        resolver_file_contents: dict[str, str] = {}
         total_analyzed_bytes = 0
         max_total_analyzed_bytes = _max_total_analyzed_bytes()
-        for file_path in python_files:
+        for file_path in _resolver_manifest_paths(files):
+            try:
+                content = get_file_content_or_raise(repo_path, file_path, revision)
+            except RepoIngestionError:
+                continue
+            if content is not None:
+                resolver_file_contents[file_path] = content
+                file_manifest.setdefault(file_path, {
+                    'path': file_path,
+                    'language': None,
+                    'language_family': None,
+                    'support_level': 'file_only',
+                    'content_stored': False,
+                    'skip_reason': 'resolver_manifest',
+                })
+        for file_path in selected_source_files:
             content = get_file_content_or_raise(repo_path, file_path, revision)
             if content is None:
+                file_manifest[file_path]['content_stored'] = False
+                file_manifest[file_path]['skip_reason'] = 'missing_content'
                 continue
             total_analyzed_bytes += len(content.encode('utf-8'))
             if total_analyzed_bytes > max_total_analyzed_bytes:
                 raise RepoIngestionError(
                     'too_large',
-                    '분석 대상 Python 코드 총량이 허용 한도를 초과했습니다.',
+                    '분석 대상 source 코드 총량이 허용 한도를 초과했습니다.',
                     metadata={
                         'limit': max_total_analyzed_bytes,
                         'actual': total_analyzed_bytes,
@@ -1479,17 +1595,34 @@ def _build_and_store_analysis(
                     },
                 )
             file_contents[file_path] = content
+            file_manifest[file_path]['byte_size'] = len(content.encode('utf-8'))
 
-        graph = parse_repo(repo_path, files, lambda _repo_path, file_path: file_contents.get(file_path))
+        graph = parse_repo(
+            repo_path,
+            files,
+            lambda _repo_path, file_path: file_contents.get(file_path),
+            enabled_languages=enabled_languages,
+            resolver_file_contents=resolver_file_contents,
+        )
         analysis = build_graph_artifact(
             repo_path=repo_path,
             revision=revision,
             graph=graph,
             file_contents=file_contents,
             ref=ref,
+            analysis_profile=profile,
+            languages=languages,
+            file_manifest=file_manifest,
             entrypoints=graph.get('entrypoints', []),
             key_modules=graph.get('key_modules', []),
-            warnings=graph.get('warnings', []),
+            warnings=[*selection_warnings, *list(graph.get('warnings', []))],
+            limits={
+                'max_files': getattr(settings, 'GITHUB_REPO_MAX_FILES', None),
+                'max_python_files': getattr(settings, 'GITHUB_REPO_MAX_PYTHON_FILES', None),
+                'max_js_ts_files': getattr(settings, 'GITHUB_REPO_MAX_JS_TS_FILES', None),
+                'max_single_file_bytes': getattr(settings, 'GITHUB_REPO_MAX_SINGLE_FILE_BYTES', None),
+                'max_total_analyzed_bytes': max_total_analyzed_bytes,
+            },
         )
         _write_analysis_artifact(artifact_path, analysis)
         return store_artifact(analysis_run, analysis)
@@ -1498,25 +1631,26 @@ def _build_and_store_analysis(
         raise
 
 
-def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, Any] | None:
+def get_repo_analysis(repo_path: str, revision: str | None = None, analysis_profile: str | None = None) -> dict[str, Any] | None:
     try:
         _analysis_parts(repo_path)
     except ValueError:
         return None
 
+    profile = _profile_or_active(analysis_profile)
     repository = get_or_create_repository(repo_path)
 
     if revision is not None:
         if not is_safe_revision(revision):
             return None
-        cached_analysis = _analysis_from_cache(repo_path, revision)
+        cached_analysis = _analysis_from_cache(repo_path, revision, analysis_profile=profile)
         if cached_analysis is not None:
             return cached_analysis
 
         try:
-            snapshot = get_repo_snapshot_at_revision(repo_path, revision)
+            snapshot = get_repo_snapshot_at_revision(repo_path, revision, enabled_languages=_enabled_languages_for_profile(profile))
         except Exception as error:
-            failed_run = start_analysis_run(repository, ref=revision, revision=revision)
+            failed_run = start_analysis_run(repository, ref=revision, revision=revision, analysis_profile=profile)
             store_failed_run(failed_run, error)
             raise
 
@@ -1525,12 +1659,12 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
         target_revision, files = snapshot
         if not files:
             return None
-        return _build_and_store_analysis(repo_path, repository, target_revision, files, ref=revision)
+        return _build_and_store_analysis(repo_path, repository, target_revision, files, ref=revision, analysis_profile=profile)
 
     try:
-        snapshot = get_repo_snapshot(repo_path)
+        snapshot = get_repo_snapshot(repo_path, enabled_languages=_enabled_languages_for_profile(profile))
     except Exception as error:
-        failed_run = start_analysis_run(repository, revision='')
+        failed_run = start_analysis_run(repository, revision='', analysis_profile=profile)
         store_failed_run(failed_run, error)
         raise
 
@@ -1540,7 +1674,7 @@ def get_repo_analysis(repo_path: str, revision: str | None = None) -> dict[str, 
     if not files:
         return None
 
-    return _build_and_store_analysis(repo_path, repository, target_revision, files)
+    return _build_and_store_analysis(repo_path, repository, target_revision, files, analysis_profile=profile)
 
 
 def _analysis_ref(run: AnalysisRun) -> dict[str, Any]:
@@ -1548,12 +1682,13 @@ def _analysis_ref(run: AnalysisRun) -> dict[str, Any]:
         'analysis_id': run.id,
         'revision': run.revision,
         'ref': run.ref,
+        'analysis_profile': run.analysis_profile,
     }
 
 
 def _build_diff_response(base_run: AnalysisRun, head_run: AnalysisRun) -> dict[str, Any]:
-    base_artifact = base_run.artifact.payload
-    head_artifact = head_run.artifact.payload
+    base_artifact = _coerced_payload(base_run.artifact)
+    head_artifact = _coerced_payload(head_run.artifact)
     diff = compare_graph_artifacts(base_artifact, head_artifact)
     return {
         'repo': head_run.repository.full_name,
@@ -1564,7 +1699,7 @@ def _build_diff_response(base_run: AnalysisRun, head_run: AnalysisRun) -> dict[s
     }
 
 
-def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None) -> dict[str, Any] | None:
+def get_diff_response(repo_path: str, base_revision: str, head_revision: str | None = None, analysis_profile: str | None = None) -> dict[str, Any] | None:
     try:
         _analysis_parts(repo_path)
     except ValueError:
@@ -1574,13 +1709,14 @@ def get_diff_response(repo_path: str, base_revision: str, head_revision: str | N
     if head_revision is not None and not is_safe_revision(head_revision):
         return None
 
-    base_payload = get_repo_analysis(repo_path, base_revision)
-    head_payload = get_repo_analysis(repo_path, head_revision) if head_revision is not None else get_repo_analysis(repo_path)
+    profile = _profile_or_active(analysis_profile)
+    base_payload = get_repo_analysis(repo_path, base_revision, analysis_profile=profile)
+    head_payload = get_repo_analysis(repo_path, head_revision, analysis_profile=profile) if head_revision is not None else get_repo_analysis(repo_path, analysis_profile=profile)
     if base_payload is None or head_payload is None:
         return None
 
-    base_run = get_analysis_run_by_revision(repo_path, str(base_payload['revision']))
-    head_run = get_analysis_run_by_revision(repo_path, str(head_payload['revision']))
+    base_run = get_analysis_run_by_revision(repo_path, str(base_payload['revision']), analysis_profile=profile)
+    head_run = get_analysis_run_by_revision(repo_path, str(head_payload['revision']), analysis_profile=profile)
     if base_run is None or head_run is None:
         return None
     return _build_diff_response(base_run, head_run)
@@ -1627,7 +1763,7 @@ def _build_share_response(share_link: ShareLink, analysis_run: AnalysisRun) -> d
     except AnalysisArtifact.DoesNotExist:
         raise ShareInputError('share에 연결된 분석 artifact가 없습니다')
 
-    graph = build_graph_response(artifact.payload, analysis_run)
+    graph = build_graph_response(_coerced_payload(artifact), analysis_run)
     return {
         'share_id': share_link.token,
         'mode': share_link.mode,
@@ -1636,6 +1772,7 @@ def _build_share_response(share_link: ShareLink, analysis_run: AnalysisRun) -> d
         'repository': _repository_payload(analysis_run.repository),
         'ref': share_link.ref,
         'revision': analysis_run.revision,
+        'analysis_profile': analysis_run.analysis_profile,
         'analysis_id': analysis_run.id,
         'graph': graph,
         'is_active': share_link.is_active,
@@ -1652,16 +1789,18 @@ def create_share_response(
     revision: str | None = None,
     title: str = '',
     expires_at=None,
+    analysis_profile: str | None = None,
 ) -> dict[str, Any] | None:
     if mode not in {ShareLink.MODE_FIXED, ShareLink.MODE_LATEST}:
         raise ShareInputError('unsupported share mode')
     if mode == ShareLink.MODE_LATEST and revision is not None:
         raise ShareInputError('latest share에는 revision을 지정할 수 없습니다')
 
-    analysis = get_repo_analysis(repo_path, revision if mode == ShareLink.MODE_FIXED else None)
+    profile = _profile_or_active(analysis_profile)
+    analysis = get_repo_analysis(repo_path, revision if mode == ShareLink.MODE_FIXED else None, analysis_profile=profile)
     if analysis is None:
         return None
-    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']))
+    analysis_run = get_analysis_run_by_revision(repo_path, str(analysis['revision']), analysis_profile=profile)
     if analysis_run is None:
         return None
 
@@ -1677,17 +1816,19 @@ def create_share_response(
     return _build_share_response(share_link, analysis_run)
 
 
-def _resolve_share_analysis_run(share_link: ShareLink) -> AnalysisRun | None:
+def _resolve_share_analysis_run(share_link: ShareLink, analysis_profile: str | None = None) -> AnalysisRun | None:
     if not share_link.is_active or _share_is_expired(share_link):
         return None
 
     if share_link.mode == ShareLink.MODE_FIXED:
         return share_link.analysis_run
 
-    analysis = get_repo_analysis(share_link.repository.full_name)
+    default_profile = share_link.analysis_run.analysis_profile if share_link.analysis_run_id else None
+    profile = _profile_or_active(analysis_profile or default_profile)
+    analysis = get_repo_analysis(share_link.repository.full_name, analysis_profile=profile)
     if analysis is None:
         return share_link.analysis_run
-    analysis_run = get_analysis_run_by_revision(share_link.repository.full_name, str(analysis['revision']))
+    analysis_run = get_analysis_run_by_revision(share_link.repository.full_name, str(analysis['revision']), analysis_profile=profile)
     if analysis_run is None:
         return share_link.analysis_run
     if share_link.analysis_run_id != analysis_run.id:
@@ -1696,7 +1837,7 @@ def _resolve_share_analysis_run(share_link: ShareLink) -> AnalysisRun | None:
     return analysis_run
 
 
-def get_share_response(share_id: str) -> dict[str, Any] | None:
+def get_share_response(share_id: str, analysis_profile: str | None = None) -> dict[str, Any] | None:
     share_link = (
         ShareLink.objects
         .select_related('repository', 'analysis_run', 'analysis_run__repository')
@@ -1705,7 +1846,7 @@ def get_share_response(share_id: str) -> dict[str, Any] | None:
     )
     if share_link is None:
         return None
-    analysis_run = _resolve_share_analysis_run(share_link)
+    analysis_run = _resolve_share_analysis_run(share_link, analysis_profile=analysis_profile)
     if analysis_run is None:
         return None
     return _build_share_response(share_link, analysis_run)

@@ -211,7 +211,7 @@ def _deterministic_node_summary_text(prompt_payload: Mapping[str, Any], *, reaso
     if kind == 'file':
         lines = [f'{label}은(는) `{path or target_id}` 파일 노드입니다.']
         if unsupported or not language:
-            lines.append('현재 분석기는 Python 파일만 세부 symbol/code excerpt로 저장하므로 이 파일은 구조 그래프의 file node로만 설명됩니다.')
+            lines.append('현재 분석 프로필에서 세부 symbol/code excerpt가 저장되지 않아 이 파일은 구조 그래프의 file node로만 설명됩니다.')
         elif language:
             lines.append(f'분석 언어는 {language}입니다.')
     elif kind == 'directory':
@@ -281,7 +281,7 @@ def _build_summary_messages(kind: str, prompt_payload: Mapping[str, Any]) -> lis
     return [
         {
             'role': 'system',
-            'content': '너는 Python 코드베이스 onboarding 문서를 쓰는 시니어 백엔드 엔지니어야. 제공된 graph와 excerpt만 근거로 한국어로 답해.',
+            'content': '너는 코드베이스 onboarding 문서를 쓰는 시니어 백엔드 엔지니어야. 제공된 graph와 excerpt만 근거로 한국어로 답해.',
         },
         {
             'role': 'user',

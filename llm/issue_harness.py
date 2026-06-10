@@ -156,6 +156,8 @@ def _bounded_nodes(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
                 'parent_id': raw_node.get('parent_id') or raw_node.get('parent'),
                 'start_line': raw_node.get('start_line'),
                 'end_line': raw_node.get('end_line'),
+                'language': raw_node.get('language'),
+                'support_level': (raw_node.get('metadata') or {}).get('support_level') if isinstance(raw_node.get('metadata'), Mapping) else None,
                 'metadata': raw_node.get('metadata') or {},
             }
         )
@@ -252,6 +254,56 @@ def _bounded_file_contents(
     return result, truncated
 
 
+def _analysis_languages(analysis: Mapping[str, Any], file_contents: Mapping[str, str]) -> tuple[list[str], str]:
+    raw_languages = analysis.get('languages')
+    languages = [str(item) for item in raw_languages if isinstance(item, str)] if isinstance(raw_languages, list) else []
+    if not languages:
+        manifest = analysis.get('file_manifest')
+        if isinstance(manifest, Mapping):
+            languages = sorted({
+                str(entry.get('language'))
+                for entry in manifest.values()
+                if isinstance(entry, Mapping) and entry.get('language')
+            })
+    if not languages:
+        node_languages = {
+            str(node.get('language'))
+            for node in _safe_list(analysis.get('nodes'))
+            if isinstance(node, Mapping) and node.get('language')
+        }
+        languages = sorted(node_languages)
+    if not languages:
+        languages = ['python'] if any(str(path).endswith('.py') for path in file_contents) else []
+    primary = languages[0] if len(languages) == 1 else ('mixed' if languages else 'unknown')
+    return languages, primary
+
+
+def _bounded_file_manifest(analysis: Mapping[str, Any], file_contents: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    raw_manifest = analysis.get('file_manifest')
+    manifest = raw_manifest if isinstance(raw_manifest, Mapping) else {}
+    bounded: dict[str, dict[str, Any]] = {}
+    for path in file_contents:
+        entry = manifest.get(path)
+        if isinstance(entry, Mapping):
+            bounded[path] = {
+                'path': path,
+                'language': entry.get('language'),
+                'language_family': entry.get('language_family'),
+                'support_level': entry.get('support_level'),
+                'content_stored': True,
+                'byte_size': entry.get('byte_size'),
+                'truncated': len(file_contents[path]) >= ISSUE_HARNESS_MAX_FILE_CHARS,
+            }
+        else:
+            bounded[path] = {
+                'path': path,
+                'language': 'python' if str(path).endswith('.py') else None,
+                'content_stored': True,
+                'truncated': len(file_contents[path]) >= ISSUE_HARNESS_MAX_FILE_CHARS,
+            }
+    return bounded
+
+
 def build_issue_harness_job(
     *,
     repo_path: str,
@@ -265,6 +317,8 @@ def build_issue_harness_job(
     bounded_issue, bounded_comments, issue_text_truncated = _bounded_issue(issue, comments)
     bounded_evidence = _bounded_evidence(evidence)
     file_contents, file_contents_truncated = _bounded_file_contents(analysis, bounded_evidence, candidates)
+    languages, primary_language = _analysis_languages(analysis, file_contents)
+    file_manifest = _bounded_file_manifest(analysis, file_contents)
     return {
         'schema_version': ISSUE_HARNESS_JOB_SCHEMA_VERSION,
         'job_id': f'github:{repo_path}#{issue.get("number")}@{revision}',
@@ -272,7 +326,10 @@ def build_issue_harness_job(
         'repo': {
             'full_name': repo_path,
             'revision': revision,
-            'language': 'python',
+            'language': primary_language,
+            'primary_language': primary_language,
+            'languages': languages,
+            'analysis_profile': analysis.get('analysis_profile'),
         },
         'issue': bounded_issue,
         'comments': bounded_comments,
@@ -296,9 +353,10 @@ def build_issue_harness_job(
             'key_modules': _bounded_list(analysis.get('key_modules'), 20),
         },
         'file_contents': file_contents,
+        'file_manifest': file_manifest,
         'available_tools': [
             {'name': 'get_issue_context', 'purpose': 'Read bounded issue, comments, evidence, and seed hints.'},
-            {'name': 'list_repo_files', 'purpose': 'List bounded Python files available to the harness.'},
+            {'name': 'list_repo_files', 'purpose': 'List bounded source files available to the harness.'},
             {'name': 'search_repo_symbols', 'purpose': 'Search graph nodes by issue terms and code identifiers.'},
             {'name': 'search_repo_text', 'purpose': 'Search bounded file text for symptoms, strings, and stack traces.'},
             {'name': 'read_repo_file', 'purpose': 'Read a bounded file excerpt from the analysis artifact.'},

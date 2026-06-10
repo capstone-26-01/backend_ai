@@ -1,4 +1,4 @@
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { Type } from "typebox";
@@ -43,6 +43,15 @@ const NEGATIVE_EVIDENCE = [
   "unrelated",
 ];
 const toolCalls: ToolCall[] = [];
+const SOURCE_EXTENSIONS = [".py", ".js", ".jsx", ".ts", ".tsx"];
+
+function jsonToolResult(payload: Record<string, unknown>, terminate = false): AgentToolResult<Record<string, unknown>> {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+    details: payload,
+    ...(terminate ? { terminate: true } : {}),
+  };
+}
 
 function loadJob(): IssueMapJob {
   return JSON.parse(process.env.HARNESS_EVAL_JOB || "{}");
@@ -128,16 +137,16 @@ function safeRelativePath(value: string): string {
   return value;
 }
 
-function listPythonFiles(root: string): string[] {
+function listSourceFiles(root: string): string[] {
   const result: string[] = [];
-  const ignored = new Set([".git", "__pycache__", "venv", ".venv", "node_modules"]);
+  const ignored = new Set([".git", "__pycache__", "venv", ".venv", "node_modules", "dist", "build", ".next", "coverage"]);
   function visit(directory: string) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       if (ignored.has(entry.name)) continue;
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         visit(absolute);
-      } else if (entry.isFile() && entry.name.endsWith(".py")) {
+      } else if (entry.isFile() && SOURCE_EXTENSIONS.some((extension) => entry.name.endsWith(extension))) {
         result.push(path.relative(root, absolute).split(path.sep).join("/"));
       }
     }
@@ -149,6 +158,9 @@ function listPythonFiles(root: string): string[] {
 function readRepoFileText(job: IssueMapJob, relativePath: string): string {
   const root = repoRoot(job);
   const safePath = safeRelativePath(relativePath);
+  if (!listSourceFiles(root).includes(safePath)) {
+    throw new Error("repo file path is not an available bounded source file");
+  }
   const absolute = path.resolve(root, safePath);
   if (!absolute.startsWith(root + path.sep)) {
     throw new Error("repo file path escaped repo root");
@@ -159,13 +171,20 @@ function readRepoFileText(job: IssueMapJob, relativePath: string): string {
 function extractSymbols(relativePath: string, text: string) {
   const symbols: Array<{ node_id: string; path: string; name: string; kind: string; line: number }> = [];
   text.split(/\r?\n/).forEach((line, index) => {
-    const match = line.match(/^\s*(async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+    const match = line.match(/^\s*(async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b/)
+      || line.match(/^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/)
+      || line.match(/^\s*(?:export\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/)
+      || line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/)
+      || line.match(/^\s*(?:export\s+)?(?:interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/);
     if (!match) return;
+    const pythonKind = match[2] ? match[1] : "";
+    const name = match[2] || match[1];
+    const kind = pythonKind === "class" || /^\s*(?:export\s+)?(?:class|interface|type|enum)\b/.test(line) ? "class" : "function";
     symbols.push({
-      node_id: `${relativePath}::${match[2]}`,
+      node_id: `${relativePath}::${name}`,
       path: relativePath,
-      name: match[2],
-      kind: match[1] === "class" ? "class" : "function",
+      name,
+      kind,
       line: index + 1,
     });
   });
@@ -175,7 +194,7 @@ function extractSymbols(relativePath: string, text: string) {
 function rankRepoSymbols(job: IssueMapJob, query = "") {
   const text = `${issueText(job)}\n${query}`.toLowerCase();
   const root = repoRoot(job);
-  const candidates = listPythonFiles(root).flatMap((relativePath) => {
+  const candidates = listSourceFiles(root).flatMap((relativePath) => {
     const fileText = readRepoFileText(job, relativePath);
     return extractSymbols(relativePath, fileText).map((symbol) => {
       const basename = symbol.path.split("/").slice(-1)[0];
@@ -201,7 +220,7 @@ function validNodePathMap(job: IssueMapJob): Map<string, string> {
   if (job.repo?.local_path) {
     const root = repoRoot(job);
     return new Map(
-      listPythonFiles(root).flatMap((relativePath) =>
+      listSourceFiles(root).flatMap((relativePath) =>
         extractSymbols(relativePath, readRepoFileText(job, relativePath)).map((symbol) => [symbol.node_id, symbol.path] as [string, string])
       )
     );
@@ -212,17 +231,14 @@ function validNodePathMap(job: IssueMapJob): Map<string, string> {
 const listRepoFiles = defineTool({
   name: "list_repo_files",
   label: "List Repo Files",
-  description: "List bounded Python files in the provided local repository fixture.",
-  promptSnippet: "List Python files available in the selected repository",
+  description: "List bounded source files in the provided local repository fixture.",
+  promptSnippet: "List source files available in the selected repository",
   parameters: Type.Object({}),
   async execute(_toolCallId, params) {
     toolCalls.push({ name: "list_repo_files", arguments: params });
     const job = loadJob();
-    const files = listPythonFiles(repoRoot(job));
-    return {
-      content: [{ type: "text", text: JSON.stringify({ files }) }],
-      details: { files },
-    };
+    const files = listSourceFiles(repoRoot(job));
+    return jsonToolResult({ files });
   },
 });
 
@@ -230,7 +246,7 @@ const searchRepoSymbols = defineTool({
   name: "search_repo_symbols",
   label: "Search Repo Symbols",
   description: "Search bounded repository symbols and rank them against the issue text.",
-  promptSnippet: "Search Python functions and classes in the selected repository",
+  promptSnippet: "Search source symbols in the selected repository",
   parameters: Type.Object({
     query: Type.Optional(Type.String()),
   }),
@@ -238,17 +254,14 @@ const searchRepoSymbols = defineTool({
     toolCalls.push({ name: "search_repo_symbols", arguments: params });
     const job = loadJob();
     const candidates = rankRepoSymbols(job, String(params.query || "")).slice(0, 12);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ candidates }) }],
-      details: { candidates },
-    };
+    return jsonToolResult({ candidates });
   },
 });
 
 const readRepoFile = defineTool({
   name: "read_repo_file",
   label: "Read Repo File",
-  description: "Read a bounded Python file from the provided repository fixture.",
+  description: "Read a bounded source file from the provided repository fixture.",
   promptSnippet: "Read a bounded repository file for code context",
   parameters: Type.Object({
     path: Type.String(),
@@ -258,10 +271,7 @@ const readRepoFile = defineTool({
     const job = loadJob();
     const safePath = safeRelativePath(params.path);
     const text = readRepoFileText(job, safePath);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ path: safePath, text: text.slice(0, 4000) }) }],
-      details: { path: safePath, text: text.slice(0, 4000) },
-    };
+    return jsonToolResult({ path: safePath, text: text.slice(0, 4000) });
   },
 });
 
@@ -282,7 +292,7 @@ const readNodeContext = defineTool({
     const node = rankRepoSymbols(job).find((candidate) => candidate.node_id === nodeId);
     if (!node) {
       const result = { error: "node_not_found", node_id: nodeId };
-      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+      return jsonToolResult(result);
     }
     const before = Math.max(0, Math.min(80, Number(params.before ?? 8)));
     const after = Math.max(0, Math.min(80, Number(params.after ?? 20)));
@@ -297,7 +307,7 @@ const readNodeContext = defineTool({
       neighbors: { incoming: [], outgoing: [], nodes: [] },
       warnings: [],
     };
-    return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    return jsonToolResult(result);
   },
 });
 
@@ -313,10 +323,7 @@ const rankIssueCandidates = defineTool({
     toolCalls.push({ name: "rank_issue_candidates", arguments: params });
     const job = loadJob();
     const result = { candidates: rankNodes(job).slice(0, 3) };
-    return {
-      content: [{ type: "text", text: JSON.stringify(result) }],
-      details: result,
-    };
+    return jsonToolResult(result);
   },
 });
 
@@ -335,10 +342,7 @@ const loadFocusGraph = defineTool({
     const nodes = (job.artifact?.nodes || []).filter((node) => selected.has(node.id));
     const edges = (job.artifact?.edges || []).filter((edge) => selected.has(edge.source) || selected.has(edge.target));
     const result = { nodes, edges };
-    return {
-      content: [{ type: "text", text: JSON.stringify(result) }],
-      details: result,
-    };
+    return jsonToolResult(result);
   },
 });
 
@@ -358,17 +362,14 @@ const loadCodeContext = defineTool({
       .filter((path) => artifactPaths.has(path))
       .map((path) => ({ path, excerpt: `Bounded context for ${path}` }));
     const result = { excerpts };
-    return {
-      content: [{ type: "text", text: JSON.stringify(result) }],
-      details: result,
-    };
+    return jsonToolResult(result);
   },
 });
 
 const searchRepoText = defineTool({
   name: "search_repo_text",
   label: "Search Repo Text",
-  description: "Search text across bounded Python files in the provided repository fixture.",
+  description: "Search text across bounded source files in the provided repository fixture.",
   promptSnippet: "Search code text for symptoms, log strings, and output keys",
   parameters: Type.Object({
     query: Type.String(),
@@ -379,7 +380,7 @@ const searchRepoText = defineTool({
     const root = repoRoot(job);
     const query = String(params.query || "").toLowerCase();
     const terms = query.split(/[^a-zA-Z0-9_]+/).filter((term) => term.length >= 3);
-    const matches = listPythonFiles(root).flatMap((relativePath) => {
+    const matches = listSourceFiles(root).flatMap((relativePath) => {
       const text = readRepoFileText(job, relativePath);
       return text.split(/\r?\n/).flatMap((line, index) => {
         const lowered = line.toLowerCase();
@@ -387,10 +388,7 @@ const searchRepoText = defineTool({
         return [{ path: relativePath, line: index + 1, text: line.trim() }];
       });
     }).slice(0, 20);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ matches }) }],
-      details: { matches },
-    };
+    return jsonToolResult({ matches });
   },
 });
 
@@ -436,10 +434,7 @@ const finishIssueMapTranscript = defineTool({
         valid_node_id_examples: Array.from(valid).slice(0, 16),
         instruction: "Retry finish_issue_map_transcript using exact node_id values returned by search_repo_symbols. Do not use file paths or Class.method spellings as node_id values.",
       };
-      return {
-        content: [{ type: "text", text: JSON.stringify(error) }],
-        details: error,
-      };
+      return jsonToolResult(error);
     }
     const text = issueText(job);
     const negatedIds = Array.from(new Set(submittedIds.filter((nodeId) => {
@@ -453,10 +448,7 @@ const finishIssueMapTranscript = defineTool({
         negated_node_ids: negatedIds,
         instruction: "Retry finish_issue_map_transcript without node_id values the issue describes as unrelated, from another request, or not part of this failure.",
       };
-      return {
-        content: [{ type: "text", text: JSON.stringify(error) }],
-        details: error,
-      };
+      return jsonToolResult(error);
     }
     const validPaths = new Set(nodePaths.values());
     const invalidPaths = Array.from(new Set(params.investigation_path.map((step) => step.path).filter((filePath) => filePath && !validPaths.has(filePath))));
@@ -471,10 +463,7 @@ const finishIssueMapTranscript = defineTool({
         valid_path_examples: Array.from(validPaths).slice(0, 16),
         instruction: "Retry finish_issue_map_transcript using exact repository-relative file paths that match each node_id.",
       };
-      return {
-        content: [{ type: "text", text: JSON.stringify(error) }],
-        details: error,
-      };
+      return jsonToolResult(error);
     }
     const transcript = {
       sample_id: job.job_id,
@@ -486,11 +475,7 @@ const finishIssueMapTranscript = defineTool({
         confidence: params.confidence,
       },
     };
-    return {
-      content: [{ type: "text", text: JSON.stringify(transcript) }],
-      details: transcript,
-      terminate: true,
-    };
+    return jsonToolResult(transcript, true);
   },
 });
 

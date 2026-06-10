@@ -22,6 +22,7 @@ from github_repo.services import (
     get_repo_snapshot_or_raise,
     _repo_lock,
     _repo_lock_path,
+    _enforce_snapshot_limits,
     _run_git,
 )
 from api.artifacts import (
@@ -99,6 +100,18 @@ class DocsEndpointsTests(TestCase):
         self.assertIn('/api/repo/', paths)
         self.assertIn('/api/analysis/', paths)
         self.assertIn('/api/qa/', paths)
+
+        qa_operation = cast(dict[str, object], cast(dict[str, object], paths['/api/qa/'])['post'])
+        request_body = cast(dict[str, object], qa_operation['requestBody'])
+        content = cast(dict[str, object], request_body['content'])
+        json_schema = cast(dict[str, object], cast(dict[str, object], content['application/json'])['schema'])
+        request_ref = cast(str, json_schema['$ref']).removeprefix('#/components/schemas/')
+        request_schema = cast(
+            dict[str, object],
+            cast(dict[str, object], cast(dict[str, object], payload['components'])['schemas'])[request_ref],
+        )
+        request_properties = cast(dict[str, object], request_schema['properties'])
+        self.assertIn('analysis_profile', request_properties)
 
     def test_swagger_docs_endpoint_renders_ui(self):
         response = cast(HttpResponse, self.client.get('/api/docs/'))
@@ -574,6 +587,348 @@ class ParserGraphTests(TestCase):
         edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
 
         self.assertNotIn(('app.py::outer', 'app.py::helper', 'calls'), edges)
+
+
+class ParserJavascriptTypescriptTests(TestCase):
+    def test_parse_repo_extracts_ts_symbols_and_resolves_relative_imports(self):
+        files = [
+            'src/base.ts',
+            'src/service.ts',
+            'src/types.ts',
+            'src/user.tsx',
+        ]
+        file_contents = {
+            'src/base.ts': 'export class BaseService {}\n',
+            'src/service.ts': (
+                'import { UserService } from "./user";\n'
+                'import type { UserRecord } from "./types";\n\n'
+                'export const loadUser = async (id: string): Promise<UserRecord> => ({ id });\n\n'
+                'export function routeHandler() {\n'
+                '  return loadUser("42");\n'
+                '}\n'
+            ),
+            'src/types.ts': 'export type UserRecord = { id: string };\n',
+            'src/user.tsx': (
+                'import { BaseService } from "./base";\n\n'
+                'export interface Loader {\n'
+                '  load(id: string): string;\n'
+                '}\n\n'
+                'export class UserService extends BaseService implements Loader {\n'
+                '  load(id: string) {\n'
+                '    return this.format(id);\n'
+                '  }\n\n'
+                '  format(id: string) {\n'
+                '    return `user:${id}`;\n'
+                '  }\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('python', 'javascript', 'typescript'))
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertEqual(nodes_by_id['src/service.ts::loadUser']['language'], 'typescript')
+        self.assertEqual(nodes_by_id['src/types.ts::UserRecord']['type'], 'class')
+        self.assertEqual(cast(dict[str, object], nodes_by_id['src/types.ts::UserRecord']['metadata'])['js_symbol_kind'], 'type_alias_declaration')
+        self.assertEqual(nodes_by_id['src/user.tsx::Loader']['type'], 'class')
+        self.assertEqual(cast(dict[str, object], nodes_by_id['src/user.tsx::Loader']['metadata'])['js_symbol_kind'], 'interface_declaration')
+        self.assertIn(('src/service.ts', 'module::src/user.tsx', 'imports'), edges)
+        self.assertIn(('src/service.ts', 'module::src/types.ts', 'imports'), edges)
+        self.assertIn(('src/service.ts::routeHandler', 'src/service.ts::loadUser', 'calls'), edges)
+        self.assertIn(('src/user.tsx::UserService', 'src/base.ts::BaseService', 'inherits'), edges)
+        self.assertIn(('src/user.tsx::UserService', 'src/user.tsx::Loader', 'inherits'), edges)
+        self.assertIn(('src/user.tsx::UserService::load', 'src/user.tsx::UserService::format', 'calls'), edges)
+
+    def test_parse_repo_resolves_tsconfig_path_aliases(self):
+        files = ['src/main.ts', 'src/lib/client.ts']
+        file_contents = {
+            'src/main.ts': (
+                'import { fetchUser } from "@lib/client";\n\n'
+                'export function boot() {\n'
+                '  return fetchUser();\n'
+                '}\n'
+            ),
+            'src/lib/client.ts': 'export function fetchUser() { return "ok"; }\n',
+        }
+
+        graph = parse_repo(
+            'owner/repo',
+            files,
+            lambda _repo, path: file_contents[path],
+            enabled_languages=('typescript',),
+            resolver_file_contents={
+                'tsconfig.json': json.dumps({'compilerOptions': {'baseUrl': '.', 'paths': {'@lib/*': ['src/lib/*']}}}),
+            },
+        )
+        import_edge = next(edge for edge in graph['edges'] if edge['source'] == 'src/main.ts' and edge['type'] == 'imports')
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertEqual(import_edge['target'], 'module::src/lib/client.ts')
+        self.assertEqual(cast(dict[str, object], import_edge['metadata'])['resolver'], 'tsconfig_paths')
+        self.assertIn(('src/main.ts::boot', 'src/lib/client.ts::fetchUser', 'calls'), edges)
+
+    def test_parse_repo_resolves_nested_tsconfig_path_aliases_from_config_dir(self):
+        files = ['packages/web/src/app.ts', 'packages/web/src/lib/user.ts']
+        file_contents = {
+            'packages/web/src/app.ts': (
+                'import { fetchUser } from "@/lib/user";\n\n'
+                'export function boot() {\n'
+                '  return fetchUser();\n'
+                '}\n'
+            ),
+            'packages/web/src/lib/user.ts': 'export function fetchUser() { return "ok"; }\n',
+        }
+
+        graph = parse_repo(
+            'owner/repo',
+            files,
+            lambda _repo, path: file_contents[path],
+            enabled_languages=('typescript',),
+            resolver_file_contents={
+                'packages/web/tsconfig.json': json.dumps({'compilerOptions': {'baseUrl': '.', 'paths': {'@/*': ['src/*']}}}),
+            },
+        )
+        import_edge = next(edge for edge in graph['edges'] if edge['source'] == 'packages/web/src/app.ts' and edge['type'] == 'imports')
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertEqual(import_edge['target'], 'module::packages/web/src/lib/user.ts')
+        self.assertEqual(cast(dict[str, object], import_edge['metadata'])['resolver'], 'tsconfig_paths')
+        self.assertIn(('packages/web/src/app.ts::boot', 'packages/web/src/lib/user.ts::fetchUser', 'calls'), edges)
+
+    def test_parse_repo_resolves_js_import_alias_calls_and_inheritance(self):
+        files = ['src/main.ts', 'src/base.ts', 'src/service.ts']
+        file_contents = {
+            'src/base.ts': 'export class BaseService {}\n',
+            'src/service.ts': (
+                'export function createUser() { return "ok"; }\n'
+                'export class UserService extends BaseService {}\n'
+            ),
+            'src/main.ts': (
+                'import { BaseService as Parent } from "./base";\n'
+                'import { createUser as buildUser, UserService as Service } from "./service";\n\n'
+                'export class RouteService extends Parent {}\n\n'
+                'export function route() {\n'
+                '  const service = new Service();\n'
+                '  return buildUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+        warnings = {(warning.get('code'), warning.get('target')) for warning in graph['warnings']}
+
+        self.assertIn(('src/main.ts::route', 'src/service.ts::createUser', 'calls'), edges)
+        self.assertIn(('src/main.ts::route', 'src/service.ts::UserService', 'calls'), edges)
+        self.assertIn(('src/main.ts::RouteService', 'src/base.ts::BaseService', 'inherits'), edges)
+        self.assertNotIn(('unresolved_call', 'buildUser'), warnings)
+
+    def test_parse_repo_resolves_parent_relative_js_imports(self):
+        files = ['src/routes/user.ts', 'src/services/userService.ts']
+        file_contents = {
+            'src/routes/user.ts': (
+                'import { createUser } from "../services/userService";\n\n'
+                'export function POST() {\n'
+                '  return createUser();\n'
+                '}\n'
+            ),
+            'src/services/userService.ts': 'export function createUser() { return { id: "1" }; }\n',
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+        import_edge = next(edge for edge in graph['edges'] if edge['source'] == 'src/routes/user.ts' and edge['type'] == 'imports')
+
+        self.assertEqual(import_edge['target'], 'module::src/services/userService.ts')
+        self.assertEqual(cast(dict[str, object], import_edge['metadata'])['resolver'], 'relative')
+        self.assertIn(('src/routes/user.ts::POST', 'src/services/userService.ts::createUser', 'calls'), edges)
+
+    def test_parse_repo_resolves_js_namespace_import_calls_and_inheritance(self):
+        files = ['src/main.ts', 'src/service.ts']
+        file_contents = {
+            'src/service.ts': (
+                'export class BaseService {}\n'
+                'export function createUser() { return { id: "1" }; }\n'
+            ),
+            'src/main.ts': (
+                'import * as service from "./service";\n\n'
+                'export class RouteService extends service.BaseService {}\n\n'
+                'export function route() {\n'
+                '  return service.createUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+        warnings = {(warning.get('code'), warning.get('target')) for warning in graph['warnings']}
+
+        self.assertIn(('src/main.ts::route', 'src/service.ts::createUser', 'calls'), edges)
+        self.assertIn(('src/main.ts::RouteService', 'src/service.ts::BaseService', 'inherits'), edges)
+        self.assertNotIn(('unresolved_call', 'namespace::service::createUser'), warnings)
+
+    def test_parse_repo_resolves_js_default_import_calls_and_inheritance(self):
+        files = ['src/main.ts', 'src/service.ts', 'src/base.ts']
+        file_contents = {
+            'src/service.ts': 'export default function createUser() { return { id: "1" }; }\n',
+            'src/base.ts': 'export default class UserService {}\n',
+            'src/main.ts': (
+                'import buildUser from "./service";\n'
+                'import Parent from "./base";\n\n'
+                'export class RouteService extends Parent {}\n\n'
+                'export function route() {\n'
+                '  return buildUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('src/main.ts::route', 'src/service.ts::createUser', 'calls'), edges)
+        self.assertIn(('src/main.ts::RouteService', 'src/base.ts::UserService', 'inherits'), edges)
+
+    def test_parse_repo_resolves_default_exported_arrow_function_imports(self):
+        files = ['src/main.ts', 'src/service.ts']
+        file_contents = {
+            'src/service.ts': 'export default () => ({ id: "1" });\n',
+            'src/main.ts': (
+                'import makeUser from "./service";\n\n'
+                'export function route() {\n'
+                '  return makeUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+        node_ids = {node['id'] for node in graph['nodes']}
+
+        self.assertIn('src/service.ts::default', node_ids)
+        self.assertIn(('src/main.ts::route', 'src/service.ts::default', 'calls'), edges)
+
+    def test_parse_repo_resolves_js_barrel_reexport_aliases(self):
+        files = ['src/main.ts', 'src/index.ts', 'src/service.ts']
+        file_contents = {
+            'src/service.ts': 'export function createUser() { return { id: "1" }; }\n',
+            'src/index.ts': 'export { createUser as buildUser } from "./service";\n',
+            'src/main.ts': (
+                'import { buildUser } from "./index";\n\n'
+                'export function route() {\n'
+                '  return buildUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('src/main.ts::route', 'src/service.ts::createUser', 'calls'), edges)
+
+    def test_parse_repo_resolves_js_barrel_export_all(self):
+        files = ['src/main.ts', 'src/index.ts', 'src/service.ts']
+        file_contents = {
+            'src/service.ts': 'export function createUser() { return { id: "1" }; }\n',
+            'src/index.ts': 'export * from "./service";\n',
+            'src/main.ts': (
+                'import { createUser } from "./index";\n\n'
+                'export function route() {\n'
+                '  return createUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('src/main.ts::route', 'src/service.ts::createUser', 'calls'), edges)
+
+    def test_parse_repo_resolves_namespace_imports_through_export_all_barrel(self):
+        files = ['src/main.ts', 'src/index.ts', 'src/service.ts']
+        file_contents = {
+            'src/service.ts': 'export function createUser() { return { id: "1" }; }\n',
+            'src/index.ts': 'export * from "./service";\n',
+            'src/main.ts': (
+                'import * as api from "./index";\n\n'
+                'export function route() {\n'
+                '  return api.createUser();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('src/main.ts::route', 'src/service.ts::createUser', 'calls'), edges)
+
+    def test_parse_repo_emits_and_resolves_js_type_reference_edges(self):
+        files = ['src/service.ts', 'src/types.ts']
+        file_contents = {
+            'src/types.ts': (
+                'export interface UserInput { id: string }\n'
+                'export type UserRecord = { id: string };\n'
+            ),
+            'src/service.ts': (
+                'import { UserInput, UserRecord } from "./types";\n\n'
+                'export function createUser(input: UserInput): UserRecord {\n'
+                '  return input as UserRecord;\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        edges = {(edge['source'], edge['target'], edge['type']) for edge in graph['edges']}
+
+        self.assertIn(('src/service.ts::createUser', 'src/types.ts::UserInput', 'references'), edges)
+        self.assertIn(('src/service.ts::createUser', 'src/types.ts::UserRecord', 'references'), edges)
+
+    def test_parse_repo_skips_ignored_js_ts_paths_without_missing_content_warning(self):
+        files = ['node_modules/pkg/index.ts']
+        content_calls: list[str] = []
+
+        def get_content(_repo, path):
+            content_calls.append(path)
+            return None
+
+        graph = parse_repo('owner/repo', files, get_content, enabled_languages=('typescript',))
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+        warnings = {(warning.get('code'), warning.get('path')) for warning in graph['warnings']}
+        metadata = cast(dict[str, object], nodes_by_id['node_modules/pkg/index.ts']['metadata'])
+
+        self.assertEqual(content_calls, [])
+        self.assertEqual(metadata['skip_reason'], 'generated_or_vendor')
+        self.assertTrue(metadata['ignored'])
+        self.assertFalse(metadata['analyzed'])
+        self.assertNotIn(('missing_content', 'node_modules/pkg/index.ts'), warnings)
+
+    def test_parse_repo_does_not_warn_for_unresolved_js_member_calls(self):
+        files = ['src/route.ts']
+        file_contents = {
+            'src/route.ts': (
+                'export function POST(request) {\n'
+                '  missingCall();\n'
+                '  return request.json();\n'
+                '}\n'
+            ),
+        }
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('typescript',))
+        warnings = {(warning.get('code'), warning.get('target')) for warning in graph['warnings']}
+
+        self.assertIn(('unresolved_call', 'missingCall'), warnings)
+        self.assertNotIn(('unresolved_call', 'namespace::request::json'), warnings)
+
+    def test_js_ts_files_are_file_only_when_profile_only_enables_python(self):
+        files = ['src/app.ts']
+        file_contents = {'src/app.ts': 'export function run() { return true; }\n'}
+
+        graph = parse_repo('owner/repo', files, lambda _repo, path: file_contents[path], enabled_languages=('python',))
+        nodes_by_id = {node['id']: node for node in graph['nodes']}
+
+        self.assertIn('src/app.ts', nodes_by_id)
+        self.assertNotIn('src/app.ts::run', nodes_by_id)
+        self.assertTrue(cast(dict[str, object], nodes_by_id['src/app.ts']['metadata'])['unsupported'])
 
 
 class ParserDirectorySymbolTests(TestCase):
@@ -1054,7 +1409,10 @@ class GraphArtifactContractTests(TestCase):
                 'default_branch',
                 'generated_at',
                 'status',
+                'analysis_profile',
                 'limits',
+                'languages',
+                'file_manifest',
                 'file_contents',
                 'tree',
                 'nodes',
@@ -1308,6 +1666,56 @@ class AnalysisArtifactServiceTests(TestCase):
 
     @patch('api.services.parse_repo')
     @patch('api.services.get_repo_snapshot')
+    @patch('api.services.get_file_content_or_raise', return_value='export function main() { return true; }\n')
+    def test_get_repo_analysis_keeps_profile_caches_separate_for_same_revision(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
+        get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py', 'src/app.ts'])
+        parse_repo_mock.return_value = {
+            'tree': [],
+            'nodes': [],
+            'edges': [],
+        }
+
+        python_analysis = get_repo_analysis('owner/repo', analysis_profile='python-v1')
+        multi_analysis = get_repo_analysis('owner/repo', analysis_profile='multi-lang-js-ts-v1')
+        cached_python_analysis = get_repo_analysis('owner/repo', analysis_profile='python-v1')
+
+        self.assertEqual(parse_repo_mock.call_count, 2)
+        self.assertEqual(parse_repo_mock.call_args_list[0].kwargs['enabled_languages'], ('python',))
+        self.assertEqual(parse_repo_mock.call_args_list[1].kwargs['enabled_languages'], ('python', 'javascript', 'typescript'))
+        self.assertEqual(cast(dict[str, object], python_analysis)['analysis_profile'], 'python-v1')
+        self.assertEqual(cast(dict[str, object], multi_analysis)['analysis_profile'], 'multi-lang-js-ts-v1')
+        self.assertEqual(cast(dict[str, object], cached_python_analysis)['analysis_profile'], 'python-v1')
+        self.assertEqual(cast(dict[str, object], python_analysis)['languages'], ['python'])
+        self.assertEqual(cast(dict[str, object], multi_analysis)['languages'], ['python', 'typescript'])
+        self.assertEqual(get_repo_snapshot_mock.call_args_list[0].kwargs['enabled_languages'], ('python',))
+        self.assertEqual(get_repo_snapshot_mock.call_args_list[1].kwargs['enabled_languages'], ('python', 'javascript', 'typescript'))
+        self.assertTrue((settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'graph.json').is_file())
+        self.assertTrue((settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'multi-lang-js-ts-v1' / 'graph.json').is_file())
+        self.assertEqual(
+            set(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED).values_list('analysis_profile', flat=True)),
+            {'python-v1', 'multi-lang-js-ts-v1'},
+        )
+
+    def test_source_manifest_keeps_python_vendor_files_but_skips_js_ts_vendor_files(self):
+        api_services_module = importlib.import_module('api.services')
+
+        selected_files, languages, manifest, warnings = api_services_module._source_file_manifest(
+            ['vendor/pkg.py', 'node_modules/pkg/index.ts', 'src/app.ts'],
+            ('python', 'typescript'),
+        )
+
+        self.assertIn('vendor/pkg.py', selected_files)
+        self.assertIn('src/app.ts', selected_files)
+        self.assertNotIn('node_modules/pkg/index.ts', selected_files)
+        self.assertEqual(languages, ['python', 'typescript'])
+        self.assertTrue(cast(dict[str, object], manifest['vendor/pkg.py'])['content_stored'])
+        self.assertIsNone(cast(dict[str, object], manifest['vendor/pkg.py'])['skip_reason'])
+        self.assertFalse(cast(dict[str, object], manifest['node_modules/pkg/index.ts'])['content_stored'])
+        self.assertEqual(cast(dict[str, object], manifest['node_modules/pkg/index.ts'])['skip_reason'], 'generated_or_vendor')
+        self.assertIn(('generated_or_vendor_file_skipped', 'node_modules/pkg/index.ts'), {(warning['code'], warning['path']) for warning in warnings})
+
+    @patch('api.services.parse_repo')
+    @patch('api.services.get_repo_snapshot')
     @patch('api.services.get_file_content_or_raise', return_value='def main():\n    pass\n')
     def test_get_repo_analysis_returns_v1_artifact_without_breaking_graph_aliases(self, get_file_content_mock, get_repo_snapshot_mock, parse_repo_mock):
         get_repo_snapshot_mock.return_value = ('abc123', ['pkg/app.py'])
@@ -1405,7 +1813,23 @@ class AnalysisArtifactServiceTests(TestCase):
         self.assertIsNotNone(analysis)
         analysis_payload = cast(dict[str, object], analysis)
         self.assertEqual(analysis_payload['revision'], 'abc123')
-        get_repo_snapshot_mock.assert_called_once_with('owner/repo')
+        get_repo_snapshot_mock.assert_called_once_with('owner/repo', enabled_languages=('python',))
+
+    @override_settings(GITHUB_REPO_MAX_JS_TS_FILES=1)
+    def test_snapshot_limits_apply_js_ts_cap_when_enabled_by_profile(self):
+        with self.assertRaises(RepoIngestionError) as caught:
+            _enforce_snapshot_limits(['src/a.ts', 'src/b.ts'], enabled_languages=('typescript',))
+
+        self.assertEqual(caught.exception.code, 'too_large')
+        self.assertEqual(caught.exception.metadata['limit_type'], 'max_analyzed_files:javascript')
+        _enforce_snapshot_limits(['src/a.ts', 'src/b.ts'], enabled_languages=('python',))
+
+    @override_settings(GITHUB_REPO_MAX_JS_TS_FILES=1)
+    def test_snapshot_limits_ignore_skipped_js_ts_paths(self):
+        _enforce_snapshot_limits(
+            ['node_modules/a.ts', 'node_modules/b.ts', 'src/app.ts'],
+            enabled_languages=('typescript',),
+        )
 
     @patch('api.services.get_repo_snapshot')
     def test_get_repo_analysis_can_load_cached_revision_without_snapshot(self, get_repo_snapshot_mock):
@@ -2163,6 +2587,35 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertEqual(labels[0]['name'], 'parser')
         self.assertTrue(any('Parser timeout error' in str(item['text']) for item in quoted_errors))
         self.assertIn('rm -rf / should be ignored as text', cast(list[dict[str, object]], evidence['comments'])[0]['body'])
+
+    def test_extract_issue_evidence_reads_javascript_stack_frames_and_tests(self):
+        issue = github_issue_payload(
+            body=(
+                'TypeError: Cannot read properties of undefined\n'
+                '    at createUser (src/services/userService.ts:7:25)\n'
+                '    at POST (src/routes/user.ts:5:21)\n'
+                '    at render (src/components/UserCard.tsx:12:3)\n'
+                '    at hydrate (src/components/UserPanel.jsx:4:9)\n'
+                'Vitest shows src/services/userService.test.ts:8:5 still passes.'
+            ),
+        )
+
+        evidence = extract_issue_evidence(issue)
+
+        stack_frames = cast(list[dict[str, object]], evidence['stack_frames'])
+        file_mentions = cast(list[dict[str, object]], evidence['file_mentions'])
+        test_mentions = cast(list[dict[str, object]], evidence['test_mentions'])
+
+        self.assertIn(
+            {'path': 'src/services/userService.ts', 'line': 7, 'column': 25, 'symbol': 'createUser', 'source': 'body', 'confidence': 1.0},
+            stack_frames,
+        )
+        self.assertTrue(any(item['path'] == 'src/routes/user.ts' and item['line'] == 5 and item['column'] == 21 for item in file_mentions))
+        self.assertTrue(any(item['path'] == 'src/components/UserCard.tsx' and item['line'] == 12 and item['column'] == 3 for item in stack_frames))
+        self.assertTrue(any(item['path'] == 'src/components/UserPanel.jsx' and item['line'] == 4 and item['column'] == 9 for item in stack_frames))
+        self.assertFalse(any(item['path'] in {'src/components/UserCard.ts', 'src/components/UserPanel.js'} for item in [*stack_frames, *file_mentions]))
+        self.assertTrue(any(item.get('path') == 'src/services/userService.test.ts' for item in test_mentions))
+        self.assertTrue(any(item.get('keyword') == 'test_failure' for item in test_mentions))
 
     def test_extract_issue_evidence_returns_route_config_exception_test_and_quoted_string_evidence(self):
         issue = github_issue_payload(
@@ -3126,6 +3579,27 @@ class AnalysisEndpointVerticalSliceTests(TestCase):
         self.assertEqual(payload['revision'], created_payload['revision'])
 
     @patch('github_repo.services._repo_clone_url')
+    def test_get_analysis_accepts_analysis_profile_query(self, repo_clone_url):
+        repo_clone_url.return_value = str(self.source_repo)
+
+        response = cast(
+            HttpResponse,
+            self.client.get(
+                '/api/analysis/',
+                {
+                    'url': 'https://github.com/owner/repo',
+                    'analysis_profile': 'multi-lang-js-ts-v1',
+                },
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        artifact = cast(dict[str, object], payload['artifact'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['analysis_profile'], 'multi-lang-js-ts-v1')
+        self.assertEqual(artifact['analysis_profile'], 'multi-lang-js-ts-v1')
+
+    @patch('github_repo.services._repo_clone_url')
     def test_tree_and_graph_endpoints_reuse_analysis_artifact(self, repo_clone_url):
         repo_clone_url.return_value = str(self.source_repo)
         created = cast(
@@ -3177,6 +3651,23 @@ class AnalysisEndpointVerticalSliceTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload['analysis_id'], analysis_id)
         self.assertEqual(artifact['revision'], created_payload['revision'])
+
+    def test_analysis_detail_includes_profile_for_non_succeeded_run(self):
+        repository = Repository.objects.create(provider='github', owner='owner', name='repo', full_name='owner/repo')
+        analysis_run = AnalysisRun.objects.create(
+            repository=repository,
+            ref='HEAD',
+            revision='',
+            analysis_profile='multi-lang-js-ts-v1',
+            status=AnalysisRun.STATUS_STARTED,
+        )
+
+        response = cast(HttpResponse, self.client.get(f'/api/analysis/{analysis_run.id}/'))
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload['analysis_profile'], 'multi-lang-js-ts-v1')
+        self.assertIsNone(payload['artifact'])
 
     def test_analysis_endpoint_rejects_invalid_url(self):
         response = cast(
@@ -3689,10 +4180,12 @@ class ShareEmbedPublicApiTests(TestCase):
     def _clone_url(self) -> str:
         return f'file://{self.source_repo}'
 
-    def _create_share(self, *, mode='fixed', revision=None):
+    def _create_share(self, *, mode='fixed', revision=None, analysis_profile=None):
         data = {'repo_url': 'https://github.com/owner/repo', 'mode': mode}
         if revision is not None:
             data['revision'] = revision
+        if analysis_profile is not None:
+            data['analysis_profile'] = analysis_profile
         return cast(
             HttpResponse,
             self.client.post('/api/share/', data=data, content_type='application/json'),
@@ -3796,6 +4289,29 @@ class ShareEmbedPublicApiTests(TestCase):
         self.assertEqual(retrieve_payload['revision'], head_revision)
         self.assertEqual(share_link.analysis_run.revision, head_revision)
         self.assertEqual(AnalysisArtifact.objects.count(), 2)
+
+    @patch('github_repo.services._repo_clone_url')
+    def test_latest_share_preserves_created_analysis_profile_on_retrieve(self, repo_clone_url):
+        repo_clone_url.return_value = self._clone_url()
+        create_response = self._create_share(mode='latest', analysis_profile='multi-lang-js-ts-v1')
+        create_payload = cast(dict[str, object], json.loads(create_response.content))
+        write_files(
+            self.source_repo,
+            {'pkg/app.py': 'def greet():\n    return "v2"\n\ndef helper():\n    return greet()\n'},
+        )
+        head_revision = commit_all(self.source_repo, 'v2')
+
+        retrieve_response = cast(HttpResponse, self.client.get(f'/api/share/{create_payload["share_id"]}/'))
+        retrieve_payload = cast(dict[str, object], json.loads(retrieve_response.content))
+        share_link = ShareLink.objects.select_related('analysis_run').get(token=create_payload['share_id'])
+
+        self.assertEqual(create_response.status_code, 201)
+        self.assertEqual(retrieve_response.status_code, 200)
+        self.assertEqual(create_payload['analysis_profile'], 'multi-lang-js-ts-v1')
+        self.assertEqual(retrieve_payload['analysis_profile'], 'multi-lang-js-ts-v1')
+        self.assertEqual(retrieve_payload['revision'], head_revision)
+        self.assertEqual(share_link.analysis_run.analysis_profile, 'multi-lang-js-ts-v1')
+        self.assertFalse(AnalysisRun.objects.filter(status=AnalysisRun.STATUS_SUCCEEDED, analysis_profile='python-v1').exists())
 
     @patch('github_repo.services._repo_clone_url')
     def test_embed_endpoint_returns_html_without_global_frame_header(self, repo_clone_url):

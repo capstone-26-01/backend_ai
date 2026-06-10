@@ -34,6 +34,7 @@ class AnalysisRun(models.Model):
     repository = models.ForeignKey(Repository, on_delete=models.CASCADE, related_name='analysis_runs')
     ref = models.CharField(max_length=255, default='HEAD')
     revision = models.CharField(max_length=255, blank=True)
+    analysis_profile = models.CharField(max_length=128, default='python-v1')
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_STARTED)
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(blank=True, null=True)
@@ -43,18 +44,19 @@ class AnalysisRun(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=['repository', 'revision'],
+                fields=['repository', 'revision', 'analysis_profile'],
                 condition=models.Q(status='succeeded'),
-                name='unique_succeeded_analysis_run_per_revision',
+                name='unique_succeeded_analysis_run_per_revision_profile',
             ),
         ]
         indexes = [
             models.Index(fields=['repository', 'revision', 'status']),
+            models.Index(fields=['repository', 'revision', 'analysis_profile', 'status']),
         ]
         ordering = ['-started_at']
 
     def __str__(self):
-        return f'{self.repository.full_name}@{self.revision or "unknown"} {self.status}'
+        return f'{self.repository.full_name}@{self.revision or "unknown"} {self.analysis_profile} {self.status}'
 
 
 class AnalysisArtifact(models.Model):

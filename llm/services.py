@@ -282,7 +282,7 @@ def _answer_question_classic(
 
     if not qa_context.context_files or not qa_context.context.strip():
         return {
-            'answer': '분석 가능한 Python 코드 문맥을 찾지 못했습니다.',
+            'answer': '분석 가능한 source 코드 문맥을 찾지 못했습니다.',
             'citations': [],
             'selected_nodes': qa_context.selected_nodes,
             'context_files': qa_context.context_files,
@@ -358,7 +358,7 @@ def stream_answer_question(
         yield {
             'event': 'final',
             'data': {
-                'answer': '분석 가능한 Python 코드 문맥을 찾지 못했습니다.',
+                'answer': '분석 가능한 source 코드 문맥을 찾지 못했습니다.',
                 'citations': [],
                 'selected_nodes': qa_context.selected_nodes,
                 'context_files': qa_context.context_files,
