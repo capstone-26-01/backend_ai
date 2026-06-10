@@ -2531,11 +2531,15 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
             ),
         )
         first_payload = cast(dict[str, object], json.loads(first.content))
+        expected_cache_key = 'issue_map:42:v2:comments_false:ctx_2:nodes_3:harness_off'
         self.assertEqual(first.status_code, 200)
+        self.assertFalse(first_payload['cached'])
+        self.assertEqual(first_payload['cache_key'], expected_cache_key)
+        self.assertEqual(first_payload['cache_version'], 'v2')
         self.assertEqual(requests_get.call_count, 1)
         artifact = AnalysisArtifact.objects.get(analysis_run=analysis_run)
         summaries = cast(dict[str, object], artifact.payload['summaries'])
-        self.assertIn('issue_map:42:v2:comments_false:ctx_2:nodes_3:harness_off', summaries)
+        self.assertIn(expected_cache_key, summaries)
 
         requests_get.reset_mock()
         with patch('api.services.rank_issue_candidates', side_effect=AssertionError('cached issue map must not rank again')):
@@ -2550,6 +2554,9 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         second_payload = cast(dict[str, object], json.loads(second.content))
 
         self.assertEqual(second.status_code, 200)
+        self.assertTrue(second_payload['cached'])
+        self.assertEqual(second_payload['cache_key'], expected_cache_key)
+        self.assertEqual(second_payload['cache_version'], 'v2')
         self.assertEqual(second_payload['selected_node_ids'], first_payload['selected_node_ids'])
         requests_get.assert_not_called()
 

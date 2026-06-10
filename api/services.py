@@ -1149,7 +1149,13 @@ def _cached_issue_map_response(artifact: AnalysisArtifact, cache_key: str) -> di
     if not isinstance(summaries, dict):
         return None
     cached = summaries.get(cache_key)
-    return dict(cached) if isinstance(cached, dict) else None
+    if not isinstance(cached, dict):
+        return None
+    response = dict(cached)
+    response['cached'] = True
+    response['cache_key'] = cache_key
+    response['cache_version'] = ISSUE_MAP_CACHE_VERSION
+    return response
 
 
 def _store_issue_map_response_cache(artifact: AnalysisArtifact, cache_key: str, response: dict[str, Any]) -> None:
@@ -1321,6 +1327,9 @@ def get_issue_map_response(
         'harness': harness,
         'limits': limits,
         'warnings': warnings,
+        'cached': False,
+        'cache_key': cache_key,
+        'cache_version': ISSUE_MAP_CACHE_VERSION,
     }
     if cache_enabled:
         _store_issue_map_response_cache(artifact, cache_key, response)

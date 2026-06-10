@@ -653,6 +653,9 @@ _ISSUE_RELATED_NODES_RESPONSE_EXAMPLE = {
     'provider': 'github',
     'source': 'mock',
     'mock': True,
+    'cached': False,
+    'cache_key': 'issue_map:42:v2:comments_false:ctx_4:nodes_8:harness_off',
+    'cache_version': 'v2',
     'issue': {
         'key': 'github:owner/repo#42',
         'number': 42,
