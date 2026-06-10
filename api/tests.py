@@ -41,7 +41,7 @@ from api.issue_map import (
 )
 from api.models import AnalysisArtifact, AnalysisRun, Repository, ShareLink
 from api.serializers import extract_repo_path, is_safe_graph_id, is_safe_ref, is_safe_repo_file_path, is_safe_revision, is_safe_share_id
-from api.services import build_issue_navigation_guide, get_artifact_by_revision, get_repo_analysis
+from api.services import build_issue_navigation_guide, get_artifact_by_revision, get_repo_analysis, issue_candidates_are_low_confidence
 from api.test_utils import (
     EVAL_RUBRIC,
     ISSUE_MAP_FIXTURE,
@@ -2297,6 +2297,35 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertEqual(guide['avoid'], [])
         self.assertIn('sample_warning', cast(dict[str, object], guide['guidance_summary'])['warning_codes'])
 
+    def test_low_confidence_guide_returns_search_steps_without_start_node(self):
+        candidates = [
+            {
+                'node_id': 'api/views.py::analysis',
+                'score': 1.0,
+                'raw_score': 25,
+                'node': {'id': 'api/views.py::analysis', 'kind': 'function', 'label': 'analysis', 'path': 'api/views.py', 'start_line': 10, 'end_line': 20},
+                'reason': 'Issue evidence did not match directly; using entrypoint/key module fallback.',
+                'evidence': [{'type': 'fallback', 'message': 'fallback'}],
+            }
+        ]
+        warnings = [{'code': 'no_ranked_issue_nodes', 'message': 'fallback'}]
+
+        self.assertTrue(issue_candidates_are_low_confidence(candidates, warnings))
+        guide = build_issue_navigation_guide(
+            candidates=candidates,
+            hypotheses=[{'node_id': 'api/views.py::analysis', 'confidence': 1.0, 'rationale': 'fallback'}],
+            investigation_path=[{'node_id': 'api/views.py::analysis', 'path': 'api/views.py', 'action': 'inspect', 'why': 'fallback'}],
+            confidence={'level': 'low', 'score': 0.34},
+            warnings=warnings,
+            evidence=extract_issue_evidence(github_issue_payload(title='Please investigate timeout', body='Timeout appears in related-nodes output.')),
+            low_confidence=True,
+        )
+
+        self.assertIsNone(guide['start_here'])
+        self.assertEqual(cast(dict[str, object], guide['guidance_summary'])['mode'], 'low_confidence')
+        self.assertIn('timeout', cast(list[str], cast(dict[str, object], guide['guidance_summary'])['search_terms']))
+        self.assertEqual(cast(list[dict[str, object]], guide['next_steps'])[0]['action'], 'search')
+
     def test_focus_graph_projection_keeps_highlights_real_and_edges_valid(self):
         analysis = build_issue_map_analysis_artifact()
         evidence = extract_issue_evidence(github_issue_payload(body='api/services.py _build_and_store_analysis parse_repo()'))
@@ -2397,6 +2426,34 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertLessEqual(len(cast(list[dict[str, object]], payload['next_steps'])), 3)
         self.assertEqual(payload['avoid'], [])
         self.assertEqual(requests_get.call_count, 2)
+
+    @override_settings(ISSUE_HARNESS_ENABLED=False)
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_vague_issue_returns_low_confidence_guidance(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.return_value = MockGithubHttpResponse(
+            payload=github_issue_payload(title='Please investigate flaky behavior', body='It fails sometimes but no stack trace is available.', labels=[], comments=0),
+            url='https://api.github.com/repos/owner/repo/issues/42',
+        )
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/issues/related-nodes/',
+                data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 3, 'include_comments': False, 'max_context_files': 2},
+                content_type='application/json',
+            ),
+        )
+        payload = cast(dict[str, object], json.loads(response.content))
+        confidence = cast(dict[str, object], payload['confidence'])
+        summary = cast(dict[str, object], payload['guidance_summary'])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(confidence['level'], 'low')
+        self.assertIsNone(payload['start_here'])
+        self.assertEqual(summary['mode'], 'low_confidence')
+        self.assertIn('flaky', cast(list[str], summary['search_terms']))
+        self.assertTrue(all(step['action'] == 'search' for step in cast(list[dict[str, object]], payload['next_steps'])))
 
     @patch('github_repo.services.requests.get')
     def test_related_nodes_rejects_analysis_statuses_before_github_calls(self, requests_get):
@@ -2708,6 +2765,46 @@ class IssueMapHarnessExplanationTests(ExternalHttpBlockedMixin, TestCase):
         warning_codes = {str(warning['code']) for warning in cast(list[dict[str, object]], payload['warnings'])}
         self.assertIn('harness_no_valid_nodes', warning_codes)
         self.assertNotEqual(cast(dict[str, object], payload['confidence']).get('source'), 'llm')
+        self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'deterministic')
+
+    @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_hallucinated_harness_with_weak_issue_returns_low_confidence(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.return_value = MockGithubHttpResponse(
+            payload=github_issue_payload(title='Please investigate flaky behavior', body='It fails sometimes but no stack trace is available.', labels=[], comments=0),
+            url='https://api.github.com/repos/owner/repo/issues/42',
+        )
+        harness_result = IssueHarnessResult(
+            output={
+                'hypotheses': [{'node_id': 'missing.py::fake', 'confidence': 0.99, 'rationale': 'unsupported'}],
+                'investigation_path': [{'node_id': 'missing.py::fake', 'path': 'missing.py', 'why': 'unsupported'}],
+                'confidence': {'level': 'high', 'score': 0.99},
+            },
+            tool_calls=[
+                {'name': 'get_issue_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'search_repo_symbols', 'arguments': {'query': 'flaky'}},
+                {'name': 'read_node_context', 'arguments': {'node_id': 'missing.py::fake'}},
+            ],
+            metadata={'variant_id': 'test-runtime-harness'},
+        )
+
+        with patch('api.services.run_issue_harness', return_value=harness_result):
+            response = cast(
+                HttpResponse,
+                self.client.post(
+                    '/api/issues/related-nodes/',
+                    data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 3, 'include_comments': False, 'max_context_files': 2},
+                    content_type='application/json',
+                ),
+            )
+        payload = cast(dict[str, object], json.loads(response.content))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(cast(dict[str, object], payload['confidence'])['level'], 'low')
+        self.assertIsNone(payload['start_here'])
+        self.assertEqual(cast(dict[str, object], payload['guidance_summary'])['mode'], 'low_confidence')
         self.assertEqual(cast(dict[str, object], payload['harness'])['source'], 'deterministic')
 
     @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)

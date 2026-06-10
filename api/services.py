@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import tempfile
 from typing import Any
@@ -768,6 +769,91 @@ def _issue_confidence(candidates: list[dict[str, Any]], warnings: list[dict[str,
     }
 
 
+STRONG_ISSUE_EVIDENCE_TYPES = {
+    'stack_frame',
+    'file_path',
+    'file_symbol',
+    'file_line',
+    'symbol',
+    'route',
+    'config',
+    'exception_message',
+    'exception_class',
+    'quoted_string',
+    'test',
+    'harness',
+}
+WEAK_ISSUE_EVIDENCE_TYPES = {'fallback', 'label', 'lexical', 'test_penalty'}
+LOW_CONFIDENCE_WARNING_CODES = {'no_ranked_issue_nodes', 'low_confidence_issue_ranking', 'weak_issue_evidence'}
+
+
+def issue_candidates_are_low_confidence(candidates: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> bool:
+    warning_codes = {str(warning.get('code')) for warning in warnings if isinstance(warning, dict)}
+    if warning_codes & LOW_CONFIDENCE_WARNING_CODES:
+        return True
+    if not candidates:
+        return True
+    top = candidates[0]
+    try:
+        raw_score = float(top.get('raw_score'))
+    except (TypeError, ValueError):
+        raw_score = float(top.get('score') or 0.0) * 100
+    evidence_types = {
+        str(item.get('type'))
+        for item in top.get('evidence') or []
+        if isinstance(item, dict) and item.get('type')
+    }
+    if raw_score < 40 and 'harness' not in evidence_types:
+        return True
+    if evidence_types and evidence_types.issubset(WEAK_ISSUE_EVIDENCE_TYPES):
+        return True
+    if evidence_types and not (evidence_types & STRONG_ISSUE_EVIDENCE_TYPES):
+        return True
+    top_kinds = [
+        str((candidate.get('node') or {}).get('kind') or (candidate.get('node') or {}).get('type') or '')
+        for candidate in candidates[:3]
+        if isinstance(candidate.get('node'), dict)
+    ]
+    return bool(top_kinds) and all(kind in {'directory', 'file'} for kind in top_kinds)
+
+
+def _low_confidence_confidence(confidence: dict[str, Any], warnings: list[dict[str, Any]]) -> dict[str, Any]:
+    warning_codes = {str(warning.get('code')) for warning in warnings if isinstance(warning, dict) and warning.get('code')}
+    reasons = [str(reason) for reason in confidence.get('reasons') or [] if reason]
+    reasons.insert(0, 'Issue evidence is too weak to identify an exact starting node.')
+    return {
+        **confidence,
+        'level': 'low',
+        'score': round(min(float(confidence.get('score') or 0.0), 0.34), 3),
+        'reasons': reasons[:5],
+        'warning_codes': sorted({*warning_codes, *[str(code) for code in confidence.get('warning_codes') or [] if code]}),
+    }
+
+
+def _issue_search_terms(evidence: dict[str, Any] | None) -> list[str]:
+    if not isinstance(evidence, dict):
+        return []
+    raw_parts = [
+        str(evidence.get('query') or ''),
+        ' '.join(str(item.get('symbol') or '') for item in evidence.get('symbol_mentions') or [] if isinstance(item, dict)),
+        ' '.join(str(item.get('path') or '') for item in evidence.get('file_mentions') or [] if isinstance(item, dict)),
+        ' '.join(str(item.get('route') or '') for item in evidence.get('route_mentions') or [] if isinstance(item, dict)),
+        ' '.join(str(item.get('name') or '') for item in evidence.get('config_mentions') or [] if isinstance(item, dict)),
+        ' '.join(str(item.get('class') or '') for item in evidence.get('exception_mentions') or [] if isinstance(item, dict)),
+        ' '.join(str(item.get('text') or '') for item in evidence.get('quoted_strings') or [] if isinstance(item, dict)),
+    ]
+    terms: list[str] = []
+    generic = {'issue', 'error', 'failed', 'failure', 'bug', 'please', 'investigate', 'github', 'python'}
+    for token in re.findall(r'[A-Za-z_][A-Za-z0-9_./:-]{2,}|[가-힣]{2,}', ' '.join(raw_parts)):
+        normalized = token.strip('.,:;()[]{}').lower()
+        if len(normalized) < 3 or normalized in generic or normalized not in terms:
+            if len(normalized) >= 3 and normalized not in generic:
+                terms.append(normalized)
+        if len(terms) >= 8:
+            break
+    return terms
+
+
 def _guide_candidate_by_id(candidates: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {
         str(candidate.get('node_id')): candidate
@@ -846,14 +932,50 @@ def build_issue_navigation_guide(
     investigation_path: list[dict[str, Any]],
     confidence: dict[str, Any],
     warnings: list[dict[str, Any]],
+    evidence: dict[str, Any] | None = None,
     low_confidence: bool = False,
 ) -> dict[str, Any]:
     warning_codes = {str(warning.get('code')) for warning in warnings if isinstance(warning, dict)}
     start_candidate, start_source = _guide_start_candidate(candidates, hypotheses, investigation_path)
     mode = 'harness' if confidence.get('source') == 'harness' else 'deterministic'
     if low_confidence or start_candidate is None:
-        message = 'No exact starting node was identified from the issue evidence.'
-        return {'start_here': None, 'next_steps': [], 'avoid': [], 'guidance_summary': {'mode': mode, 'message': message, 'warning_codes': sorted(code for code in warning_codes if code)}}
+        search_terms = _issue_search_terms(evidence)
+        exploratory_steps: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        term_text = ', '.join(search_terms[:3]) if search_terms else 'the reproduced error'
+        for candidate in candidates:
+            if len(exploratory_steps) >= 3:
+                break
+            node = _guide_node_from_candidate(candidate)
+            path = node.get('path')
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(str(path))
+            exploratory_steps.append(
+                {
+                    'node_id': str(candidate.get('node_id') or node.get('id') or ''),
+                    'path': path,
+                    'start_line': node.get('start_line'),
+                    'end_line': node.get('end_line'),
+                    'label': node.get('label') or candidate.get('node_id'),
+                    'kind': node.get('kind') or node.get('type') or '',
+                    'action': 'search',
+                    'why': f'Issue evidence is weak; reproduce the issue and search this file for {term_text}.',
+                }
+            )
+        message = 'No exact origin was found. Reproduce the issue and search these terms first.'
+        return {
+            'start_here': None,
+            'next_steps': exploratory_steps,
+            'avoid': [],
+            'guidance_summary': {
+                'mode': 'low_confidence',
+                'message': message,
+                'search_terms': search_terms,
+                'warning_codes': sorted(code for code in warning_codes if code),
+                'source_mode': mode,
+            },
+        }
 
     start_node_id = str(start_candidate.get('node_id'))
     start_why = start_source.get('why') if isinstance(start_source, dict) else None
@@ -1115,12 +1237,17 @@ def get_issue_map_response(
             warnings.append(_issue_harness_warning(error))
     else:
         warnings.append({'code': 'harness_disabled', 'message': 'Issue harness flag가 꺼져 있어 deterministic issue ranking을 반환했습니다.'})
+    low_confidence = confidence.get('source') != 'harness' and issue_candidates_are_low_confidence(candidates, warnings)
+    if low_confidence:
+        confidence = _low_confidence_confidence(confidence, warnings)
     guide = build_issue_navigation_guide(
         candidates=candidates,
         hypotheses=hypotheses,
         investigation_path=investigation_path,
         confidence=confidence,
         warnings=warnings,
+        evidence=evidence,
+        low_confidence=low_confidence,
     )
 
     return {
