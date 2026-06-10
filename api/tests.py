@@ -2575,7 +2575,7 @@ class IssueMapHarnessExplanationTests(ExternalHttpBlockedMixin, TestCase):
                 {'name': 'get_issue_context', 'arguments': {}},
                 {'name': 'list_repo_files', 'arguments': {}},
                 {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
-                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+                {'name': 'read_node_context', 'arguments': {'node_id': 'parser/services.py::parse_repo'}},
             ],
             metadata={'variant_id': 'test-runtime-harness'},
         )
@@ -2598,11 +2598,14 @@ class IssueMapHarnessExplanationTests(ExternalHttpBlockedMixin, TestCase):
         harness_tool_names = [call['name'] for call in cast(list[dict[str, object]], cast(dict[str, object], payload['harness'])['tool_calls'])]
         self.assertIn('get_issue_context', harness_tool_names)
         self.assertIn('search_repo_symbols', harness_tool_names)
+        self.assertIn('read_node_context', harness_tool_names)
         run_harness.assert_called_once()
         harness_job = run_harness.call_args.args[0]
         self.assertIn('graph', harness_job)
         self.assertIn('file_contents', harness_job)
         self.assertIn('parser/services.py', harness_job['file_contents'])
+        harness_job_tool_names = {tool['name'] for tool in harness_job['available_tools']}
+        self.assertIn('read_node_context', harness_job_tool_names)
 
     @override_settings(ISSUE_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
     @patch('github_repo.services.requests.get')
@@ -2613,7 +2616,7 @@ class IssueMapHarnessExplanationTests(ExternalHttpBlockedMixin, TestCase):
             mock_github_issue_comments_response(issue_number=42, count=2),
         ]
 
-        with patch('api.services.run_issue_harness', side_effect=IssueHarnessUnavailable('harness_missing_inspection', 'Issue harness must inspect code or graph neighbors before naming origin nodes.')):
+        with patch('api.services.run_issue_harness', side_effect=IssueHarnessUnavailable('harness_missing_inspection', 'Issue harness must inspect code, node context, or graph neighbors before naming origin nodes.')):
             status_code, payload = self._post_related_nodes(analysis_run)
 
         self.assertEqual(status_code, 200)
