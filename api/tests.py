@@ -2455,6 +2455,96 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertIn('flaky', cast(list[str], summary['search_terms']))
         self.assertTrue(all(step['action'] == 'search' for step in cast(list[dict[str, object]], payload['next_steps'])))
 
+    @override_settings(ISSUE_HARNESS_ENABLED=False)
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_reuses_cached_deterministic_guidance(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.return_value = mock_github_issue_detail_response(issue_number=42)
+
+        first = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/issues/related-nodes/',
+                data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 3, 'include_comments': False, 'max_context_files': 2},
+                content_type='application/json',
+            ),
+        )
+        first_payload = cast(dict[str, object], json.loads(first.content))
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(requests_get.call_count, 1)
+        artifact = AnalysisArtifact.objects.get(analysis_run=analysis_run)
+        summaries = cast(dict[str, object], artifact.payload['summaries'])
+        self.assertIn('issue_map:42:v2:comments_false:ctx_2:nodes_3:harness_off', summaries)
+
+        requests_get.reset_mock()
+        with patch('api.services.rank_issue_candidates', side_effect=AssertionError('cached issue map must not rank again')):
+            second = cast(
+                HttpResponse,
+                self.client.post(
+                    '/api/issues/related-nodes/',
+                    data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 3, 'include_comments': False, 'max_context_files': 2},
+                    content_type='application/json',
+                ),
+            )
+        second_payload = cast(dict[str, object], json.loads(second.content))
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second_payload['selected_node_ids'], first_payload['selected_node_ids'])
+        requests_get.assert_not_called()
+
+    @override_settings(ISSUE_HARNESS_ENABLED=False)
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_cache_key_varies_by_limits(self, requests_get):
+        analysis_run = self._create_analysis_run()
+        requests_get.side_effect = [
+            mock_github_issue_detail_response(issue_number=42),
+            mock_github_issue_detail_response(issue_number=42),
+        ]
+
+        for max_nodes in (2, 4):
+            response = cast(
+                HttpResponse,
+                self.client.post(
+                    '/api/issues/related-nodes/',
+                    data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': max_nodes, 'include_comments': False, 'max_context_files': 2},
+                    content_type='application/json',
+                ),
+            )
+            self.assertEqual(response.status_code, 200)
+
+        artifact = AnalysisArtifact.objects.get(analysis_run=analysis_run)
+        summaries = cast(dict[str, object], artifact.payload['summaries'])
+        self.assertIn('issue_map:42:v2:comments_false:ctx_2:nodes_2:harness_off', summaries)
+        self.assertIn('issue_map:42:v2:comments_false:ctx_2:nodes_4:harness_off', summaries)
+        self.assertEqual(requests_get.call_count, 2)
+
+    @override_settings(ISSUE_HARNESS_ENABLED=False)
+    @patch('github_repo.services.requests.get')
+    def test_related_nodes_cache_is_scoped_to_analysis_revision(self, requests_get):
+        first_run = self._create_analysis_run()
+        second_run = self._create_analysis_run()
+        requests_get.side_effect = [
+            mock_github_issue_detail_response(issue_number=42),
+            mock_github_issue_detail_response(issue_number=42),
+        ]
+
+        for analysis_run in (first_run, second_run):
+            response = cast(
+                HttpResponse,
+                self.client.post(
+                    '/api/issues/related-nodes/',
+                    data={'analysis_id': analysis_run.id, 'issue_number': 42, 'max_nodes': 3, 'include_comments': False, 'max_context_files': 2},
+                    content_type='application/json',
+                ),
+            )
+            self.assertEqual(response.status_code, 200)
+
+        self.assertNotEqual(first_run.revision, second_run.revision)
+        self.assertEqual(requests_get.call_count, 2)
+        for analysis_run in (first_run, second_run):
+            summaries = cast(dict[str, object], AnalysisArtifact.objects.get(analysis_run=analysis_run).payload['summaries'])
+            self.assertIn('issue_map:42:v2:comments_false:ctx_2:nodes_3:harness_off', summaries)
+
     @patch('github_repo.services.requests.get')
     def test_related_nodes_rejects_analysis_statuses_before_github_calls(self, requests_get):
         pending_run = self._create_analysis_run(status=AnalysisRun.STATUS_STARTED, payload=None)
