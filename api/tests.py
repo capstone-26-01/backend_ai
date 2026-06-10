@@ -2188,6 +2188,41 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertTrue(any(item['name'] == 'test_related_nodes_returns_old_fields_and_issue_graph_fields' for item in test_mentions))
         self.assertTrue(any(item['text'] == 'No exact origin found' for item in quoted_strings))
 
+    def test_extract_issue_evidence_matches_bare_exception_timeout_and_failure(self):
+        issue = github_issue_payload(
+            body=(
+                'Exception: generic failure while mapping the issue.\n'
+                'Timeout: repo parsing exceeded the limit.\n'
+                'Failure: harness result was incomplete.\n'
+            ),
+        )
+
+        evidence = extract_issue_evidence(issue)
+
+        exception_classes = {item['class'] for item in cast(list[dict[str, object]], evidence['exception_mentions'])}
+        self.assertIn('Exception', exception_classes)
+        self.assertIn('Timeout', exception_classes)
+        self.assertIn('Failure', exception_classes)
+
+    def test_extract_issue_evidence_caps_richer_evidence_lists(self):
+        body = '\n'.join(
+            [
+                *[f'Exception: failure number {index}' for index in range(25)],
+                *[f'GET /api/example-{index}/ fails' for index in range(45)],
+                *[f'Missing CONFIG_NAME_{index}' for index in range(45)],
+                *[f'Failing test_example_{index}' for index in range(45)],
+                *[f'The response says "quoted response {index}"' for index in range(25)],
+            ]
+        )
+
+        evidence = extract_issue_evidence(github_issue_payload(body=body))
+
+        self.assertEqual(len(cast(list[dict[str, object]], evidence['exception_mentions'])), 20)
+        self.assertEqual(len(cast(list[dict[str, object]], evidence['route_mentions'])), 40)
+        self.assertEqual(len(cast(list[dict[str, object]], evidence['config_mentions'])), 40)
+        self.assertEqual(len(cast(list[dict[str, object]], evidence['test_mentions'])), 40)
+        self.assertEqual(len(cast(list[dict[str, object]], evidence['quoted_strings'])), 20)
+
     def test_rank_issue_candidates_uses_exact_file_symbol_label_and_comment_evidence(self):
         analysis = build_issue_map_analysis_artifact()
         issue = github_issue_payload(
@@ -2257,6 +2292,32 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
 
         self.assertEqual(generic_candidates[0]['node_id'], 'parser/services.py::parse_repo')
         self.assertEqual(test_candidates[0]['node_id'], 'tests/test_parser.py::test_parse_repo_timeout')
+
+    def test_rank_issue_candidates_boosts_production_neighbors_for_named_tests(self):
+        analysis = {
+            'nodes': [
+                {'id': 'parser/services.py::parse_repo', 'type': 'function', 'label': 'parse_repo', 'file': 'parser/services.py', 'start_line': 1, 'end_line': 3},
+                {'id': 'tests/test_parser.py::test_parse_repo_timeout', 'type': 'function', 'label': 'test_parse_repo_timeout', 'file': 'tests/test_parser.py', 'start_line': 1, 'end_line': 4},
+                {'id': 'docs/readme.py::parse_notes', 'type': 'function', 'label': 'parse_notes', 'file': 'docs/readme.py', 'start_line': 1, 'end_line': 2},
+            ],
+            'edges': [
+                {'source': 'tests/test_parser.py::test_parse_repo_timeout', 'target': 'parser/services.py::parse_repo', 'type': 'calls'},
+            ],
+            'entrypoints': [],
+            'key_modules': [],
+            'file_contents': {
+                'parser/services.py': 'def parse_repo(files):\n    raise TimeoutError("parser timeout")\n',
+                'tests/test_parser.py': 'def test_parse_repo_timeout():\n    assert parse_repo([])\n',
+                'docs/readme.py': 'def parse_notes():\n    return None\n',
+            },
+        }
+        evidence = extract_issue_evidence(github_issue_payload(body='pytest failing test_parse_repo_timeout in tests/test_parser.py'))
+
+        candidates, _warnings = rank_issue_candidates(analysis, evidence, max_candidates=3)
+        candidates_by_id = {candidate['node_id']: candidate for candidate in candidates}
+
+        self.assertIn('parser/services.py::parse_repo', candidates_by_id)
+        self.assertTrue(any(item['type'] == 'test_related_production' for item in candidates_by_id['parser/services.py::parse_repo']['evidence']))
 
     def test_rank_issue_candidates_emits_weak_evidence_warning_for_label_only_match(self):
         analysis = build_issue_map_analysis_artifact()
