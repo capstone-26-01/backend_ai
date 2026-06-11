@@ -1,8 +1,8 @@
 opencode:
   chat_completions_url: https://opencode.ai/zen/v1/chat/completions
-  model: kimi-k2.5
+  model: kimi-k2.6
   allowed_models:
-    - kimi-k2.5
     - kimi-k2.6
+    - kimi-k2.5
   max_tokens: 1200
   timeout_seconds: 60

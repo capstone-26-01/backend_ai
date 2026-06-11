@@ -19,7 +19,8 @@ ISSUE_HARNESS_MAX_EDGES = 12000
 ISSUE_HARNESS_MAX_FILES = 300
 ISSUE_HARNESS_MAX_FILE_CHARS = 20000
 ISSUE_HARNESS_MAX_TOTAL_FILE_CHARS = 1_500_000
-ISSUE_HARNESS_MAX_TOOL_CALLS = 30
+ISSUE_HARNESS_MAX_TOOL_CALLS = 80
+SOURCE_SUFFIXES = ('.py', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts')
 
 
 class IssueHarnessUnavailable(RuntimeError):
@@ -81,6 +82,44 @@ def _candidate_path(candidate: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _is_source_path(path: str | None) -> bool:
+    return bool(path and path.endswith(SOURCE_SUFFIXES))
+
+
+def _is_source_backed_node(node: Mapping[str, Any], file_contents: Mapping[str, str]) -> bool:
+    path = _node_path(node)
+    return bool(path and _is_source_path(path) and path in file_contents)
+
+
+def _source_seed_candidates(candidates: Sequence[Mapping[str, Any]], file_contents: Mapping[str, str]) -> list[dict[str, Any]]:
+    seeds: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        node_id = _candidate_node_id(candidate)
+        path = _candidate_path(candidate)
+        if not node_id or not path or not _is_source_path(path) or path not in file_contents:
+            continue
+        marker = (node_id, path)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        seeds.append(
+            {
+                'rank': len(seeds) + 1,
+                'score': candidate.get('score'),
+                'node_id': node_id,
+                'path': path,
+                'reason': candidate.get('reason'),
+                'evidence': _bounded_list(candidate.get('evidence'), 6),
+            }
+        )
+        if len(seeds) >= 20:
+            break
+    return seeds
+
+
 def _bounded_issue(issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
     remaining = ISSUE_HARNESS_MAX_ISSUE_TEXT_CHARS
     title, title_truncated = _truncate(issue.get('title'), min(500, remaining))
@@ -137,13 +176,72 @@ def _bounded_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _bounded_nodes(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
-    nodes: list[dict[str, Any]] = []
-    for raw_node in _bounded_list(analysis.get('nodes'), ISSUE_HARNESS_MAX_NODES):
+def _raw_nodes_by_id(analysis: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    nodes: dict[str, Mapping[str, Any]] = {}
+    for raw_node in _safe_list(analysis.get('nodes')):
         if not isinstance(raw_node, Mapping):
             continue
         node_id = _node_id(raw_node)
-        if not node_id:
+        if node_id:
+            nodes[node_id] = raw_node
+    return nodes
+
+
+def _node_ids_for_path(nodes_by_id: Mapping[str, Mapping[str, Any]], path: str) -> list[str]:
+    return [node_id for node_id, node in nodes_by_id.items() if _node_path(node) == path]
+
+
+def _bounded_nodes(
+    analysis: Mapping[str, Any],
+    seed_candidates: Sequence[Mapping[str, Any]],
+    file_contents: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    nodes_by_id = _raw_nodes_by_id(analysis)
+    raw_edges = [edge for edge in _safe_list(analysis.get('edges')) if isinstance(edge, Mapping)]
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+
+    def add(node_id: str | None) -> None:
+        if node_id and node_id in nodes_by_id and node_id not in seen:
+            seen.add(node_id)
+            ordered_ids.append(node_id)
+
+    seed_ids = [_string(seed.get('node_id')) for seed in seed_candidates if isinstance(seed, Mapping)]
+    seed_paths = [_string(seed.get('path')) for seed in seed_candidates if isinstance(seed, Mapping)]
+
+    for node_id in seed_ids:
+        add(node_id)
+    for path in seed_paths:
+        for node_id in _node_ids_for_path(nodes_by_id, path):
+            add(node_id)
+    for edge in raw_edges:
+        source = _string(edge.get('source'))
+        target = _string(edge.get('target'))
+        if source in seen:
+            add(target)
+        if target in seen:
+            add(source)
+    for path in file_contents:
+        for node_id in _node_ids_for_path(nodes_by_id, path):
+            add(node_id)
+    for entrypoint in _safe_list(analysis.get('entrypoints')):
+        if isinstance(entrypoint, Mapping):
+            add(_string(entrypoint.get('id')))
+    for key_module in _safe_list(analysis.get('key_modules')):
+        if isinstance(key_module, Mapping):
+            add(_string(key_module.get('id')))
+    for node_id, raw_node in nodes_by_id.items():
+        if _is_source_backed_node(raw_node, file_contents):
+            add(node_id)
+    for node_id in nodes_by_id:
+        add(node_id)
+        if len(ordered_ids) >= ISSUE_HARNESS_MAX_NODES:
+            break
+
+    nodes: list[dict[str, Any]] = []
+    for node_id in ordered_ids[:ISSUE_HARNESS_MAX_NODES]:
+        raw_node = nodes_by_id[node_id]
+        if not isinstance(raw_node, Mapping):
             continue
         nodes.append(
             {
@@ -164,13 +262,32 @@ def _bounded_nodes(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
     return nodes
 
 
-def _bounded_edges(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _bounded_edges(analysis: Mapping[str, Any], bounded_node_ids: set[str], seed_node_ids: set[str]) -> list[dict[str, Any]]:
+    raw_edges = [edge for edge in _safe_list(analysis.get('edges')) if isinstance(edge, Mapping)]
+
+    def edge_priority(edge: Mapping[str, Any]) -> tuple[int, str, str]:
+        source = _string(edge.get('source'))
+        target = _string(edge.get('target'))
+        touches_seed = source in seed_node_ids or target in seed_node_ids
+        fully_bounded = source in bounded_node_ids and target in bounded_node_ids
+        if touches_seed and fully_bounded:
+            priority = 0
+        elif fully_bounded:
+            priority = 1
+        elif touches_seed:
+            priority = 2
+        else:
+            priority = 3
+        return priority, source, target
+
     edges: list[dict[str, Any]] = []
-    for raw_edge in _bounded_list(analysis.get('edges'), ISSUE_HARNESS_MAX_EDGES):
-        if not isinstance(raw_edge, Mapping):
-            continue
+    for raw_edge in sorted(raw_edges, key=edge_priority):
+        if len(edges) >= ISSUE_HARNESS_MAX_EDGES:
+            break
         source = _string(raw_edge.get('source'))
         target = _string(raw_edge.get('target'))
+        if source not in bounded_node_ids or target not in bounded_node_ids:
+            continue
         if not source or not target:
             continue
         edges.append(
@@ -319,6 +436,11 @@ def build_issue_harness_job(
     file_contents, file_contents_truncated = _bounded_file_contents(analysis, bounded_evidence, candidates)
     languages, primary_language = _analysis_languages(analysis, file_contents)
     file_manifest = _bounded_file_manifest(analysis, file_contents)
+    seed_candidates = _source_seed_candidates(candidates, file_contents)
+    bounded_nodes = _bounded_nodes(analysis, seed_candidates, file_contents)
+    bounded_node_ids = {_string(node.get('id')) for node in bounded_nodes}
+    seed_node_ids = {_string(seed.get('node_id')) for seed in seed_candidates}
+    bounded_edges = _bounded_edges(analysis, bounded_node_ids, seed_node_ids)
     return {
         'schema_version': ISSUE_HARNESS_JOB_SCHEMA_VERSION,
         'job_id': f'github:{repo_path}#{issue.get("number")}@{revision}',
@@ -334,21 +456,10 @@ def build_issue_harness_job(
         'issue': bounded_issue,
         'comments': bounded_comments,
         'evidence': bounded_evidence,
-        'seed_candidates': [
-            {
-                'rank': candidate.get('rank'),
-                'score': candidate.get('score'),
-                'node_id': _candidate_node_id(candidate),
-                'path': _candidate_path(candidate),
-                'reason': candidate.get('reason'),
-                'evidence': _bounded_list(candidate.get('evidence'), 6),
-            }
-            for candidate in candidates[:20]
-            if isinstance(candidate, Mapping)
-        ],
+        'seed_candidates': seed_candidates,
         'graph': {
-            'nodes': _bounded_nodes(analysis),
-            'edges': _bounded_edges(analysis),
+            'nodes': bounded_nodes,
+            'edges': bounded_edges,
             'entrypoints': _bounded_list(analysis.get('entrypoints'), 20),
             'key_modules': _bounded_list(analysis.get('key_modules'), 20),
         },
@@ -401,6 +512,11 @@ def _parse_json_stdout(stdout: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise IssueHarnessUnavailable('harness_invalid_json', 'Issue harness output JSON must be an object.')
     return payload
+
+
+def _is_rate_limit_message(value: Any) -> bool:
+    text = _string(value).lower()
+    return any(pattern in text for pattern in ('429', 'rate limit', 'rate_limit', 'rate-limit', 'too many requests'))
 
 
 def _final_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -478,6 +594,8 @@ def run_issue_harness(
         raise
     if completed.returncode != 0:
         message = _string(payload.get('error') or payload.get('message') or completed.stderr[:500] or 'Issue harness command failed.')
+        if _is_rate_limit_message(message):
+            raise IssueHarnessUnavailable('provider_rate_limited', message)
         raise IssueHarnessUnavailable('harness_failed', message)
     final = _final_from_payload(payload)
     tool_calls = _tool_calls_from_payload(payload)

@@ -14,6 +14,7 @@ from harness_eval.swebench.evaluator import (
     FAILURE_CONTRACT_FAILED,
     FAILURE_INVALID_JSON,
     FAILURE_MISSING_FINAL,
+    FAILURE_PROVIDER_RATE_LIMITED,
     FAILURE_RUNNER_ERROR,
     FAILURE_TIMEOUT,
     evaluate_transcript,
@@ -109,6 +110,8 @@ def _transcript_path(sample_id: str, variant_id: str, transcripts_dir: Path = DE
 def _failure_reason_from_harness(code: str) -> str:
     if code == 'harness_timeout':
         return FAILURE_TIMEOUT
+    if code in {'provider_rate_limited', 'harness_rate_limited'}:
+        return FAILURE_PROVIDER_RATE_LIMITED
     if code == 'harness_invalid_json':
         return FAILURE_INVALID_JSON
     if code == 'harness_missing_final':

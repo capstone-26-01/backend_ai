@@ -56,18 +56,17 @@ Production-like live Pi SUT eval:
 
 - set `OPENCODE_API_KEY` in the caller environment,
 - set `RUN_OPENCODE_LIVE_TESTS=true`,
-- run `python -m harness_eval.runner run-harness harness_eval/samples/origin_trace.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5`.
+- run `python -m harness_eval.swebench.runner run-sample harness_eval/swebench_samples/<sample>.json --live --model kimi-k2.5 --write-transcript` for a prepared SWE-bench localization sample.
 
-This keeps the deterministic evaluator outside the SUT. `pi_runner.py` invokes
-Pi with only the bounded issue-map tools from
-`harness_eval/pi/issue_map_extension.ts`, then extracts the transcript from the
-terminating `finish_issue_map_transcript` tool result. If `live-smoke` passes
-but this command fails, the provider is reachable and the failure is in the Pi
-tool loop/output contract.
+This keeps the deterministic evaluator outside the SUT. The active runtime path
+is `llm.issue_harness -> llm.pi_issue_runner -> llm/pi_issue_extension.ts`;
+`harness_eval.swebench.runner` builds the bounded runtime job, calls the runtime
+harness, and evaluates the returned transcript against hidden SWE-bench source
+labels. If `live-smoke` passes but this command fails, the provider is reachable
+and the failure is in the runtime Pi tool loop/output contract.
 
-The finishing tool also clamps final nodes and paths to high-confidence
-candidates derived from the job packet's own issue/artifact evidence. It must
-not read hidden evaluator `expect` fields.
+The finishing tool validates final nodes and paths against the bounded runtime
+job. It must not read hidden evaluator labels or `expect` fields.
 
 Repo-fixture samples cover parser timeout tracing and same-file precision, so
 the gate fails when the SUT sprays extra nodes that happen to share an allowed

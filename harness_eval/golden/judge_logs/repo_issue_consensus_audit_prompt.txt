@@ -15,8 +15,9 @@ Context:
 
 Inspect:
 - harness_eval/evaluator.py
-- harness_eval/pi_runner.py
-- harness_eval/pi/issue_map_extension.ts
+- llm/issue_harness.py
+- llm/pi_issue_runner.py
+- llm/pi_issue_extension.ts
 - harness_eval/samples/repo_*.json
 - harness_eval/golden/repo_issue_consensus.json
 - harness_eval/fixtures/repos/**/*

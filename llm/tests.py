@@ -339,6 +339,74 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertIn('parser/services.py', job['file_contents'])
         self.assertNotIn('/etc/passwd', job['file_contents'])
 
+    def test_issue_harness_job_prioritizes_source_backed_candidates_in_graph(self):
+        junk_nodes = [
+            {'id': f'django/contrib/postgres/locale/{index}', 'kind': 'directory', 'label': str(index), 'path': f'django/contrib/postgres/locale/{index}'}
+            for index in range(5050)
+        ]
+        target = {
+            'id': 'django/db/backends/postgresql/client.py::DatabaseClient',
+            'kind': 'class',
+            'label': 'DatabaseClient',
+            'path': 'django/db/backends/postgresql/client.py',
+            'start_line': 1,
+            'end_line': 3,
+        }
+        caller = {
+            'id': 'django/core/management/commands/dbshell.py::Command',
+            'kind': 'class',
+            'label': 'Command',
+            'path': 'django/core/management/commands/dbshell.py',
+            'start_line': 1,
+            'end_line': 2,
+        }
+        analysis = {
+            'file_contents': {
+                'django/db/backends/postgresql/client.py': 'class DatabaseClient:\n    executable_name = "psql"\n',
+                'django/core/management/commands/dbshell.py': 'class Command:\n    pass\n',
+            },
+            'nodes': [*junk_nodes, target, caller],
+            'edges': [
+                {'source': caller['id'], 'target': target['id'], 'kind': 'references'},
+            ],
+            'entrypoints': [],
+            'key_modules': [],
+        }
+
+        job = build_issue_harness_job(
+            repo_path='django/django',
+            revision='abc123',
+            issue={'number': 10973, 'title': 'dbshell PostgreSQL client args', 'body': 'PostgreSQL dbshell passes bad arguments to psql.'},
+            comments=[],
+            evidence={'query': 'PostgreSQL dbshell client args'},
+            candidates=[
+                {
+                    'rank': 1,
+                    'score': 1.0,
+                    'node_id': 'django/contrib/postgres/locale/it',
+                    'node': {'path': 'django/contrib/postgres/locale/it'},
+                    'reason': 'weak locale match',
+                    'evidence': [],
+                },
+                {
+                    'rank': 2,
+                    'score': 0.8,
+                    'node_id': target['id'],
+                    'node': {'path': target['path']},
+                    'reason': 'source match',
+                    'evidence': [],
+                },
+            ],
+            analysis=analysis,
+        )
+
+        self.assertEqual([seed['node_id'] for seed in job['seed_candidates']], [target['id']])
+        graph_ids = {node['id'] for node in job['graph']['nodes']}
+        self.assertIn(target['id'], graph_ids)
+        self.assertIn(caller['id'], graph_ids)
+        self.assertNotIn('django/contrib/postgres/locale/it', {seed['node_id'] for seed in job['seed_candidates']})
+        self.assertIn({'source': caller['id'], 'target': target['id'], 'kind': 'references', 'type': None, 'path': None}, job['graph']['edges'])
+
     def test_issue_harness_job_preserves_typescript_language_manifest(self):
         analysis = {
             'repo': 'owner/repo',
@@ -545,7 +613,7 @@ class IssueHarnessRuntimeTests(TestCase):
             {'name': 'search_repo_symbols', 'arguments': {'query': 'parse_repo'}},
             {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
         ]
-        tool_calls.extend({'name': 'get_node', 'arguments': {'node_id': 'parser/services.py::parse_repo'}} for _ in range(31))
+        tool_calls.extend({'name': 'get_node', 'arguments': {'node_id': 'parser/services.py::parse_repo'}} for _ in range(81))
         payload = {
             'tool_calls': tool_calls,
             'final': {
@@ -555,7 +623,7 @@ class IssueHarnessRuntimeTests(TestCase):
             },
         }
 
-        with self.assertRaisesMessage(IssueHarnessUnavailable, 'exceeded 30 tool calls'):
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'exceeded 80 tool calls'):
             run_issue_harness(self._job(), command=self._command_that_prints(payload), timeout_seconds=5)
 
     def test_run_issue_harness_reports_failed_non_json_command_as_harness_failure(self):
@@ -566,6 +634,19 @@ class IssueHarnessRuntimeTests(TestCase):
 
         self.assertEqual(caught.exception.code, 'harness_failed')
         self.assertIn('boom', caught.exception.message)
+
+    def test_run_issue_harness_reports_rate_limited_json_error(self):
+        command = [
+            sys.executable,
+            '-c',
+            'import json; print(json.dumps({"error": "Pi did not call finish_issue_map_transcript: 429 Rate limit exceeded"})); raise SystemExit(1)',
+        ]
+
+        with self.assertRaises(IssueHarnessUnavailable) as caught:
+            run_issue_harness(self._job(), command=command, timeout_seconds=5)
+
+        self.assertEqual(caught.exception.code, 'provider_rate_limited')
+        self.assertIn('429 Rate limit exceeded', caught.exception.message)
 
     def test_default_pi_runner_fails_closed_without_opencode_key(self):
         with patch.dict(os.environ, {'OPENCODE_API_KEY': ''}, clear=False):
@@ -625,6 +706,7 @@ class IssueHarnessRuntimeTests(TestCase):
             extension=pi_issue_runner.DEFAULT_EXTENSION,
             provider='opencode',
             model='kimi-k2.5',
+            thinking='high',
         )
 
         command = pi_issue_runner.build_command(args, self._job())
@@ -633,7 +715,77 @@ class IssueHarnessRuntimeTests(TestCase):
 
         self.assertIn('get_neighbors,read_node_context,finish_issue_map_transcript', tools)
         self.assertIn('read_node_context', prompt)
+        self.assertIn('seed_candidates', prompt)
+        self.assertIn('12 non-finish tool calls', prompt)
+        self.assertEqual(command[command.index('--thinking') + 1], 'high')
         self.assertLess(tools.index('read_node_context'), tools.index('finish_issue_map_transcript'))
+
+    def _pi_args(self, **overrides):
+        from argparse import Namespace
+        from llm import pi_issue_runner
+
+        base = dict(
+            pi_bin='npx',
+            pi_package='@earendil-works/pi-coding-agent@0.78.0',
+            extension=pi_issue_runner.DEFAULT_EXTENSION,
+            provider='opencode',
+            model='deepseek-v4-flash',
+            thinking='off',
+        )
+        base.update(overrides)
+        return Namespace(**base)
+
+    def test_pi_runner_command_passes_thinking_level_through(self):
+        """Real thinking levels (the default is high) are passed verbatim for every model.
+
+        All target models run as thinking models. Deepseek-format models are kept valid
+        via the models.json `supportsReasoningEffort: false` override, NOT by disabling
+        thinking, so high must flow straight through to the Pi CLI.
+        """
+        from llm import pi_issue_runner
+
+        for model in ('kimi-k2.5', 'kimi-k2.6', 'deepseek-v4-flash'):
+            command = pi_issue_runner.build_command(
+                self._pi_args(model=model, thinking='high'), self._job()
+            )
+            self.assertEqual(command[command.index('--thinking') + 1], 'high', msg=model)
+
+    def test_pi_runner_command_passes_thinking_off_explicitly(self):
+        """`off`/`none` are passed as an explicit `--thinking off`, not omitted.
+
+        Omitting the flag makes the Pi CLI fall back to its DEFAULT_THINKING_LEVEL
+        ("medium"); an explicit `off` is the only way to actually disable reasoning.
+        """
+        from llm import pi_issue_runner
+
+        for value in ('off', 'none', 'OFF', 'None'):
+            command = pi_issue_runner.build_command(self._pi_args(thinking=value), self._job())
+            self.assertIn('--thinking', command, msg=f'thinking={value!r}')
+            self.assertEqual(command[command.index('--thinking') + 1], 'off', msg=f'thinking={value!r}')
+
+    def test_pi_runner_command_omits_thinking_flag_for_default(self):
+        from llm import pi_issue_runner
+
+        for value in ('', 'default', None):
+            command = pi_issue_runner.build_command(self._pi_args(thinking=value), self._job())
+            self.assertNotIn('--thinking', command, msg=f'thinking={value!r}')
+
+    def test_pi_runner_writes_models_override_keeping_deepseek_thinking(self):
+        """The harness writes models.json so deepseek-format models stay thinking models
+        (supportsReasoningEffort: false) without sending both thinking and reasoning_effort."""
+        import tempfile
+        from pathlib import Path
+        from llm import pi_issue_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            path = pi_issue_runner._ensure_pi_models_override(state_dir)
+            self.assertEqual(path, state_dir / 'models.json')
+            config = json.loads(path.read_text(encoding='utf-8'))
+            overrides = config['providers']['opencode']['modelOverrides']
+            self.assertFalse(overrides['deepseek-v4-flash']['compat']['supportsReasoningEffort'])
+            # The override must NOT disable reasoning itself; thinking stays on.
+            self.assertNotIn('reasoning', overrides['deepseek-v4-flash'])
 
     def test_runtime_finish_gate_accepts_read_node_context_tool_name(self):
         extension_path = settings.BASE_DIR / 'llm' / 'pi_issue_extension.ts'

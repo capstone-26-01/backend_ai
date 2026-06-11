@@ -32,7 +32,7 @@ Tracked Files
 - `harness_matrix.sample.json`: model/tool/MCP/skill comparison matrix.
 - `evaluator.py`: schema and transcript scoring logic.
 - `runner.py`: CLI for validation, transcript evaluation, dry-run matrix expansion, and optional live OpenCode calls.
-- `pi_runner.py` and `pi/issue_map_extension.ts`: real Pi/OpenCode SUT adapter with bounded issue-map tools.
+- `swebench/runner.py`: SWE-bench localization benchmark wrapper for the active runtime Pi issue harness.
 
 Offline Commands
 ----------------
@@ -98,42 +98,52 @@ This is not a replacement for a real Pi run with tools. It tests the model/provi
 - `json_parse_error`: parser failure when the model ignored JSON-only instructions,
 - `eval_passed`: deterministic transcript checks passed.
 
-Live Pi SUT Eval
-----------------
+Runtime Pi Benchmark Eval
+-------------------------
 
-This is the production-like live check: `run-harness` stays the deterministic judge, while `pi_runner.py` is the system under test. The Pi runner installs/uses `@earendil-works/pi-coding-agent@0.79.1` through `npx`, binds only bounded repo-analysis tools from `pi/issue_map_extension.ts`, and emits the final transcript from a terminating `finish_issue_map_transcript` tool result.
+The old `harness_eval.pi_runner` adapter has been retired. Production-like Pi
+benchmarks now use one active contract:
 
-For repo samples, the job packet contains a local repo fixture path and issue text, not a precomputed graph artifact. Pi must call `list_repo_files`, `search_repo_symbols`, and `read_repo_file`; the deterministic evaluator compares the final transcript against hidden `expect` values derived from `golden/repo_issue_consensus.json`. The SUT never receives that golden file or the hidden `expect` block.
+```
+llm.issue_harness -> llm.pi_issue_runner -> llm/pi_issue_extension.ts
+```
 
-Repo-fixture samples are not smoke tests. They cover multi-file call chains, same-file decoys, permission classes, GitHub ingestion failures, graph filtering, graph label conversion, parser visitor gaps, worker/cache key mismatch, and a negative needs-info issue where the correct answer is no node. These catch cases where the model includes every plausible node from a file, guesses from labels, or skips file reads before naming origin symbols.
+For SWE-bench localization samples, `harness_eval.swebench.runner` builds the
+bounded runtime job, calls `llm.issue_harness.run_issue_harness()`, and defaults
+to `python -m llm.pi_issue_runner --provider opencode --model <model>`. Hidden
+SWE-bench patch labels stay inside the evaluator and are never sent to Pi.
 
 ```
 export OPENCODE_API_KEY=...
 export RUN_OPENCODE_LIVE_TESTS=true
-python -m harness_eval.runner run-harness harness_eval/samples/repo_parser_timeout.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
-python -m harness_eval.runner run-harness harness_eval/samples/repo_same_file_precision.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
-python -m harness_eval.runner run-harness harness_eval/samples/repo_fetch_none_crash.json -- python -m harness_eval.pi_runner --live --model kimi-k2.5
+python -m harness_eval.swebench.runner run-sample harness_eval/swebench_samples/<sample>.json --live --model kimi-k2.5 --write-transcript
+python -m harness_eval.swebench.runner run-matrix --live --samples-dir harness_eval/swebench_samples --matrix harness_eval/harness_matrix.sample.json --limit 20 --write-report
 ```
 
 Expected result:
 
 - exit code 0,
-- required repo-analysis tools were called,
-- required tool order and required file reads were satisfied,
+- runtime tools such as `get_issue_context`, `list_repo_files`, `search_repo_symbols` or `search_repo_text`, and an inspection tool were called,
 - forbidden filesystem/shell/network/GitHub tools were not called,
-- expected node IDs and paths passed the deterministic evaluator,
-- `pi_metadata.response_ids` and `pi_metadata.usage` are present in the transcript for API/dashboard correlation.
+- returned source paths overlap the hidden SWE-bench gold source files,
+- `pi_metadata.response_ids` and `pi_metadata.usage` are present when the provider reports them.
 
-If this fails while `live-smoke` passes, the provider is reachable but the Pi tool loop/output contract is broken.
+If this fails while `live-smoke` passes, the provider is reachable but the
+runtime Pi tool loop/output contract is broken.
 
-Evaluating Real Pi Runs
------------------------
+Evaluating External Runner Transcripts
+--------------------------------------
 
-Run the real Pi command as a black box:
+`harness_eval.runner run-harness` still accepts any black-box command that
+speaks the synthetic issue-map sample transcript shape:
 
 ```
 python -m harness_eval.runner run-harness harness_eval/samples/repo_parser_timeout.json -- <your-pi-command-and-args>
 ```
+
+Use this for external experiments against the legacy synthetic samples. Runtime
+Pi/SWE-bench benchmarks should use `harness_eval.swebench.runner`, which targets
+`llm.pi_issue_runner` by default.
 
 Or export a real run as a transcript shaped like:
 

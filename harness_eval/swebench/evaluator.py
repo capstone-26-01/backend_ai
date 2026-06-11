@@ -15,6 +15,7 @@ FAILURE_NO_FINAL_NODES = 'no_final_nodes'
 FAILURE_NO_RESOLVED_PATHS = 'no_resolved_paths'
 FAILURE_NO_GOLD_OVERLAP = 'no_gold_file_overlap'
 FAILURE_TIMEOUT = 'timeout'
+FAILURE_PROVIDER_RATE_LIMITED = 'provider_rate_limited'
 FAILURE_RUNNER_ERROR = 'runner_error'
 
 

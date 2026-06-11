@@ -72,12 +72,13 @@ flowchart LR
   Runner["runner.py CLI<br/>validate, render-job, run-harness,<br/>evaluate-transcript, dry-run-matrix"]
   Job["Stripped job packet<br/>visible issue, repo or artifact only"]
   SUT["Black-box SUT command<br/>fake harness or external runner"]
-  PiRunner["pi_runner.py<br/>Pi adapter, live opt-in"]
+  Swebench["swebench/runner.py CLI<br/>runtime benchmark"]
+  RuntimeJob["Runtime issue harness job<br/>issue, graph, bounded file contents"]
+  RuntimePi["llm.pi_issue_runner<br/>runtime Pi harness"]
   Live["OpenCode Zen live path<br/>smoke, sample, or Pi run<br/>opt-in only"]
 
-  subgraph Tools["Bounded Pi tools and fixtures"]
-    ArtifactTools["Artifact tools<br/>rank_issue_candidates<br/>load_focus_graph<br/>load_code_context"]
-    RepoTools["Repo fixture tools<br/>list_repo_files<br/>search_repo_symbols<br/>search_repo_text<br/>read_repo_file"]
+  subgraph Tools["Runtime bounded Pi tools and fixtures"]
+    RuntimeTools["Issue harness tools<br/>get_issue_context<br/>list_repo_files<br/>search_repo_symbols/search_repo_text<br/>read_node_context/read_repo_file"]
     Fixtures["fixtures/repos/*<br/>local Python repos"]
     Finish["finish_issue_map_transcript<br/>terminating transcript tool"]
   end
@@ -91,13 +92,13 @@ flowchart LR
   Matrix --> Runner
   Runner -->|"build_job_packet strips expect"| Job
   Job --> SUT
-  Job -. live opt-in .-> PiRunner
-  PiRunner -.-> Live
-  PiRunner --> ArtifactTools
-  PiRunner --> RepoTools
-  ArtifactTools --> Finish
-  RepoTools --> Fixtures
-  RepoTools --> Finish
+  Matrix --> Swebench
+  Swebench --> RuntimeJob
+  RuntimeJob --> RuntimePi
+  RuntimePi -.-> Live
+  RuntimePi --> RuntimeTools
+  RuntimeTools --> Fixtures
+  RuntimeTools --> Finish
   Finish --> Transcript
   SUT --> Transcript
   Samples -->|"hidden expect only"| Evaluator
@@ -147,7 +148,7 @@ parser/       Python tree-sitter parsing, tree/graph construction, static edge
 llm/          QA context selection, OpenCode Zen calls, summaries,
               bounded runtime issue harness
 harness_eval/ Deterministic issue-map runner evaluation suite and optional live
-              Pi/OpenCode adapters
+              Pi/OpenCode benchmark wrappers
 config/       Django settings, OpenAPI/Swagger routing, WSGI/ASGI entrypoints
 ```
 
@@ -292,7 +293,8 @@ The suite contains:
 - A deterministic evaluator that checks required tool use, forbidden tool use,
   required file reads, node/path allowlists, investigation-path paths, and
   confidence bounds.
-- A Pi runner adapter using bounded tools from `harness_eval/pi/`.
+- SWE-bench/model benchmark wrappers that target the active runtime harness:
+  `llm.issue_harness -> llm.pi_issue_runner -> llm/pi_issue_extension.ts`.
 - Optional OpenCode Zen live smoke/sample commands for dashboard and provider
   correlation.
 
