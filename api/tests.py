@@ -2695,6 +2695,34 @@ class IssueMapDeterministicTests(ExternalHttpBlockedMixin, TestCase):
         self.assertTrue(any(item['type'] in {'stack_frame', 'symbol', 'file_path'} for item in candidates[0]['evidence']))
         self.assertFalse(any(warning.get('code') == 'no_ranked_issue_nodes' for warning in warnings))
 
+    def test_rank_issue_candidates_filters_non_source_metadata_when_source_matches_exist(self):
+        analysis = {
+            'nodes': [
+                {'id': 'django/contrib/postgres/locale/it', 'type': 'directory', 'label': 'it', 'path': 'django/contrib/postgres/locale/it'},
+                {
+                    'id': 'django/db/backends/postgresql/client.py::DatabaseClient',
+                    'type': 'class',
+                    'label': 'DatabaseClient',
+                    'file': 'django/db/backends/postgresql/client.py',
+                    'start_line': 1,
+                    'end_line': 3,
+                },
+            ],
+            'edges': [],
+            'entrypoints': [],
+            'key_modules': [],
+            'file_contents': {
+                'django/db/backends/postgresql/client.py': 'class DatabaseClient:\n    executable_name = "psql"\n',
+            },
+        }
+        evidence = extract_issue_evidence(github_issue_payload(body='PostgreSQL dbshell client should pass arguments to psql.'))
+
+        candidates, _warnings = rank_issue_candidates(analysis, evidence, max_candidates=4)
+        candidate_ids = [candidate['node_id'] for candidate in candidates]
+
+        self.assertIn('django/db/backends/postgresql/client.py::DatabaseClient', candidate_ids)
+        self.assertNotIn('django/contrib/postgres/locale/it', candidate_ids)
+
     def test_rank_issue_candidates_uses_route_config_exception_and_quoted_string_evidence(self):
         analysis = {
             'nodes': [

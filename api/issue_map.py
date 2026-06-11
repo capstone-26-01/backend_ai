@@ -407,6 +407,14 @@ def _analysis_file_contents(analysis: Mapping[str, Any]) -> Mapping[str, Any]:
     return file_contents if isinstance(file_contents, Mapping) else {}
 
 
+def _is_source_backed_node(analysis: Mapping[str, Any], node: Mapping[str, Any]) -> bool:
+    path = _node_path(node)
+    if not path or not _is_source_path(path):
+        return False
+    file_contents = _analysis_file_contents(analysis)
+    return not file_contents or path in file_contents
+
+
 def _node_search_text(node_id: str, node: Mapping[str, Any], file_contents: Mapping[str, Any]) -> str:
     node_path = _node_path(node) or ''
     source_text = _string(file_contents.get(node_path))
@@ -837,6 +845,9 @@ def rank_issue_candidates(
         warnings.append({'code': 'no_ranked_issue_nodes', 'message': 'Issue evidence did not match graph nodes directly.'})
 
     ranked_ids = sorted(scores, key=lambda node_id: (-scores[node_id], _node_path(nodes_by_id[node_id]) or '', node_id))
+    source_ranked_ids = [node_id for node_id in ranked_ids if _is_source_backed_node(analysis, nodes_by_id[node_id])]
+    if source_ranked_ids:
+        ranked_ids = source_ranked_ids
     if ranked_ids and scores[ranked_ids[0]] < 40:
         warnings.append({'code': 'low_confidence_issue_ranking', 'message': 'Issue evidence produced only weak graph matches.'})
     if _weak_issue_evidence(scores, evidence_by_node, ranked_ids, nodes_by_id):

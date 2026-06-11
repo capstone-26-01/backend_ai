@@ -12,4 +12,4 @@ Residual non-blocking risks:
 
 5. No automated lint against partial symbol-name leakage in issue text - `repo_same_file_precision` intentionally names `delete_share_token` as a decoy, but there is no harness-level test scanning issue bodies for unexpected mentions of expected symbol basenames such as `attach_labels` or `refresh_issue_cache`. Fix: add a validation check that no expected `node_id` basename appears verbatim in the issue text unless explicitly allowlisted as a decoy.
 
-6. Negation heuristic brittleness in `issue_map_extension.ts` - `isNegatedMention` relies on a hardcoded 48-character context window and a static phrase list. Novel negation phrasing outside this window could evade rejection at runtime. Fix: expand phrase list and add a sample that exercises a longer-distance negation.
+6. Negation heuristic brittleness in the runtime Pi extension - `isNegatedMention` relies on bounded context windows and static phrase lists. Novel negation phrasing outside those windows could evade rejection at runtime. Fix: expand phrase coverage and add a sample that exercises longer-distance negation.

@@ -287,6 +287,27 @@ class ReportAggregationTests(unittest.TestCase):
         self.assertEqual(report['failures_by_reason'], {evaluator.FAILURE_NO_GOLD_OVERLAP: 1})
 
 
+class RunnerHarnessCommandTests(unittest.TestCase):
+    def test_provider_rate_limited_code_maps_to_provider_rate_limited_failure(self) -> None:
+        self.assertEqual(runner._failure_reason_from_harness('provider_rate_limited'), evaluator.FAILURE_PROVIDER_RATE_LIMITED)
+
+    def test_legacy_harness_rate_limited_code_maps_to_provider_rate_limited_failure(self) -> None:
+        self.assertEqual(runner._failure_reason_from_harness('harness_rate_limited'), evaluator.FAILURE_PROVIDER_RATE_LIMITED)
+
+    def test_default_pi_command_targets_runtime_issue_runner(self) -> None:
+        command = runner._pi_command('kimi-k2.5', 'opencode_zen')
+
+        self.assertEqual(command[:3], [sys.executable, '-m', 'llm.pi_issue_runner'])
+        self.assertIn('--provider', command)
+        self.assertEqual(command[command.index('--provider') + 1], 'opencode')
+        self.assertEqual(command[command.index('--model') + 1], 'kimi-k2.5')
+
+    def test_custom_command_passthrough_remains_available(self) -> None:
+        command = runner._pi_command('kimi-k2.5', 'opencode', ['--', 'python', 'custom_runner.py'])
+
+        self.assertEqual(command, ['python', 'custom_runner.py'])
+
+
 class RunnerCostTests(unittest.TestCase):
     def test_cost_usd_from_opencode_usage(self) -> None:
         usage = {

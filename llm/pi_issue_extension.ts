@@ -54,7 +54,8 @@ type ToolCall = {
 type GraphNode = NonNullable<NonNullable<IssueHarnessJob["graph"]>["nodes"]>[number];
 
 const toolCalls: ToolCall[] = [];
-const MAX_TOOL_CALLS = 30;
+const SOFT_FINISH_TOOL_CALLS = 12;
+const MAX_TOOL_CALLS = 80;
 const GENERIC_TERMS = new Set([
   "api",
   "app",
@@ -125,6 +126,19 @@ function recordToolCall(name: string, args: unknown) {
   }
   toolCalls.push({ name, arguments: args });
   return null;
+}
+
+function finishGuidance() {
+  const used = toolCalls.filter((call) => call.name !== "finish_issue_map_transcript").length;
+  return {
+    tool_call_budget: {
+      used,
+      soft_finish_by: SOFT_FINISH_TOOL_CALLS,
+      hard_max: MAX_TOOL_CALLS,
+      instruction:
+        "Do not exhaustively search. Verify the best seed/search candidates, then call finish_issue_map_transcript. If used >= soft_finish_by, finish now with the best inspected nodes.",
+    },
+  };
 }
 
 function issueText(job: IssueHarnessJob): string {
@@ -281,6 +295,13 @@ const getIssueContext = defineTool({
       comments: job.comments || [],
       evidence: job.evidence || {},
       seed_candidates: job.seed_candidates || [],
+      recommended_workflow: [
+        "Use seed_candidates as the primary ranked shortlist.",
+        "Run at most one symbol search and one text search if seed evidence is insufficient.",
+        "Inspect at most two likely nodes with read_node_context or read_repo_file.",
+        "Call finish_issue_map_transcript with the best 1-3 inspected origin nodes; do not keep searching for certainty.",
+      ],
+      ...finishGuidance(),
     };
     return jsonToolResult(result);
   },
@@ -381,7 +402,11 @@ const searchRepoSymbols = defineTool({
     if (budgetError) return budgetError;
     const job = loadJob();
     const candidates = rankedSymbols(job, String(params.query || "")).slice(0, 20);
-    return jsonToolResult({ candidates });
+    return jsonToolResult({
+      candidates,
+      instruction: "Pick the strongest candidate(s), inspect at most two, then call finish_issue_map_transcript.",
+      ...finishGuidance(),
+    });
   },
 });
 
@@ -396,7 +421,11 @@ const searchRepoText = defineTool({
     if (budgetError) return budgetError;
     const job = loadJob();
     const matches = searchText(job, String(params.query || ""));
-    return jsonToolResult({ matches });
+    return jsonToolResult({
+      matches,
+      instruction: "Use these text matches to choose a short candidate list. Do not continue broad text search after a plausible file is found.",
+      ...finishGuidance(),
+    });
   },
 });
 
@@ -419,7 +448,14 @@ const readRepoFile = defineTool({
     const start = Math.max(1, Number(params.start_line || 1));
     const end = Math.min(lines.length, Number(params.end_line || Math.min(lines.length, start + 120)));
     const excerpt = lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 8000);
-    const result = { path: filePath, start_line: start, end_line: end, excerpt };
+    const result = {
+      path: filePath,
+      start_line: start,
+      end_line: end,
+      excerpt,
+      instruction: "If this file plausibly explains the issue, call finish_issue_map_transcript now.",
+      ...finishGuidance(),
+    };
     return jsonToolResult(result);
   },
 });
@@ -496,6 +532,8 @@ const readNodeContext = defineTool({
         nodes: neighborNodes,
       },
       warnings,
+      instruction: "If this node plausibly explains the issue, call finish_issue_map_transcript now. Otherwise inspect one more candidate at most.",
+      ...finishGuidance(),
     };
     return jsonToolResult(result);
   },
@@ -512,7 +550,9 @@ const getNode = defineTool({
     if (budgetError) return budgetError;
     const job = loadJob();
     const node = nodeById(job, params.node_id);
-    const result = node ? { node } : { error: "node_not_found", node_id: params.node_id };
+    const result = node
+      ? { node, instruction: "Prefer read_node_context over repeated get_node calls; finish after inspecting the best candidate.", ...finishGuidance() }
+      : { error: "node_not_found", node_id: params.node_id, ...finishGuidance() };
     return jsonToolResult(result);
   },
 });
@@ -533,7 +573,13 @@ const getNeighbors = defineTool({
       .slice(0, limit);
     const neighborIds = new Set(edges.flatMap((edge) => [edge.source || "", edge.target || ""]).filter((nodeId) => nodeId && nodeId !== params.node_id));
     const nodes = (job.graph?.nodes || []).filter((node) => neighborIds.has(node.id || ""));
-    const result = { node_id: params.node_id, nodes, edges };
+    const result = {
+      node_id: params.node_id,
+      nodes,
+      edges,
+      instruction: "Use neighbors only to confirm the best origin node; then call finish_issue_map_transcript.",
+      ...finishGuidance(),
+    };
     return jsonToolResult(result);
   },
 });

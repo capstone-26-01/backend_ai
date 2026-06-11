@@ -288,7 +288,7 @@ read_repo_file, read_node_context, or get_neighbors before final nodes
 finish_issue_map_transcript
 ```
 
-The older `harness_eval/pi_runner.py` repo-fixture adapter is not the target unless it is explicitly updated to the same runtime tool contract. This prevents a model from passing SWE-bench localization with a different tool surface than production.
+The older `harness_eval/pi_runner.py` repo-fixture adapter has been retired. This prevents a model from passing SWE-bench localization with a different tool surface than production.
 
 Preferred command shape:
 

@@ -9,7 +9,6 @@
     "types": ["node"]
   },
   "include": [
-    "llm/pi_issue_extension.ts",
-    "harness_eval/pi/issue_map_extension.ts"
+    "llm/pi_issue_extension.ts"
   ]
 }
