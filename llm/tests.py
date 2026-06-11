@@ -13,8 +13,10 @@ from typing import cast
 from api.services import get_repo_analysis
 from api.test_utils import create_git_fixture_repo
 from llm.issue_harness import (
+    IssueHarnessResult,
     IssueHarnessUnavailable,
     build_issue_harness_job,
+    build_qa_harness_job,
     run_issue_harness,
 )
 from llm.services import (
@@ -176,6 +178,95 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         self.assertEqual(response['citations'], ['pkg/factory.py'])
         self.assertEqual(response['warnings'][0]['code'], 'invalid_selected_node')
+
+    @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('llm.services._generate_answer')
+    @patch('llm.services.run_issue_harness')
+    def test_answer_question_uses_qa_harness_when_enabled(self, run_harness, generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
+            'edges': [],
+        }
+        run_harness.return_value = IssueHarnessResult(
+            output={
+                'answer': 'main은 pkg/app.py에 있습니다.',
+                'citations': ['pkg/app.py'],
+                'selected_nodes': ['pkg/app.py::main'],
+                'context_files': ['pkg/app.py'],
+                'confidence': {'score': 0.9},
+                'warnings': [],
+            },
+            tool_calls=[
+                {'name': 'get_question_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'pkg/app.py'}},
+            ],
+            metadata={'variant_id': 'runtime-pi-qa-harness'},
+        )
+
+        response = answer_question('owner/repo', analysis, 'main은 어디인가요?', selected_file_path='pkg/app.py')
+
+        self.assertEqual(response['answer'], 'main은 pkg/app.py에 있습니다.')
+        self.assertEqual(response['citations'], ['pkg/app.py'])
+        self.assertEqual(cast(dict[str, object], response['context_summary'])['strategy'], 'pi_harness')
+        self.assertEqual(cast(dict[str, object], response['harness'])['source'], 'pi_harness')
+        generate_answer.assert_not_called()
+        run_harness.assert_called_once()
+        harness_job = run_harness.call_args.args[0]
+        self.assertEqual(harness_job['task'], 'answer_repo_question')
+        self.assertEqual(harness_job['file_contents']['pkg/app.py'], 'def main():\n    return "ok"\n')
+
+    @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('llm.services._generate_answer')
+    @patch('llm.services.run_issue_harness')
+    def test_answer_question_falls_back_when_qa_harness_unavailable(self, run_harness, generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
+            'edges': [],
+        }
+        run_harness.side_effect = IssueHarnessUnavailable('harness_failed', 'model offline')
+        generate_answer.return_value = 'classic fallback'
+
+        response = answer_question('owner/repo', analysis, 'main은 어디인가요?')
+
+        self.assertEqual(response['answer'], 'classic fallback')
+        self.assertTrue(any(warning['code'] == 'harness_failed' for warning in cast(list[dict[str, object]], response['warnings'])))
+
+    @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('llm.services._stream_generate_answer')
+    @patch('llm.services.run_issue_harness')
+    def test_stream_answer_question_uses_qa_harness_final_event(self, run_harness, stream_generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
+            'edges': [],
+        }
+        run_harness.return_value = IssueHarnessResult(
+            output={
+                'answer': 'harness answer',
+                'citations': ['pkg/app.py'],
+                'selected_nodes': ['pkg/app.py::main'],
+                'context_files': ['pkg/app.py'],
+                'warnings': [],
+            },
+            tool_calls=[
+                {'name': 'get_question_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'pkg/app.py'}},
+            ],
+            metadata={'variant_id': 'runtime-pi-qa-harness'},
+        )
+
+        events = list(stream_answer_question('owner/repo', analysis, 'main은 어디인가요?'))
+
+        self.assertEqual([event['event'] for event in events], ['meta', 'final'])
+        self.assertEqual(events[1]['data']['answer'], 'harness answer')
+        stream_generate_answer.assert_not_called()
 
     def test_rank_files_can_use_cached_summary_text_hook(self):
         analysis = {
@@ -520,6 +611,83 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertEqual(job['evidence']['test_mentions'], [])
         self.assertEqual(job['evidence']['quoted_strings'], [])
 
+    def test_qa_harness_job_preserves_full_file_text_and_qa_tools(self):
+        long_text = 'A' * (20_000 + 250)
+        analysis = self._analysis()
+        analysis['file_contents'] = {'pkg/app.py': long_text}
+        analysis['file_manifest'] = {'pkg/app.py': {'path': 'pkg/app.py', 'language': 'python', 'byte_size': len(long_text)}}
+        analysis['nodes'] = [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 1}]
+        analysis['edges'] = []
+
+        job = build_qa_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            question='What are the key methods?',
+            analysis=analysis,
+            selected_file_path='pkg/app.py',
+        )
+
+        tool_names = {tool['name'] for tool in job['available_tools']}
+        self.assertEqual(job['task'], 'answer_repo_question')
+        self.assertEqual(job['file_contents']['pkg/app.py'], long_text)
+        self.assertFalse(job['file_manifest']['pkg/app.py']['truncated'])
+        self.assertIn('get_question_context', tool_names)
+        self.assertIn('finish_repo_qa_transcript', tool_names)
+        self.assertNotIn('get_issue_context', tool_names)
+        self.assertNotIn('finish_issue_map_transcript', tool_names)
+
+    def test_run_issue_harness_accepts_qa_transcript(self):
+        job = build_qa_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            question='Where is parse_repo?',
+            analysis=self._analysis(),
+        )
+        payload = {
+            'variant_id': 'test-qa-harness',
+            'tool_calls': [
+                {'name': 'get_question_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            'final': {
+                'answer': 'parse_repo는 parser/services.py에 있습니다.',
+                'citations': ['parser/services.py'],
+                'selected_nodes': ['parser/services.py::parse_repo'],
+                'context_files': ['parser/services.py'],
+                'confidence': {'score': 0.9},
+                'warnings': [],
+            },
+        }
+
+        result = run_issue_harness(job, command=self._command_that_prints(payload), timeout_seconds=5)
+
+        self.assertEqual(result.output['answer'], 'parse_repo는 parser/services.py에 있습니다.')
+        self.assertEqual([call['name'] for call in result.tool_calls], ['get_question_context', 'list_repo_files', 'read_repo_file'])
+
+    def test_run_issue_harness_rejects_qa_transcript_without_question_context(self):
+        job = build_qa_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            question='Where is parse_repo?',
+            analysis=self._analysis(),
+        )
+        payload = {
+            'tool_calls': [
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            'final': {
+                'answer': 'parse_repo는 parser/services.py에 있습니다.',
+                'citations': ['parser/services.py'],
+                'selected_nodes': ['parser/services.py::parse_repo'],
+                'context_files': ['parser/services.py'],
+            },
+        }
+
+        with self.assertRaisesMessage(IssueHarnessUnavailable, 'question context'):
+            run_issue_harness(job, command=self._command_that_prints(payload), timeout_seconds=5)
+
     def test_run_issue_harness_accepts_tool_backed_transcript(self):
         payload = {
             'variant_id': 'test-harness',
@@ -719,6 +887,54 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertIn('12 non-finish tool calls', prompt)
         self.assertEqual(command[command.index('--thinking') + 1], 'high')
         self.assertLess(tools.index('read_node_context'), tools.index('finish_issue_map_transcript'))
+
+    def test_pi_runner_command_and_prompt_switch_for_qa_task(self):
+        from argparse import Namespace
+        from llm import pi_issue_runner
+
+        args = Namespace(
+            pi_bin='npx',
+            pi_package='@earendil-works/pi-coding-agent@0.79.1',
+            extension=pi_issue_runner.DEFAULT_EXTENSION,
+            provider='opencode',
+            model='kimi-k2.6',
+            thinking='high',
+        )
+        job = build_qa_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            question='What are the key methods?',
+            analysis=self._analysis(),
+        )
+
+        command = pi_issue_runner.build_command(args, job)
+        tools = command[command.index('--tools') + 1]
+        prompt = pi_issue_runner.build_prompt(job)
+
+        self.assertIn('get_question_context', tools)
+        self.assertIn('finish_repo_qa_transcript', tools)
+        self.assertNotIn('finish_issue_map_transcript', tools)
+        self.assertIn('Answer the user repository question', prompt)
+        self.assertIn('Finish only by calling finish_repo_qa_transcript', prompt)
+
+    def test_pi_runner_transcript_parser_accepts_qa_finish_tool(self):
+        from llm.pi_issue_runner import extract_transcript
+
+        transcript = {
+            'sample_id': 'github:owner/repo:qa@abc123',
+            'variant_id': 'runtime-pi-qa-harness',
+            'tool_calls': [
+                {'name': 'get_question_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            'final': {'answer': 'QA answer', 'citations': ['parser/services.py'], 'selected_nodes': [], 'context_files': ['parser/services.py']},
+        }
+        event = {'role': 'toolResult', 'toolName': 'finish_repo_qa_transcript', 'details': transcript}
+
+        parsed, _metadata = extract_transcript(json.dumps(event))
+
+        self.assertEqual(cast(dict[str, object], parsed)['final'], transcript['final'])
 
     def _pi_args(self, **overrides):
         from argparse import Namespace

@@ -5,11 +5,20 @@ import { Type } from "typebox";
 
 type IssueHarnessJob = {
   job_id?: string;
+  task?: string;
   repo?: {
+    full_name?: string;
+    revision?: string;
     language?: string;
     primary_language?: string;
     languages?: string[];
     analysis_profile?: string;
+  };
+  question?: {
+    text?: string;
+    selected_node_id?: string;
+    selected_file_path?: string;
+    max_context_files?: number;
   };
   issue?: {
     title?: string;
@@ -54,6 +63,10 @@ type ToolCall = {
 type GraphNode = NonNullable<NonNullable<IssueHarnessJob["graph"]>["nodes"]>[number];
 
 const toolCalls: ToolCall[] = [];
+const QA_TASK = "answer_repo_question";
+const ISSUE_FINISH_TOOL = "finish_issue_map_transcript";
+const QA_FINISH_TOOL = "finish_repo_qa_transcript";
+const FINISH_TOOLS = new Set([ISSUE_FINISH_TOOL, QA_FINISH_TOOL]);
 const SOFT_FINISH_TOOL_CALLS = 12;
 const MAX_TOOL_CALLS = 80;
 const GENERIC_TERMS = new Set([
@@ -100,23 +113,34 @@ function jsonToolResult(payload: Record<string, unknown>, terminate = false): Ag
   };
 }
 
+function isQaJob(job: IssueHarnessJob): boolean {
+  return job.task === QA_TASK;
+}
+
+function variantId(job: IssueHarnessJob): string {
+  return isQaJob(job) ? "runtime-pi-qa-harness" : "runtime-pi-issue-harness";
+}
+
+function finishToolName(job: IssueHarnessJob): string {
+  return isQaJob(job) ? QA_FINISH_TOOL : ISSUE_FINISH_TOOL;
+}
+
+function nonFinishToolCalls(): ToolCall[] {
+  return toolCalls.filter((call) => !FINISH_TOOLS.has(call.name));
+}
+
 function recordToolCall(name: string, args: unknown) {
-  const countedCalls = toolCalls.filter((call) => call.name !== "finish_issue_map_transcript").length;
-  if (name !== "finish_issue_map_transcript" && countedCalls >= MAX_TOOL_CALLS) {
+  const countedCalls = nonFinishToolCalls().length;
+  if (!FINISH_TOOLS.has(name) && countedCalls >= MAX_TOOL_CALLS) {
     const job = loadJob();
+    const final = isQaJob(job)
+      ? { answer: "", citations: [], selected_nodes: [], context_files: [], confidence: { level: "none", score: 0, reasons: ["tool_call_budget_exceeded"] } }
+      : { hypotheses: [], investigation_path: [], confidence: { level: "none", score: 0, reasons: ["tool_call_budget_exceeded"] } };
     return jsonToolResult({
       sample_id: job.job_id,
-      variant_id: "runtime-pi-issue-harness",
-      tool_calls: toolCalls.filter((call) => call.name !== "finish_issue_map_transcript"),
-      final: {
-        hypotheses: [],
-        investigation_path: [],
-        confidence: {
-          level: "none",
-          score: 0,
-          reasons: ["tool_call_budget_exceeded"],
-        },
-      },
+      variant_id: variantId(job),
+      tool_calls: nonFinishToolCalls(),
+      final,
       error: "tool_call_budget_exceeded",
       max_tool_calls: MAX_TOOL_CALLS,
       attempted_tool: name,
@@ -128,20 +152,22 @@ function recordToolCall(name: string, args: unknown) {
   return null;
 }
 
-function finishGuidance() {
-  const used = toolCalls.filter((call) => call.name !== "finish_issue_map_transcript").length;
+function finishGuidance(job: IssueHarnessJob) {
+  const used = nonFinishToolCalls().length;
+  const finishTool = finishToolName(job);
   return {
     tool_call_budget: {
       used,
       soft_finish_by: SOFT_FINISH_TOOL_CALLS,
       hard_max: MAX_TOOL_CALLS,
       instruction:
-        "Do not exhaustively search. Verify the best seed/search candidates, then call finish_issue_map_transcript. If used >= soft_finish_by, finish now with the best inspected nodes.",
+        `Do not exhaustively search. Verify the best artifact evidence, then call ${finishTool}. If used >= soft_finish_by, finish now with the best inspected context.`,
     },
   };
 }
 
 function issueText(job: IssueHarnessJob): string {
+  if (isQaJob(job)) return [job.question?.text || "", job.question?.selected_node_id || "", job.question?.selected_file_path || ""].join("\n").toLowerCase();
   return [
     job.issue?.title || "",
     job.issue?.body || "",
@@ -221,7 +247,7 @@ function validPaths(job: IssueHarnessJob): Set<string> {
 }
 
 function priorToolNames(): string[] {
-  return toolCalls.filter((call) => call.name !== "finish_issue_map_transcript").map((call) => call.name);
+  return nonFinishToolCalls().map((call) => call.name);
 }
 
 function safeFilePath(job: IssueHarnessJob, rawPath: string): string {
@@ -301,7 +327,41 @@ const getIssueContext = defineTool({
         "Inspect at most two likely nodes with read_node_context or read_repo_file.",
         "Call finish_issue_map_transcript with the best 1-3 inspected origin nodes; do not keep searching for certainty.",
       ],
-      ...finishGuidance(),
+      ...finishGuidance(job),
+    };
+    return jsonToolResult(result);
+  },
+});
+
+const getQuestionContext = defineTool({
+  name: "get_question_context",
+  label: "Get Question Context",
+  description: "Read the bounded repository question, selected graph node, and selected file focus.",
+  promptSnippet: "Read the user repository question before searching repository artifacts",
+  parameters: Type.Object({}),
+  async execute(_toolCallId, params) {
+    const budgetError = recordToolCall("get_question_context", params);
+    if (budgetError) return budgetError;
+    const job = loadJob();
+    const selectedNodeId = job.question?.selected_node_id || "";
+    const selectedFilePath = job.question?.selected_file_path || "";
+    const result = {
+      repo: job.repo || {},
+      question: job.question || {},
+      selected_node: selectedNodeId ? compactNode(nodeById(job, selectedNodeId)) : undefined,
+      selected_file: selectedFilePath
+        ? {
+            path: selectedFilePath,
+            manifest: job.file_manifest?.[selectedFilePath] || null,
+            available: Object.prototype.hasOwnProperty.call(job.file_contents || {}, selectedFilePath),
+          }
+        : undefined,
+      recommended_workflow: [
+        "Use selected_file_path or selected_node_id first when present.",
+        "List files, search symbols/text as needed, then read exact files or node context before answering.",
+        "Call finish_repo_qa_transcript with answer, citations, selected_nodes, and context_files.",
+      ],
+      ...finishGuidance(job),
     };
     return jsonToolResult(result);
   },
@@ -328,7 +388,7 @@ function searchText(job: IssueHarnessJob, query: string) {
       }
     });
   }
-  return matches.slice(0, 40);
+  return isQaJob(job) ? matches : matches.slice(0, 40);
 }
 
 function compactNode(node: GraphNode | undefined) {
@@ -359,6 +419,10 @@ function listedFiles(job: IssueHarnessJob) {
       truncated: Boolean(manifest.truncated),
     };
   });
+}
+
+function excerptForJob(job: IssueHarnessJob, text: string): string {
+  return isQaJob(job) ? text : text.slice(0, 8000);
 }
 
 function findContainer(job: IssueHarnessJob, node: GraphNode) {
@@ -401,11 +465,12 @@ const searchRepoSymbols = defineTool({
     const budgetError = recordToolCall("search_repo_symbols", params);
     if (budgetError) return budgetError;
     const job = loadJob();
-    const candidates = rankedSymbols(job, String(params.query || "")).slice(0, 20);
+    const ranked = rankedSymbols(job, String(params.query || ""));
+    const candidates = isQaJob(job) ? ranked : ranked.slice(0, 20);
     return jsonToolResult({
       candidates,
-      instruction: "Pick the strongest candidate(s), inspect at most two, then call finish_issue_map_transcript.",
-      ...finishGuidance(),
+      instruction: `Pick the strongest candidate(s), inspect exact context, then call ${finishToolName(job)}.`,
+      ...finishGuidance(job),
     });
   },
 });
@@ -424,7 +489,7 @@ const searchRepoText = defineTool({
     return jsonToolResult({
       matches,
       instruction: "Use these text matches to choose a short candidate list. Do not continue broad text search after a plausible file is found.",
-      ...finishGuidance(),
+      ...finishGuidance(job),
     });
   },
 });
@@ -446,15 +511,16 @@ const readRepoFile = defineTool({
     const filePath = safeFilePath(job, params.path);
     const lines = String((job.file_contents || {})[filePath] || "").split(/\r?\n/);
     const start = Math.max(1, Number(params.start_line || 1));
-    const end = Math.min(lines.length, Number(params.end_line || Math.min(lines.length, start + 120)));
-    const excerpt = lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 8000);
+    const defaultEnd = isQaJob(job) ? lines.length : Math.min(lines.length, start + 120);
+    const end = Math.min(lines.length, Number(params.end_line || defaultEnd));
+    const excerpt = excerptForJob(job, lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n"));
     const result = {
       path: filePath,
       start_line: start,
       end_line: end,
       excerpt,
-      instruction: "If this file plausibly explains the issue, call finish_issue_map_transcript now.",
-      ...finishGuidance(),
+      instruction: `If this file answers the task, call ${finishToolName(job)} now.`,
+      ...finishGuidance(job),
     };
     return jsonToolResult(result);
   },
@@ -478,8 +544,8 @@ const readNodeContext = defineTool({
     const node = nodeById(job, nodeId)!;
     const warnings: string[] = [];
 
-    const before = Math.max(0, Math.min(80, Number(params.before ?? 8)));
-    const after = Math.max(0, Math.min(80, Number(params.after ?? 20)));
+    const before = isQaJob(job) ? Math.max(0, Number(params.before ?? Number.MAX_SAFE_INTEGER)) : Math.max(0, Math.min(80, Number(params.before ?? 8)));
+    const after = isQaJob(job) ? Math.max(0, Number(params.after ?? Number.MAX_SAFE_INTEGER)) : Math.max(0, Math.min(80, Number(params.after ?? 20)));
     const nodeStart = Number(node.start_line || 0);
     const nodeEnd = Number(node.end_line || node.start_line || 0);
     const filePath = node.path || "";
@@ -495,12 +561,12 @@ const readNodeContext = defineTool({
     } else if (!nodeStart || !nodeEnd) {
       warnings.push("line_range_unavailable");
       const lines = String((job.file_contents || {})[filePath] || "").split(/\r?\n/);
-      const end = Math.min(lines.length, 120);
+      const end = isQaJob(job) ? lines.length : Math.min(lines.length, 120);
       context = {
         path: filePath,
         start_line: 1,
         end_line: end,
-        excerpt: lines.slice(0, end).map((line, index) => `${index + 1}: ${line}`).join("\n").slice(0, 8000),
+        excerpt: excerptForJob(job, lines.slice(0, end).map((line, index) => `${index + 1}: ${line}`).join("\n")),
       };
     } else {
       const lines = String((job.file_contents || {})[filePath] || "").split(/\r?\n/);
@@ -510,18 +576,21 @@ const readNodeContext = defineTool({
         path: filePath,
         start_line: start,
         end_line: end,
-        excerpt: lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n").slice(0, 8000),
+        excerpt: excerptForJob(job, lines.slice(start - 1, end).map((line, index) => `${start + index}: ${line}`).join("\n")),
       };
     }
 
-    const incoming = (job.graph?.edges || []).filter((edge) => edge.target === nodeId).slice(0, 50);
-    const outgoing = (job.graph?.edges || []).filter((edge) => edge.source === nodeId).slice(0, 50);
+    const incomingEdges = (job.graph?.edges || []).filter((edge) => edge.target === nodeId);
+    const outgoingEdges = (job.graph?.edges || []).filter((edge) => edge.source === nodeId);
+    const incoming = isQaJob(job) ? incomingEdges : incomingEdges.slice(0, 50);
+    const outgoing = isQaJob(job) ? outgoingEdges : outgoingEdges.slice(0, 50);
     const neighborIds = new Set(
       [...incoming, ...outgoing]
         .flatMap((edge) => [edge.source || "", edge.target || ""])
         .filter((candidateId) => candidateId && candidateId !== nodeId)
     );
-    const neighborNodes = (job.graph?.nodes || []).filter((candidate) => neighborIds.has(candidate.id || "")).slice(0, 50).map(compactNode);
+    const allNeighborNodes = (job.graph?.nodes || []).filter((candidate) => neighborIds.has(candidate.id || ""));
+    const neighborNodes = (isQaJob(job) ? allNeighborNodes : allNeighborNodes.slice(0, 50)).map(compactNode);
     const result = {
       node: compactNode(node),
       context,
@@ -532,8 +601,8 @@ const readNodeContext = defineTool({
         nodes: neighborNodes,
       },
       warnings,
-      instruction: "If this node plausibly explains the issue, call finish_issue_map_transcript now. Otherwise inspect one more candidate at most.",
-      ...finishGuidance(),
+      instruction: `If this node answers the task, call ${finishToolName(job)} now. Otherwise inspect one more candidate at most.`,
+      ...finishGuidance(job),
     };
     return jsonToolResult(result);
   },
@@ -551,8 +620,8 @@ const getNode = defineTool({
     const job = loadJob();
     const node = nodeById(job, params.node_id);
     const result = node
-      ? { node, instruction: "Prefer read_node_context over repeated get_node calls; finish after inspecting the best candidate.", ...finishGuidance() }
-      : { error: "node_not_found", node_id: params.node_id, ...finishGuidance() };
+      ? { node, instruction: "Prefer read_node_context over repeated get_node calls; finish after inspecting the best candidate.", ...finishGuidance(job) }
+      : { error: "node_not_found", node_id: params.node_id, ...finishGuidance(job) };
     return jsonToolResult(result);
   },
 });
@@ -567,7 +636,7 @@ const getNeighbors = defineTool({
     const budgetError = recordToolCall("get_neighbors", params);
     if (budgetError) return budgetError;
     const job = loadJob();
-    const limit = Math.max(1, Math.min(50, Number(params.limit || 20)));
+    const limit = isQaJob(job) ? Math.max(1, Number(params.limit || Number.MAX_SAFE_INTEGER)) : Math.max(1, Math.min(50, Number(params.limit || 20)));
     const edges = (job.graph?.edges || [])
       .filter((edge) => edge.source === params.node_id || edge.target === params.node_id)
       .slice(0, limit);
@@ -577,8 +646,8 @@ const getNeighbors = defineTool({
       node_id: params.node_id,
       nodes,
       edges,
-      instruction: "Use neighbors only to confirm the best origin node; then call finish_issue_map_transcript.",
-      ...finishGuidance(),
+      instruction: `Use neighbors to confirm the answer, then call ${finishToolName(job)}.`,
+      ...finishGuidance(job),
     };
     return jsonToolResult(result);
   },
@@ -708,8 +777,8 @@ const finishIssueMapTranscript = defineTool({
 
     const transcript = {
       sample_id: job.job_id,
-      variant_id: "runtime-pi-issue-harness",
-      tool_calls: toolCalls.filter((call) => call.name !== "finish_issue_map_transcript"),
+      variant_id: variantId(job),
+      tool_calls: nonFinishToolCalls(),
       final: {
         hypotheses: params.hypotheses || [],
         investigation_path: params.investigation_path || [],
@@ -720,8 +789,106 @@ const finishIssueMapTranscript = defineTool({
   },
 });
 
+const finishRepoQaTranscript = defineTool({
+  name: "finish_repo_qa_transcript",
+  label: "Finish Repo QA Transcript",
+  description: "Return a final repository question answer grounded in inspected artifact files and graph nodes.",
+  promptSnippet: "Finish with an answer, citations, selected nodes, and context files after bounded tool investigation",
+  promptGuidelines: [
+    "Call finish_repo_qa_transcript only after reading question context, listing files, and inspecting repository artifacts.",
+    "Use exact node_id values and repository-relative paths returned by tools. Do not invent citations.",
+  ],
+  parameters: Type.Object({
+    answer: Type.String(),
+    citations: Type.Optional(Type.Array(Type.String())),
+    selected_nodes: Type.Optional(Type.Array(Type.String())),
+    context_files: Type.Optional(Type.Array(Type.String())),
+    confidence: Type.Optional(Type.Object({
+      level: Type.Optional(Type.String()),
+      score: Type.Optional(Type.Number()),
+      reasons: Type.Optional(Type.Array(Type.String())),
+      rationale: Type.Optional(Type.String()),
+    })),
+    warnings: Type.Optional(Type.Array(Type.Object({
+      code: Type.Optional(Type.String()),
+      message: Type.Optional(Type.String()),
+    }))),
+  }),
+  async execute(_toolCallId, params) {
+    const budgetError = recordToolCall("finish_repo_qa_transcript", params);
+    if (budgetError) return budgetError;
+    const job = loadJob();
+    const toolNames = priorToolNames();
+    if (toolNames.length === 0) {
+      return jsonToolResult({
+        error: "missing_tool_work",
+        instruction: "Call get_question_context, list_repo_files, and inspect repository artifacts before finishing.",
+      });
+    }
+    if (!toolNames.includes("get_question_context")) {
+      return jsonToolResult({
+        error: "missing_question_context",
+        instruction: "Retry after reading bounded question context with get_question_context.",
+      });
+    }
+    if (!toolNames.includes("list_repo_files")) {
+      return jsonToolResult({
+        error: "missing_file_listing",
+        instruction: "Retry after listing bounded repository files with list_repo_files.",
+      });
+    }
+    const repositoryTools = ["search_repo_symbols", "search_repo_text", "read_repo_file", "get_node", "get_neighbors", "read_node_context"];
+    if (!repositoryTools.some((name) => toolNames.includes(name))) {
+      return jsonToolResult({
+        error: "missing_inspection",
+        instruction: "Retry after inspecting repository symbols, text, files, nodes, or neighbors.",
+      });
+    }
+
+    const validNodes = validNodeIds(job);
+    const selectedNodes = params.selected_nodes || [];
+    const invalidNodes = Array.from(new Set(selectedNodes.filter((nodeId) => !validNodes.has(nodeId))));
+    if (invalidNodes.length) {
+      return jsonToolResult({
+        error: "invalid_node_ids",
+        invalid_node_ids: invalidNodes,
+        valid_node_id_examples: Array.from(validNodes).slice(0, 20),
+        instruction: "Retry finish_repo_qa_transcript using exact node_id values returned by graph tools.",
+      });
+    }
+
+    const paths = validPaths(job);
+    const citationPaths = [...(params.citations || []), ...(params.context_files || [])].filter(Boolean);
+    const invalidPaths = Array.from(new Set(citationPaths.filter((filePath) => !paths.has(filePath))));
+    if (invalidPaths.length) {
+      return jsonToolResult({
+        error: "invalid_paths",
+        invalid_paths: invalidPaths,
+        valid_path_examples: Array.from(paths).slice(0, 20),
+        instruction: "Retry using repository-relative file paths available in the analysis artifact.",
+      });
+    }
+
+    const transcript = {
+      sample_id: job.job_id,
+      variant_id: variantId(job),
+      tool_calls: nonFinishToolCalls(),
+      final: {
+        answer: params.answer || "",
+        citations: params.citations || [],
+        selected_nodes: selectedNodes,
+        context_files: params.context_files || params.citations || [],
+        confidence: params.confidence || {},
+        warnings: params.warnings || [],
+      },
+    };
+    return jsonToolResult(transcript, true);
+  },
+});
+
 export default function (pi: ExtensionAPI) {
   pi.registerTool(getIssueContext);
+  pi.registerTool(getQuestionContext);
   pi.registerTool(listRepoFiles);
   pi.registerTool(searchRepoSymbols);
   pi.registerTool(searchRepoText);
@@ -730,4 +897,5 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(getNeighbors);
   pi.registerTool(readNodeContext);
   pi.registerTool(finishIssueMapTranscript);
+  pi.registerTool(finishRepoQaTranscript);
 }
