@@ -328,6 +328,25 @@ def _safe_progress_args(tool_name: str, value: Any) -> dict[str, str]:
     return {key: _short_string(value[key]) for key in allowed_keys if key in value and isinstance(value[key], (str, int, float, bool))}
 
 
+def _answer_token_chunks(value: Any, *, chunk_size: int = 80) -> Iterator[str]:
+    text = str(value or '')
+    for index in range(0, len(text), chunk_size):
+        chunk = text[index:index + chunk_size]
+        if chunk:
+            yield chunk
+
+
+def _qa_stream_error_event(error: IssueHarnessUnavailable) -> dict[str, object]:
+    return {
+        'event': 'error',
+        'data': {
+            'error': error.message or 'QA harness 실행 중 오류가 발생했습니다.',
+            'code': error.code,
+            'source': 'qa_harness',
+        },
+    }
+
+
 def _iter_mappings(value: Any) -> Iterator[Mapping[str, Any]]:
     if isinstance(value, Mapping):
         yield value
@@ -539,6 +558,7 @@ def stream_answer_question(
 ) -> Iterator[dict[str, object]]:
     fallback_warning: dict[str, Any] | None = None
     if _qa_harness_enabled():
+        harness_stream: Iterator[dict[str, Any]] | None = None
         try:
             job, extra_env = _qa_harness_job_and_env(
                 repo_path,
@@ -559,12 +579,13 @@ def stream_answer_question(
             }
             response = None
             emitted_progress: set[str] = set()
-            for item in stream_issue_harness(
+            harness_stream = stream_issue_harness(
                 job,
                 command=_qa_harness_command(),
                 timeout_seconds=int(getattr(settings, 'ISSUE_HARNESS_TIMEOUT_SECONDS', 180)),
                 extra_env=extra_env,
-            ):
+            )
+            for item in harness_stream:
                 if item.get('kind') == 'progress':
                     event = item.get('event')
                     if not isinstance(event, Mapping):
@@ -581,6 +602,7 @@ def stream_answer_question(
                         response = _qa_harness_response(job, result)
             if response is None:
                 raise IssueHarnessUnavailable('harness_missing_final', 'QA harness did not return a final result.')
+            answer = str(response.get('answer') or '')
             yield {
                 'event': 'meta',
                 'data': {
@@ -593,10 +615,18 @@ def stream_answer_question(
                     'harness': response.get('harness'),
                 },
             }
+            for chunk in _answer_token_chunks(answer):
+                yield {'event': 'token', 'data': {'text': chunk}}
             yield {'event': 'final', 'data': response}
             return
         except IssueHarnessUnavailable as error:
-            fallback_warning = _qa_harness_warning(error)
+            yield _qa_stream_error_event(error)
+            return
+        finally:
+            if harness_stream is not None:
+                close = getattr(harness_stream, 'close', None)
+                if callable(close):
+                    close()
 
     qa_context = build_qa_context(
         analysis,

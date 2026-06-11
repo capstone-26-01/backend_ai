@@ -232,8 +232,9 @@ def _qa_streaming_response(
     model: str | None = None,
 ) -> StreamingHttpResponse:
     def stream():
+        answer_stream = None
         try:
-            for item in stream_answer_question(
+            answer_stream = stream_answer_question(
                 repo_path,
                 analysis,
                 question,
@@ -241,7 +242,8 @@ def _qa_streaming_response(
                 selected_file_path=selected_file_path,
                 max_context_files=max_context_files,
                 model=model,
-            ):
+            )
+            for item in answer_stream:
                 if not isinstance(item, dict):
                     continue
                 event_name = str(item.get('event') or 'message')
@@ -256,6 +258,11 @@ def _qa_streaming_response(
                     'detail': str(error),
                 },
             )
+        finally:
+            if answer_stream is not None:
+                close = getattr(answer_stream, 'close', None)
+                if callable(close):
+                    close()
 
     response_obj = StreamingHttpResponse(stream(), content_type='text/event-stream; charset=utf-8')
     response_obj['Cache-Control'] = 'no-cache'
@@ -467,7 +474,11 @@ _QA_DESCRIPTION = '''
 - 이미 `/api/analysis/`를 호출했다면 `analysis_id`를 보내세요. repo URL 재분석을 피할 수 있습니다.
 - 특정 그래프 노드를 선택한 상태라면 `selected_node_id`를 함께 보내면 답변 범위가 좁아집니다.
 - `repo_url`만 보내도 동작하지만, 프런트엔드에서는 `analysis_id` 재사용이 더 안정적입니다.
-- 기본은 기존 JSON 응답입니다. `Accept: text/event-stream` 또는 `stream=true`를 보내면 같은 endpoint에서 SSE로 token/meta/final event를 반환합니다.
+- 기본은 기존 JSON 응답입니다. `Accept: text/event-stream` 또는 `stream=true`를 보내면 같은 endpoint에서 SSE를 반환합니다.
+- SSE 완료 신호는 항상 `event: final`입니다. `[DONE]` sentinel이나 별도 end event는 없습니다.
+- 답변 본문은 `event: token` / `data: {"text": "..."}` 형식으로 전송되며, 최종 전체 답변은 `final.data.answer`에도 포함됩니다.
+- Pi harness QA 경로에서는 답변 token 전송 전에 진행 이벤트가 추가로 올 수 있습니다: `harness_start`, `harness_usage`, `harness_tool_call`, `harness_tool_result`.
+- 실패나 timeout은 스트림 종료 전에 `event: error` / `data: {"error": "...", "code": "..."}` 형식으로 전송됩니다.
 - LLM 호출은 OpenCode Zen만 사용합니다. `model`을 보내면 해당 Zen 모델을 요청하고, `config.yaml`의 `opencode.allowed_models`가 설정되어 있으면 그 목록 안에서만 허용됩니다.
 '''
 _REPO_FILES_DESCRIPTION = '''
@@ -1396,7 +1407,7 @@ def node_summary(request):
             'selected_node_id': serializers.CharField(required=False, help_text='/api/graph/ 응답의 nodes[].id입니다. 선택 노드 중심으로 답변할 때 사용합니다.'),
             'selected_file_path': serializers.CharField(required=False, help_text='선택 파일 중심으로 답변할 때 사용합니다.'),
             'max_context_files': serializers.IntegerField(required=False, min_value=1, max_value=10, help_text='답변에 사용할 최대 context 파일 수입니다. 기본값 4.'),
-            'stream': serializers.BooleanField(required=False, help_text='true이거나 Accept: text/event-stream이면 SSE로 token/meta/final event를 반환합니다. 생략하면 기존 JSON 응답입니다.'),
+            'stream': serializers.BooleanField(required=False, help_text='true이거나 Accept: text/event-stream이면 SSE를 반환합니다. token.data.text, meta, final, error 및 harness_* 진행 이벤트를 사용할 수 있습니다.'),
             'model': serializers.CharField(required=False, help_text='선택할 OpenCode Zen 모델 ID입니다. 생략하면 config.yaml의 opencode.model을 사용합니다.'),
         }
     ),

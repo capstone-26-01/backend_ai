@@ -272,10 +272,63 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
         events = list(stream_answer_question('owner/repo', analysis, 'main은 어디인가요?'))
 
-        self.assertEqual([event['event'] for event in events], ['harness_start', 'harness_tool_call', 'harness_tool_call', 'meta', 'final'])
+        self.assertEqual([event['event'] for event in events], ['harness_start', 'harness_tool_call', 'harness_tool_call', 'meta', 'token', 'final'])
         self.assertEqual(events[2]['data'], {'name': 'read_repo_file', 'arguments': {'path': 'pkg/app.py'}})
-        self.assertEqual(events[4]['data']['answer'], 'harness answer')
+        self.assertEqual(events[4]['data'], {'text': 'harness answer'})
+        self.assertEqual(events[5]['data']['answer'], 'harness answer')
         stream_generate_answer.assert_not_called()
+
+    @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('llm.services.stream_issue_harness', side_effect=IssueHarnessUnavailable('harness_timeout', 'Issue harness exceeded 5 seconds.'))
+    def test_stream_answer_question_returns_error_event_when_qa_harness_fails(self, stream_harness):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
+            'edges': [],
+        }
+
+        events = list(stream_answer_question('owner/repo', analysis, 'main은 어디인가요?'))
+
+        self.assertEqual([event['event'] for event in events], ['harness_start', 'error'])
+        self.assertEqual(events[1]['data']['code'], 'harness_timeout')
+        stream_harness.assert_called_once()
+
+    @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('llm.services.stream_issue_harness')
+    def test_stream_answer_question_closes_qa_harness_stream_on_client_disconnect(self, stream_harness):
+        class ClosingHarnessStream:
+            def __init__(self):
+                self.closed = False
+                self.emitted = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.emitted:
+                    raise AssertionError('test should close before waiting for another harness event')
+                self.emitted = True
+                return {'kind': 'progress', 'event': {'role': 'toolCall', 'toolName': 'get_question_context', 'arguments': {}}}
+
+            def close(self):
+                self.closed = True
+
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
+            'edges': [],
+        }
+        harness_stream = ClosingHarnessStream()
+        stream_harness.return_value = harness_stream
+        events = stream_answer_question('owner/repo', analysis, 'main은 어디인가요?')
+
+        self.assertEqual(next(events)['event'], 'harness_start')
+        self.assertEqual(next(events)['event'], 'harness_tool_call')
+        events.close()
+
+        self.assertTrue(harness_stream.closed)
 
     def test_rank_files_can_use_cached_summary_text_hook(self):
         analysis = {
@@ -713,6 +766,37 @@ class IssueHarnessRuntimeTests(TestCase):
         self.assertEqual(events[1]['kind'], 'result')
         result = events[1]['result']
         self.assertEqual(result.output['answer'], 'parse_repo는 parser/services.py에 있습니다.')
+
+    @patch('llm.issue_harness._kill_process_group')
+    @patch('llm.issue_harness._stream_process_lines')
+    @patch('llm.issue_harness.subprocess.Popen')
+    def test_stream_issue_harness_kills_process_when_generator_is_closed(self, popen_mock, stream_lines_mock, kill_process_group):
+        process = Mock()
+        process.stdin = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        popen_mock.return_value = process
+        stream_lines_mock.return_value = iter(
+            [
+                (
+                    'stdout',
+                    json.dumps({'harness_event': 'pi_stdout', 'payload': {'role': 'toolCall', 'toolName': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}}}) + '\n',
+                )
+            ]
+        )
+        job = build_qa_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            question='Where is parse_repo?',
+            analysis=self._analysis(),
+        )
+
+        events = stream_issue_harness(job, command=[sys.executable, '-c', ''], timeout_seconds=5)
+        self.assertEqual(next(events)['kind'], 'progress')
+        events.close()
+
+        kill_process_group.assert_called_once_with(process)
+        process.wait.assert_called_once()
 
     def test_run_issue_harness_rejects_qa_transcript_without_question_context(self):
         job = build_qa_harness_job(
