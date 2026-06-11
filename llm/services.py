@@ -7,10 +7,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Mapping, cast
 
+from django.conf import settings
 import requests
 import yaml
 
 from llm.context_selection import build_context_for_files, build_qa_context, identifier_tokens, question_tokens, rank_files
+from llm.issue_harness import (
+    IssueHarnessUnavailable,
+    build_qa_harness_job,
+    command_from_string,
+    run_issue_harness,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +269,80 @@ def _stream_generate_answer(messages: list[dict[str, str]], *, model: str | None
         raise RuntimeError('OpenCode Zen 스트리밍 응답이 비어 있습니다.')
 
 
+def _qa_harness_enabled() -> bool:
+    return bool(getattr(settings, 'QA_HARNESS_ENABLED', False))
+
+
+def _qa_harness_command() -> list[str] | None:
+    command = str(getattr(settings, 'ISSUE_HARNESS_COMMAND', '') or '').strip()
+    if not command:
+        return None
+    return command_from_string(command)
+
+
+def _qa_harness_warning(error: IssueHarnessUnavailable) -> dict[str, Any]:
+    return {
+        'code': error.code,
+        'message': error.message or 'QA harness를 사용할 수 없어 기존 QA 경로로 폴백했습니다.',
+        'source': 'qa_harness',
+    }
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
+
+
+def _answer_question_with_harness(
+    repo_path: str,
+    analysis: dict[str, Any],
+    question: str,
+    *,
+    selected_node_id: str | None = None,
+    selected_file_path: str | None = None,
+    max_context_files: int = 4,
+    model: str | None = None,
+) -> dict[str, object]:
+    revision = str(analysis.get('revision') or '')
+    job = build_qa_harness_job(
+        repo_path=repo_path,
+        revision=revision,
+        question=question,
+        analysis=analysis,
+        selected_node_id=selected_node_id,
+        selected_file_path=selected_file_path,
+        max_context_files=max_context_files,
+    )
+    extra_env = {'ISSUE_HARNESS_PI_MODEL': _normalize_opencode_model_id(model)} if model else None
+    result = run_issue_harness(
+        job,
+        command=_qa_harness_command(),
+        timeout_seconds=int(getattr(settings, 'ISSUE_HARNESS_TIMEOUT_SECONDS', 180)),
+        extra_env=extra_env,
+    )
+    output = result.output
+    warnings = [dict(item) for item in output.get('warnings', []) if isinstance(item, Mapping)]
+    return {
+        'answer': str(output.get('answer') or ''),
+        'citations': _string_list(output.get('citations')),
+        'selected_nodes': _string_list(output.get('selected_nodes')),
+        'context_files': _string_list(output.get('context_files')),
+        'context_summary': {
+            'strategy': 'pi_harness',
+            'truncated': False,
+            'file_contents_truncated': bool(job.get('limits', {}).get('file_contents_truncated')) if isinstance(job.get('limits'), Mapping) else False,
+        },
+        'tool_trace': result.tool_calls,
+        'warnings': warnings,
+        'harness': {
+            'enabled': True,
+            'source': 'pi_harness',
+            'metadata': result.metadata,
+        },
+    }
+
+
 def _answer_question_classic(
     repo_path: str,
     analysis: dict[str, Any],
@@ -315,6 +396,30 @@ def answer_question(
     max_context_files: int = 4,
     model: str | None = None,
 ) -> dict[str, object]:
+    if _qa_harness_enabled():
+        try:
+            return _answer_question_with_harness(
+                repo_path,
+                analysis,
+                question,
+                selected_node_id=selected_node_id,
+                selected_file_path=selected_file_path,
+                max_context_files=max_context_files,
+                model=model,
+            )
+        except IssueHarnessUnavailable as error:
+            response = _answer_question_classic(
+                repo_path,
+                analysis,
+                question,
+                selected_node_id=selected_node_id,
+                selected_file_path=selected_file_path,
+                max_context_files=max_context_files,
+                model=model,
+            )
+            response['warnings'] = [*cast(list[Any], response.get('warnings', [])), _qa_harness_warning(error)]
+            return response
+
     return _answer_question_classic(
         repo_path,
         analysis,
@@ -336,6 +441,35 @@ def stream_answer_question(
     max_context_files: int = 4,
     model: str | None = None,
 ) -> Iterator[dict[str, object]]:
+    fallback_warning: dict[str, Any] | None = None
+    if _qa_harness_enabled():
+        try:
+            response = _answer_question_with_harness(
+                repo_path,
+                analysis,
+                question,
+                selected_node_id=selected_node_id,
+                selected_file_path=selected_file_path,
+                max_context_files=max_context_files,
+                model=model,
+            )
+            yield {
+                'event': 'meta',
+                'data': {
+                    'repo': repo_path,
+                    'citations': response.get('citations', []),
+                    'selected_nodes': response.get('selected_nodes', []),
+                    'context_files': response.get('context_files', []),
+                    'context_summary': response.get('context_summary', {}),
+                    'warnings': response.get('warnings', []),
+                    'harness': response.get('harness'),
+                },
+            }
+            yield {'event': 'final', 'data': response}
+            return
+        except IssueHarnessUnavailable as error:
+            fallback_warning = _qa_harness_warning(error)
+
     qa_context = build_qa_context(
         analysis,
         question,
@@ -350,11 +484,11 @@ def stream_answer_question(
         'selected_nodes': qa_context.selected_nodes,
         'context_files': qa_context.context_files,
         'context_summary': qa_context.context_summary,
-        'warnings': qa_context.warnings,
+        'warnings': [*qa_context.warnings, *([fallback_warning] if fallback_warning else [])],
     }
 
     if not qa_context.context_files or not qa_context.context.strip():
-        warnings = [{'code': 'no_context'}, *qa_context.warnings]
+        warnings = [{'code': 'no_context'}, *qa_context.warnings, *([fallback_warning] if fallback_warning else [])]
         yield {
             'event': 'final',
             'data': {
@@ -388,6 +522,6 @@ def stream_answer_question(
             'context_files': qa_context.context_files,
             'context_summary': qa_context.context_summary,
             'tool_trace': [],
-            'warnings': qa_context.warnings,
+            'warnings': [*qa_context.warnings, *([fallback_warning] if fallback_warning else [])],
         },
     }
