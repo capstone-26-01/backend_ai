@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 import fcntl
@@ -160,8 +161,32 @@ def _github_api_base_url() -> str:
     return str(getattr(settings, 'GITHUB_API_BASE_URL', 'https://api.github.com')).rstrip('/')
 
 
+@lru_cache(maxsize=1)
+def _github_cli_token() -> str:
+    if shutil.which('gh') is None:
+        return ''
+    try:
+        completed = subprocess.run(
+            ['gh', 'auth', 'token'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    if completed.returncode != 0:
+        return ''
+    return str(completed.stdout or '').strip()
+
+
 def _github_token() -> str:
-    return str(getattr(settings, 'GITHUB_TOKEN', '') or os.getenv('GITHUB_TOKEN', '')).strip()
+    configured_token = str(getattr(settings, 'GITHUB_TOKEN', '') or os.getenv('GITHUB_TOKEN', '')).strip()
+    return configured_token or _github_cli_token()
+
+
+def _clear_github_cli_token_cache() -> None:
+    _github_cli_token.cache_clear()
 
 
 def _github_headers() -> dict[str, str]:

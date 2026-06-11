@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 import importlib
 import json
+import os
 import requests
 import subprocess
 import shutil
@@ -13,6 +14,7 @@ from django.core.cache import cache
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
 from django.utils import timezone
+from github_repo import services as github_services
 from github_repo.services import (
     RepoIngestionError,
     get_file_content,
@@ -2385,6 +2387,56 @@ class IssueMockEndpointTests(ExternalHttpBlockedMixin, TestCase):
 
 
 class IssueLiveEndpointTests(ExternalHttpBlockedMixin, TestCase):
+    def tearDown(self):
+        github_services._clear_github_cli_token_cache()
+        super().tearDown()
+
+    @override_settings(GITHUB_TOKEN='env-token')
+    @patch('github_repo.services._github_cli_token', side_effect=AssertionError('gh fallback should not run when GITHUB_TOKEN is set'))
+    def test_github_headers_prefer_configured_token_over_gh_cli(self, github_cli_token):
+        headers = github_services._github_headers()
+
+        self.assertEqual(headers['Authorization'], 'Bearer env-token')
+        github_cli_token.assert_not_called()
+
+    @override_settings(GITHUB_TOKEN='')
+    @patch.dict(os.environ, {'GITHUB_TOKEN': ''})
+    @patch('github_repo.services.shutil.which', return_value='/usr/bin/gh')
+    @patch('github_repo.services.subprocess.run')
+    def test_github_headers_fall_back_to_gh_cli_token(self, run_mock, which_mock):
+        github_services._clear_github_cli_token_cache()
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gh', 'auth', 'token'],
+            0,
+            stdout='gh-cli-token\n',
+            stderr='',
+        )
+
+        headers = github_services._github_headers()
+
+        self.assertEqual(headers['Authorization'], 'Bearer gh-cli-token')
+        run_mock.assert_called_once_with(
+            ['gh', 'auth', 'token'],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        which_mock.assert_called_once_with('gh')
+
+    @override_settings(GITHUB_TOKEN='')
+    @patch.dict(os.environ, {'GITHUB_TOKEN': ''})
+    @patch('github_repo.services.shutil.which', return_value='/usr/bin/gh')
+    @patch('github_repo.services.subprocess.run', side_effect=subprocess.TimeoutExpired(['gh', 'auth', 'token'], 2))
+    def test_github_headers_omit_authorization_when_gh_cli_fallback_fails(self, run_mock, which_mock):
+        github_services._clear_github_cli_token_cache()
+
+        headers = github_services._github_headers()
+
+        self.assertNotIn('Authorization', headers)
+        run_mock.assert_called_once()
+        which_mock.assert_called_once_with('gh')
+
     @patch('github_repo.services.requests.get')
     def test_issues_endpoint_uses_live_github_by_default_and_filters_prs(self, requests_get):
         requests_get.return_value = mock_github_issue_list_response()
