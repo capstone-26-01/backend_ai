@@ -2169,6 +2169,45 @@ class AnalysisEndpointReuseTests(TestCase):
         answer_question_mock.assert_not_called()
         stream_answer_question_mock.assert_called_once()
 
+    @patch('api.views.answer_question')
+    @patch('api.views.stream_answer_question')
+    @patch('api.views.get_repo_analysis')
+    def test_qa_endpoint_stream_sends_error_event_before_close(self, get_repo_analysis_mock, stream_answer_question_mock, answer_question_mock):
+        get_repo_analysis_mock.return_value = {
+            'repo': 'owner/repo',
+            'revision': 'abc123',
+            'tree': [],
+            'nodes': [],
+            'edges': [],
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+        }
+
+        def failing_stream():
+            yield {'event': 'harness_start', 'data': {'repo': 'owner/repo'}}
+            raise RuntimeError('boom')
+
+        stream_answer_question_mock.return_value = failing_stream()
+
+        response = cast(
+            HttpResponse,
+            self.client.post(
+                '/api/qa/',
+                data={'repo_url': 'https://github.com/owner/repo', 'question': '무엇을 하나요?', 'stream': True},
+                content_type='application/json',
+            ),
+        )
+        body = b''.join(
+            chunk if isinstance(chunk, bytes) else chunk.encode('utf-8')
+            for chunk in response.streaming_content
+        ).decode('utf-8')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('event: harness_start', body)
+        self.assertIn('event: error', body)
+        self.assertIn('qa_stream_error', body)
+        self.assertIn('boom', body)
+        answer_question_mock.assert_not_called()
+
     def test_qa_endpoint_requires_repo_url_or_analysis_id(self):
         response = cast(
             HttpResponse,
