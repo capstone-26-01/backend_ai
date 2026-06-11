@@ -17,6 +17,7 @@ from llm.issue_harness import (
     build_qa_harness_job,
     command_from_string,
     run_issue_harness,
+    stream_issue_harness,
 )
 
 logger = logging.getLogger(__name__)
@@ -294,7 +295,76 @@ def _string_list(value: Any) -> list[str]:
     return [str(item) for item in value if isinstance(item, str)]
 
 
-def _answer_question_with_harness(
+QA_PROGRESS_TOOLS = {
+    'get_question_context',
+    'list_repo_files',
+    'search_repo_symbols',
+    'search_repo_text',
+    'read_repo_file',
+    'get_node',
+    'get_neighbors',
+    'read_node_context',
+    'finish_repo_qa_transcript',
+}
+QA_PROGRESS_ARG_KEYS = {
+    'search_repo_symbols': {'query'},
+    'search_repo_text': {'query'},
+    'read_repo_file': {'path'},
+    'get_node': {'node_id'},
+    'get_neighbors': {'node_id'},
+    'read_node_context': {'node_id'},
+}
+
+
+def _short_string(value: Any, *, limit: int = 180) -> str:
+    text = str(value)
+    return text if len(text) <= limit else f'{text[:limit]}...'
+
+
+def _safe_progress_args(tool_name: str, value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    allowed_keys = QA_PROGRESS_ARG_KEYS.get(tool_name, set())
+    return {key: _short_string(value[key]) for key in allowed_keys if key in value and isinstance(value[key], (str, int, float, bool))}
+
+
+def _iter_mappings(value: Any) -> Iterator[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _iter_mappings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_mappings(child)
+
+
+def _qa_progress_from_pi_event(event: Mapping[str, Any]) -> list[dict[str, object]]:
+    progress: list[dict[str, object]] = []
+    for item in _iter_mappings(event):
+        tool_name = item.get('toolName') or item.get('name') or item.get('tool')
+        if not isinstance(tool_name, str) or tool_name not in QA_PROGRESS_TOOLS:
+            continue
+        role = str(item.get('role') or item.get('type') or item.get('event') or '').lower()
+        arguments = item.get('arguments') or item.get('args') or item.get('input') or item.get('parameters') or {}
+        event_name = 'harness_tool_result' if 'result' in role else 'harness_tool_call'
+        progress.append({'event': event_name, 'data': {'name': tool_name, 'arguments': _safe_progress_args(tool_name, arguments)}})
+    message = event.get('message')
+    usage = message.get('usage') if isinstance(message, Mapping) else None
+    if isinstance(usage, Mapping):
+        progress.append(
+            {
+                'event': 'harness_usage',
+                'data': {
+                    key: usage[key]
+                    for key in ('input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens')
+                    if isinstance(usage.get(key), (int, float))
+                },
+            }
+        )
+    return progress
+
+
+def _qa_harness_job_and_env(
     repo_path: str,
     analysis: dict[str, Any],
     question: str,
@@ -303,7 +373,7 @@ def _answer_question_with_harness(
     selected_file_path: str | None = None,
     max_context_files: int = 4,
     model: str | None = None,
-) -> dict[str, object]:
+) -> tuple[dict[str, Any], dict[str, str] | None]:
     revision = str(analysis.get('revision') or '')
     job = build_qa_harness_job(
         repo_path=repo_path,
@@ -315,12 +385,10 @@ def _answer_question_with_harness(
         max_context_files=max_context_files,
     )
     extra_env = {'ISSUE_HARNESS_PI_MODEL': _normalize_opencode_model_id(model)} if model else None
-    result = run_issue_harness(
-        job,
-        command=_qa_harness_command(),
-        timeout_seconds=int(getattr(settings, 'ISSUE_HARNESS_TIMEOUT_SECONDS', 180)),
-        extra_env=extra_env,
-    )
+    return job, extra_env
+
+
+def _qa_harness_response(job: Mapping[str, Any], result: Any) -> dict[str, object]:
     output = result.output
     warnings = [dict(item) for item in output.get('warnings', []) if isinstance(item, Mapping)]
     return {
@@ -341,6 +409,34 @@ def _answer_question_with_harness(
             'metadata': result.metadata,
         },
     }
+
+
+def _answer_question_with_harness(
+    repo_path: str,
+    analysis: dict[str, Any],
+    question: str,
+    *,
+    selected_node_id: str | None = None,
+    selected_file_path: str | None = None,
+    max_context_files: int = 4,
+    model: str | None = None,
+) -> dict[str, object]:
+    job, extra_env = _qa_harness_job_and_env(
+        repo_path=repo_path,
+        question=question,
+        analysis=analysis,
+        selected_node_id=selected_node_id,
+        selected_file_path=selected_file_path,
+        max_context_files=max_context_files,
+        model=model,
+    )
+    result = run_issue_harness(
+        job,
+        command=_qa_harness_command(),
+        timeout_seconds=int(getattr(settings, 'ISSUE_HARNESS_TIMEOUT_SECONDS', 180)),
+        extra_env=extra_env,
+    )
+    return _qa_harness_response(job, result)
 
 
 def _answer_question_classic(
@@ -444,7 +540,7 @@ def stream_answer_question(
     fallback_warning: dict[str, Any] | None = None
     if _qa_harness_enabled():
         try:
-            response = _answer_question_with_harness(
+            job, extra_env = _qa_harness_job_and_env(
                 repo_path,
                 analysis,
                 question,
@@ -453,6 +549,38 @@ def stream_answer_question(
                 max_context_files=max_context_files,
                 model=model,
             )
+            yield {
+                'event': 'harness_start',
+                'data': {
+                    'repo': repo_path,
+                    'revision': job.get('repo', {}).get('revision') if isinstance(job.get('repo'), Mapping) else None,
+                    'source': 'pi_harness',
+                },
+            }
+            response = None
+            emitted_progress: set[str] = set()
+            for item in stream_issue_harness(
+                job,
+                command=_qa_harness_command(),
+                timeout_seconds=int(getattr(settings, 'ISSUE_HARNESS_TIMEOUT_SECONDS', 180)),
+                extra_env=extra_env,
+            ):
+                if item.get('kind') == 'progress':
+                    event = item.get('event')
+                    if not isinstance(event, Mapping):
+                        continue
+                    for progress in _qa_progress_from_pi_event(event):
+                        key = json.dumps(progress, ensure_ascii=False, sort_keys=True)
+                        if key in emitted_progress:
+                            continue
+                        emitted_progress.add(key)
+                        yield progress
+                elif item.get('kind') == 'result':
+                    result = item.get('result')
+                    if result is not None:
+                        response = _qa_harness_response(job, result)
+            if response is None:
+                raise IssueHarnessUnavailable('harness_missing_final', 'QA harness did not return a final result.')
             yield {
                 'event': 'meta',
                 'data': {

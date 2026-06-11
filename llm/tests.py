@@ -18,6 +18,7 @@ from llm.issue_harness import (
     build_issue_harness_job,
     build_qa_harness_job,
     run_issue_harness,
+    stream_issue_harness,
 )
 from llm.services import (
     _build_context,
@@ -238,15 +239,15 @@ class SelectiveQuestionAnsweringTests(TestCase):
 
     @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
     @patch('llm.services._stream_generate_answer')
-    @patch('llm.services.run_issue_harness')
-    def test_stream_answer_question_uses_qa_harness_final_event(self, run_harness, stream_generate_answer):
+    @patch('llm.services.stream_issue_harness')
+    def test_stream_answer_question_uses_qa_harness_progress_and_final_events(self, stream_harness, stream_generate_answer):
         analysis = {
             'revision': 'abc123',
             'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
             'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
             'edges': [],
         }
-        run_harness.return_value = IssueHarnessResult(
+        result = IssueHarnessResult(
             output={
                 'answer': 'harness answer',
                 'citations': ['pkg/app.py'],
@@ -261,11 +262,19 @@ class SelectiveQuestionAnsweringTests(TestCase):
             ],
             metadata={'variant_id': 'runtime-pi-qa-harness'},
         )
+        stream_harness.return_value = iter(
+            [
+                {'kind': 'progress', 'event': {'role': 'toolCall', 'toolName': 'get_question_context', 'arguments': {}}},
+                {'kind': 'progress', 'event': {'role': 'toolCall', 'toolName': 'read_repo_file', 'arguments': {'path': 'pkg/app.py', 'content': 'secret'}}},
+                {'kind': 'result', 'result': result},
+            ]
+        )
 
         events = list(stream_answer_question('owner/repo', analysis, 'main은 어디인가요?'))
 
-        self.assertEqual([event['event'] for event in events], ['meta', 'final'])
-        self.assertEqual(events[1]['data']['answer'], 'harness answer')
+        self.assertEqual([event['event'] for event in events], ['harness_start', 'harness_tool_call', 'harness_tool_call', 'meta', 'final'])
+        self.assertEqual(events[2]['data'], {'name': 'read_repo_file', 'arguments': {'path': 'pkg/app.py'}})
+        self.assertEqual(events[4]['data']['answer'], 'harness answer')
         stream_generate_answer.assert_not_called()
 
     def test_rank_files_can_use_cached_summary_text_hook(self):
@@ -416,6 +425,10 @@ class IssueHarnessRuntimeTests(TestCase):
 
     def _command_that_prints(self, payload: dict[str, object]) -> list[str]:
         code = 'import json; print(json.dumps(%r))' % payload
+        return [sys.executable, '-c', code]
+
+    def _command_that_streams(self, payloads: list[dict[str, object]]) -> list[str]:
+        code = 'import json, sys\nfor payload in %r:\n    print(json.dumps(payload), flush=True)\n' % payloads
         return [sys.executable, '-c', code]
 
     def test_issue_harness_job_contains_bounded_graph_and_file_tools(self):
@@ -664,6 +677,42 @@ class IssueHarnessRuntimeTests(TestCase):
 
         self.assertEqual(result.output['answer'], 'parse_repo는 parser/services.py에 있습니다.')
         self.assertEqual([call['name'] for call in result.tool_calls], ['get_question_context', 'list_repo_files', 'read_repo_file'])
+
+    def test_stream_issue_harness_yields_progress_before_qa_result(self):
+        job = build_qa_harness_job(
+            repo_path='owner/repo',
+            revision='abc123',
+            question='Where is parse_repo?',
+            analysis=self._analysis(),
+        )
+        result_payload = {
+            'variant_id': 'test-qa-harness',
+            'tool_calls': [
+                {'name': 'get_question_context', 'arguments': {}},
+                {'name': 'list_repo_files', 'arguments': {}},
+                {'name': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}},
+            ],
+            'final': {
+                'answer': 'parse_repo는 parser/services.py에 있습니다.',
+                'citations': ['parser/services.py'],
+                'selected_nodes': ['parser/services.py::parse_repo'],
+                'context_files': ['parser/services.py'],
+            },
+        }
+        command = self._command_that_streams(
+            [
+                {'harness_event': 'pi_stdout', 'payload': {'role': 'toolCall', 'toolName': 'read_repo_file', 'arguments': {'path': 'parser/services.py'}}},
+                {'harness_event': 'result', 'payload': result_payload},
+            ]
+        )
+
+        events = list(stream_issue_harness(job, command=command, timeout_seconds=5))
+
+        self.assertEqual(events[0]['kind'], 'progress')
+        self.assertEqual(events[0]['event']['toolName'], 'read_repo_file')
+        self.assertEqual(events[1]['kind'], 'result')
+        result = events[1]['result']
+        self.assertEqual(result.output['answer'], 'parse_repo는 parser/services.py에 있습니다.')
 
     def test_run_issue_harness_rejects_qa_transcript_without_question_context(self):
         job = build_qa_harness_job(

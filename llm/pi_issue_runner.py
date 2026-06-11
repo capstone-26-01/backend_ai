@@ -5,6 +5,8 @@ from typing import Any, Mapping
 import argparse
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 import time
@@ -312,6 +314,85 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _print_stream_event(name: str, payload: Mapping[str, Any]) -> None:
+    _print_json({'harness_event': name, 'payload': dict(payload)})
+    sys.stdout.flush()
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        process.kill()
+
+
+def _stream_pi_command(command: list[str], env: Mapping[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=dict(env),
+        start_new_session=True,
+    )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
+    started_at = time.monotonic()
+    try:
+        while streams:
+            if time.monotonic() - started_at > timeout:
+                _kill_process_group(process)
+                raise subprocess.TimeoutExpired(command, timeout, output=''.join(stdout_lines), stderr=''.join(stderr_lines))
+            ready, _, _ = select.select(streams, [], [], 0.2)
+            if not ready:
+                if process.poll() is not None:
+                    for stream in list(streams):
+                        for line in stream.readlines():
+                            if stream is process.stdout:
+                                stdout_lines.append(line)
+                            else:
+                                stderr_lines.append(line)
+                        streams.remove(stream)
+                continue
+            for stream in ready:
+                line = stream.readline()
+                if line == '':
+                    streams.remove(stream)
+                    continue
+                if stream is process.stdout:
+                    stdout_lines.append(line)
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, Mapping):
+                        _print_stream_event('pi_stdout', event)
+                else:
+                    stderr_lines.append(line)
+        return subprocess.CompletedProcess(command, process.wait(), ''.join(stdout_lines), ''.join(stderr_lines))
+    finally:
+        if process.poll() is None:
+            _kill_process_group(process)
+            process.wait()
+
+
+def _run_pi_command(command: list[str], env: Mapping[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
+    if _env_bool('ISSUE_HARNESS_STREAM_EVENTS'):
+        return _stream_pi_command(command, env, timeout)
+    return subprocess.run(
+        command,
+        input='',
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=dict(env),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Run runtime Pi harness over a bounded backend job packet.')
     parser.add_argument('--model', default=os.getenv('ISSUE_HARNESS_PI_MODEL', DEFAULT_MODEL))
@@ -351,26 +432,17 @@ def main(argv: list[str] | None = None) -> int:
 
     command = build_command(args, job)
     try:
-        completed = subprocess.run(
-            command,
-            input='',
-            capture_output=True,
-            text=True,
-            timeout=args.timeout,
-            check=False,
-            env=env,
-        )
+        completed = _run_pi_command(command, env, args.timeout)
     except subprocess.TimeoutExpired as exc:
-        _print_json(
-            _error(
-                job,
-                f'Pi exceeded {args.timeout} seconds',
-                details={
-                    'stdout_preview': str(exc.stdout or '')[:1000],
-                    'stderr_preview': str(exc.stderr or '')[:1000],
-                },
-            )
+        payload = _error(
+            job,
+            f'Pi exceeded {args.timeout} seconds',
+            details={'stdout_preview': str(exc.stdout or '')[:1000], 'stderr_preview': str(exc.stderr or '')[:1000]},
         )
+        if _env_bool('ISSUE_HARNESS_STREAM_EVENTS'):
+            _print_stream_event('result', payload)
+        else:
+            _print_json(payload)
         if not _env_bool('ISSUE_HARNESS_KEEP_JOB_FILES'):
             job_file.unlink(missing_ok=True)
         return 1
@@ -387,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
         suffix = ''
         if isinstance(error_messages, list) and error_messages:
             suffix = f': {error_messages[-1]}'
-        _print_json(
+        payload = (
             _error(
                 job,
                 f'Pi did not call {_finish_tool_name(job)}{suffix}',
@@ -399,10 +471,17 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
         )
+        if _env_bool('ISSUE_HARNESS_STREAM_EVENTS'):
+            _print_stream_event('result', payload)
+        else:
+            _print_json(payload)
         return 1
     transcript.setdefault('variant_id', _variant_id(job))
     transcript['pi_metadata'] = metadata
-    _print_json(transcript)
+    if _env_bool('ISSUE_HARNESS_STREAM_EVENTS'):
+        _print_stream_event('result', transcript)
+    else:
+        _print_json(transcript)
     return 0 if completed.returncode == 0 else 1
 
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Iterator, Mapping, Sequence, cast
 import json
 import os
+import select
+import signal
 import shlex
 import subprocess
 import sys
+import time
 
 
 ISSUE_HARNESS_JOB_SCHEMA_VERSION = 1
@@ -670,6 +673,74 @@ def _parse_json_stdout(stdout: str) -> dict[str, Any]:
     return payload
 
 
+def _result_from_payload(payload: Mapping[str, Any], *, returncode: int = 0, stderr: str = '') -> IssueHarnessResult:
+    if returncode != 0:
+        message = _string(payload.get('error') or payload.get('message') or stderr[:500] or 'Issue harness command failed.')
+        if _is_rate_limit_message(message):
+            raise IssueHarnessUnavailable('provider_rate_limited', message)
+        raise IssueHarnessUnavailable('harness_failed', message)
+    task = _string(payload.get('task')) or _string(payload.get('final', {}).get('task') if isinstance(payload.get('final'), Mapping) else '') or ISSUE_HARNESS_TASK
+    task = _string(payload.get('task')) or task
+    final = _final_from_payload(payload, task=task)
+    tool_calls = _tool_calls_from_payload(payload)
+    _validate_harness_work(final, tool_calls, task=task)
+    metadata = {
+        'returncode': returncode,
+        'variant_id': payload.get('variant_id'),
+        'harness_error': payload.get('error'),
+        'pi_metadata': payload.get('pi_metadata') or {},
+    }
+    return IssueHarnessResult(output=final, tool_calls=tool_calls, metadata=metadata)
+
+
+def _stream_wrapper_payload(line: str) -> tuple[str, dict[str, Any]] | None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    event = payload.get('harness_event')
+    data = payload.get('payload')
+    if isinstance(event, str) and isinstance(data, Mapping):
+        return event, dict(data)
+    return None
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        process.kill()
+
+
+def _stream_process_lines(
+    process: subprocess.Popen[str],
+    *,
+    timeout_seconds: int,
+) -> Iterator[tuple[str, str]]:
+    started_at = time.monotonic()
+    streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
+    while streams:
+        if time.monotonic() - started_at > timeout_seconds:
+            _kill_process_group(process)
+            raise IssueHarnessUnavailable('harness_timeout', f'Issue harness exceeded {timeout_seconds} seconds.')
+        ready, _, _ = select.select(streams, [], [], 0.2)
+        if not ready:
+            if process.poll() is not None:
+                for stream in list(streams):
+                    for line in stream.readlines():
+                        yield ('stdout' if stream is process.stdout else 'stderr'), line
+                    streams.remove(stream)
+            continue
+        for stream in ready:
+            line = stream.readline()
+            if line == '':
+                streams.remove(stream)
+                continue
+            yield ('stdout' if stream is process.stdout else 'stderr'), line
+
+
 def _is_rate_limit_message(value: Any) -> bool:
     text = _string(value).lower()
     return any(pattern in text for pattern in ('429', 'rate limit', 'rate_limit', 'rate-limit', 'too many requests'))
@@ -770,19 +841,67 @@ def run_issue_harness(
             message = _string(completed.stderr[:500] or completed.stdout[:500] or 'Issue harness command failed without JSON output.')
             raise IssueHarnessUnavailable('harness_failed', message) from exc
         raise
-    if completed.returncode != 0:
-        message = _string(payload.get('error') or payload.get('message') or completed.stderr[:500] or 'Issue harness command failed.')
-        if _is_rate_limit_message(message):
-            raise IssueHarnessUnavailable('provider_rate_limited', message)
-        raise IssueHarnessUnavailable('harness_failed', message)
-    task = _string(job.get('task')) or ISSUE_HARNESS_TASK
-    final = _final_from_payload(payload, task=task)
-    tool_calls = _tool_calls_from_payload(payload)
-    _validate_harness_work(final, tool_calls, task=task)
-    metadata = {
-        'returncode': completed.returncode,
-        'variant_id': payload.get('variant_id'),
-        'harness_error': payload.get('error'),
-        'pi_metadata': payload.get('pi_metadata') or {},
-    }
-    return IssueHarnessResult(output=final, tool_calls=tool_calls, metadata=metadata)
+    payload.setdefault('task', _string(job.get('task')) or ISSUE_HARNESS_TASK)
+    return _result_from_payload(payload, returncode=completed.returncode, stderr=completed.stderr)
+
+
+def stream_issue_harness(
+    job: Mapping[str, Any],
+    *,
+    command: Sequence[str] | None = None,
+    timeout_seconds: int = ISSUE_HARNESS_DEFAULT_TIMEOUT_SECONDS,
+    extra_env: Mapping[str, str] | None = None,
+) -> Iterator[dict[str, Any]]:
+    command = list(command or default_pi_harness_command())
+    env = os.environ.copy()
+    env['ISSUE_HARNESS_STREAM_EVENTS'] = '1'
+    if extra_env:
+        env.update(dict(extra_env))
+    process: subprocess.Popen[str] | None = None
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    result_payload: dict[str, Any] | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+            start_new_session=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(json.dumps(job, ensure_ascii=False))
+            process.stdin.close()
+        except OSError:
+            pass
+        for stream_name, line in _stream_process_lines(process, timeout_seconds=timeout_seconds):
+            if stream_name == 'stderr':
+                stderr_lines.append(line)
+                continue
+            stdout_lines.append(line)
+            parsed = _stream_wrapper_payload(line.strip())
+            if parsed is None:
+                continue
+            event_name, payload = parsed
+            if event_name == 'pi_stdout':
+                yield {'kind': 'progress', 'event': payload}
+            elif event_name == 'result':
+                result_payload = payload
+        returncode = process.wait()
+        if result_payload is None:
+            payload = _parse_json_stdout(''.join(stdout_lines))
+        else:
+            payload = result_payload
+        payload.setdefault('task', _string(job.get('task')) or ISSUE_HARNESS_TASK)
+        result = _result_from_payload(payload, returncode=returncode, stderr=''.join(stderr_lines))
+        yield {'kind': 'result', 'result': result}
+    except OSError as exc:
+        raise IssueHarnessUnavailable('harness_unavailable', str(exc)) from exc
+    finally:
+        if process is not None and process.poll() is None:
+            _kill_process_group(process)
+            process.wait()
