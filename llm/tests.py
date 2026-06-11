@@ -1003,6 +1003,28 @@ class IssueHarnessRuntimeTests(TestCase):
             # The override must NOT disable reasoning itself; thinking stays on.
             self.assertNotIn('reasoning', overrides['deepseek-v4-flash'])
 
+    def test_extract_transcript_sums_cost_across_billable_turns(self):
+        """Cost must be summed across unique responseIds, not taken from the last turn,
+        and streaming-duplicate messages must collapse to one billable turn each."""
+        from llm import pi_issue_runner
+
+        def msg(rid, in_t, out_t, cost):
+            return json.dumps({'message': {'responseId': rid, 'usage': {
+                'input': in_t, 'output': out_t, 'cacheRead': 0, 'cacheWrite': 0,
+                'totalTokens': in_t + out_t, 'cost': {'total': cost}}}})
+
+        stdout = '\n'.join([
+            msg('r1', 100, 10, 0.001),
+            msg('r1', 100, 10, 0.001),   # streaming duplicate of r1 -> counted once
+            msg('r2', 200, 20, 0.002),
+            msg('r3', 300, 30, 0.003),   # last turn only would record 0.003
+        ])
+        _, metadata = pi_issue_runner.extract_transcript(stdout)
+        usage = metadata['usage']
+        self.assertEqual(usage['turns'], 3)
+        self.assertAlmostEqual(usage['cost']['total'], 0.006)  # 0.001+0.002+0.003, not 0.003
+        self.assertEqual(usage['totalTokens'], 110 + 220 + 330)
+
     def test_runtime_finish_gate_accepts_read_node_context_tool_name(self):
         extension_path = settings.BASE_DIR / 'llm' / 'pi_issue_extension.ts'
         text = extension_path.read_text(encoding='utf-8')

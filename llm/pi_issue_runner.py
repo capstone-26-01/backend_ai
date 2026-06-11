@@ -135,6 +135,36 @@ def _decode_finish_tool_result(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _aggregate_usage(turns: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Sum token + cost usage across billable LLM turns.
+
+    Pi reports usage PER LLM call (per responseId), not cumulatively, so the cost of a
+    multi-turn tool loop is the SUM over turns — recording only the last turn under-counts
+    the real cost (typically ~2-3x for these issue-localization runs).
+    """
+    agg: dict[str, Any] = {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0, 'totalTokens': 0}
+    cost_total = 0.0
+    have_cost = False
+    for usage in turns:
+        for key in ('input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                agg[key] += value
+        cost = usage.get('cost')
+        if isinstance(cost, Mapping):
+            total = cost.get('total')
+            if isinstance(total, (int, float)):
+                cost_total += total
+                have_cost = True
+        elif isinstance(cost, (int, float)):
+            cost_total += cost
+            have_cost = True
+    if have_cost:
+        agg['cost'] = {'total': cost_total}
+    agg['turns'] = len(turns)
+    return agg
+
+
 def extract_transcript(stdout: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     transcript = None
     metadata: dict[str, Any] = {
@@ -143,6 +173,10 @@ def extract_transcript(stdout: str) -> tuple[dict[str, Any] | None, dict[str, An
         'error_messages': [],
         'usage': None,
     }
+    # Pi repeats each message across streaming events; key usage by responseId so each
+    # billable call is counted once (the last, most-complete copy wins).
+    usage_by_response: dict[str, dict[str, Any]] = {}
+    final_turn_usage: dict[str, Any] | None = None
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
         if not line:
@@ -165,13 +199,21 @@ def extract_transcript(stdout: str) -> tuple[dict[str, Any] | None, dict[str, An
                 metadata['response_ids'].append(response_id)
             usage = message.get('usage')
             if isinstance(usage, Mapping):
-                metadata['usage'] = dict(usage)
+                final_turn_usage = dict(usage)
+                if isinstance(response_id, str) and response_id:
+                    usage_by_response[response_id] = dict(usage)
             error_message = message.get('errorMessage')
             if isinstance(error_message, str) and error_message and error_message not in metadata['error_messages']:
                 metadata['error_messages'].append(error_message)
         decoded = _decode_finish_tool_result(event)
         if decoded is not None:
             transcript = decoded
+    if usage_by_response:
+        metadata['usage'] = _aggregate_usage(list(usage_by_response.values()))
+        metadata['final_turn_usage'] = final_turn_usage
+    elif final_turn_usage is not None:
+        # No responseId on any usage message; fall back to last-seen (no safe way to sum).
+        metadata['usage'] = final_turn_usage
     return transcript, metadata
 
 
