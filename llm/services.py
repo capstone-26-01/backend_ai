@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Mapping, cast
@@ -336,6 +337,101 @@ def _answer_token_chunks(value: Any, *, chunk_size: int = 80) -> Iterator[str]:
             yield chunk
 
 
+_FINISH_ANSWER_OPEN = re.compile(r'^\s*\{\s*"answer"\s*:\s*"')
+
+
+def _decode_partial_answer(raw_args: str) -> tuple[str | None, bool]:
+    """Decode the `answer` string value from a partial finish-tool arguments JSON.
+
+    The Pi agent streams the finish tool call arguments as raw JSON fragments
+    (`{"answer":"...token...token...`). This returns (decoded_answer_so_far, closed)
+    for the safely-decodable prefix, holding back any trailing incomplete escape.
+    Returns (None, False) until the `"answer":"` opening is seen.
+    """
+    match = _FINISH_ANSWER_OPEN.match(raw_args)
+    if not match:
+        return None, False
+    body = raw_args[match.end():]
+    out: list[str] = []
+    index = 0
+    length = len(body)
+    closed = False
+    while index < length:
+        char = body[index]
+        if char == '\\':
+            if index + 1 >= length:
+                break  # incomplete escape: hold back
+            nxt = body[index + 1]
+            if nxt == 'u':
+                if index + 6 > length:
+                    break  # incomplete \uXXXX: hold back
+                out.append(body[index:index + 6])
+                index += 6
+                continue
+            out.append(body[index:index + 2])
+            index += 2
+            continue
+        if char == '"':
+            closed = True
+            break
+        out.append(char)
+        index += 1
+    try:
+        decoded = json.loads('"' + ''.join(out) + '"')
+    except ValueError:
+        return None, False
+    return decoded, closed
+
+
+class _FinishAnswerStreamer:
+    """Turn streamed finish-tool argument deltas into incremental answer text.
+
+    Feeds on raw Pi `assistantMessageEvent` payloads and yields the newly-available
+    answer text for each delta, so the harness answer can be streamed token by token
+    instead of being chunked after the subprocess finishes.
+    """
+
+    def __init__(self) -> None:
+        self._raw: dict[Any, str] = {}
+        self._emitted: dict[Any, int] = {}
+
+    def feed(self, event: Mapping[str, Any]) -> list[str]:
+        ame = event.get('assistantMessageEvent')
+        if not isinstance(ame, Mapping):
+            return []
+        etype = ame.get('type')
+        content_index = ame.get('contentIndex')
+        if etype == 'toolcall_start':
+            self._raw[content_index] = ''
+            self._emitted[content_index] = 0
+            return []
+        if etype == 'toolcall_delta':
+            self._raw[content_index] = self._raw.get(content_index, '') + str(ame.get('delta') or '')
+            decoded, _closed = _decode_partial_answer(self._raw[content_index])
+            if decoded is None:
+                return []
+            already = self._emitted.get(content_index, 0)
+            if len(decoded) > already:
+                self._emitted[content_index] = len(decoded)
+                return [decoded[already:]]
+            return []
+        if etype == 'toolcall_end':
+            raw = self._raw.pop(content_index, '')
+            emitted = self._emitted.pop(content_index, 0)
+            tool_call = ame.get('toolCall')
+            arguments = tool_call.get('arguments') if isinstance(tool_call, Mapping) else None
+            answer = arguments.get('answer') if isinstance(arguments, Mapping) else None
+            if not isinstance(answer, str):
+                return []
+            was_answer = emitted > 0 or bool(_FINISH_ANSWER_OPEN.match(raw or ''))
+            if not was_answer:
+                return []
+            if len(answer) > emitted:
+                return [answer[emitted:]]
+            return []
+        return []
+
+
 def _qa_stream_error_event(error: IssueHarnessUnavailable) -> dict[str, object]:
     return {
         'event': 'error',
@@ -579,6 +675,8 @@ def stream_answer_question(
             }
             response = None
             emitted_progress: set[str] = set()
+            answer_streamer = _FinishAnswerStreamer()
+            streamed_answer = False
             harness_stream = stream_issue_harness(
                 job,
                 command=_qa_harness_command(),
@@ -596,6 +694,11 @@ def stream_answer_question(
                             continue
                         emitted_progress.add(key)
                         yield progress
+                    for text in answer_streamer.feed(event):
+                        if not text:
+                            continue
+                        streamed_answer = True
+                        yield {'event': 'token', 'data': {'text': text}}
                 elif item.get('kind') == 'result':
                     result = item.get('result')
                     if result is not None:
@@ -615,8 +718,9 @@ def stream_answer_question(
                     'harness': response.get('harness'),
                 },
             }
-            for chunk in _answer_token_chunks(answer):
-                yield {'event': 'token', 'data': {'text': chunk}}
+            if not streamed_answer:
+                for chunk in _answer_token_chunks(answer):
+                    yield {'event': 'token', 'data': {'text': chunk}}
             yield {'event': 'final', 'data': response}
             return
         except IssueHarnessUnavailable as error:
