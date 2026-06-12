@@ -140,8 +140,9 @@ class WorkspaceSettingsTests(TestCase):
         self.assertGreater(settings.GITHUB_REPO_GIT_TIMEOUT_SECONDS, 0)
         self.assertGreater(settings.GITHUB_REPO_MAX_FILES, 0)
         self.assertGreater(settings.GITHUB_REPO_MAX_PYTHON_FILES, 0)
-        self.assertGreater(settings.GITHUB_REPO_MAX_SINGLE_FILE_BYTES, 0)
-        self.assertGreater(settings.GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES, 0)
+        # Byte caps default to 0 (unlimited); only non-negative is required.
+        self.assertGreaterEqual(settings.GITHUB_REPO_MAX_SINGLE_FILE_BYTES, 0)
+        self.assertGreaterEqual(settings.GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES, 0)
         self.assertGreater(settings.GITHUB_REPO_REVISION_FETCH_DEPTH, 0)
 
 

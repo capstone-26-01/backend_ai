@@ -1479,7 +1479,7 @@ def _read_analysis_artifact(artifact_path) -> dict[str, Any]:
 
 
 def _max_total_analyzed_bytes() -> int:
-    return int(getattr(settings, 'GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES', 5_000_000))
+    return int(getattr(settings, 'GITHUB_REPO_MAX_TOTAL_ANALYZED_BYTES', 0))
 
 
 def _source_file_manifest(files: list[str], enabled_languages: tuple[str, ...]) -> tuple[list[str], list[str], dict[str, Any], list[dict[str, Any]]]:
@@ -1584,7 +1584,7 @@ def _build_and_store_analysis(
                 file_manifest[file_path]['skip_reason'] = 'missing_content'
                 continue
             total_analyzed_bytes += len(content.encode('utf-8'))
-            if total_analyzed_bytes > max_total_analyzed_bytes:
+            if max_total_analyzed_bytes > 0 and total_analyzed_bytes > max_total_analyzed_bytes:
                 raise RepoIngestionError(
                     'too_large',
                     '분석 대상 source 코드 총량이 허용 한도를 초과했습니다.',

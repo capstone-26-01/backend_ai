@@ -894,8 +894,8 @@ def get_file_content_or_raise(repo_path: str, file_path: str, revision: str | No
         raise RepoIngestionError('invalid_repo_path', '올바른 repo 경로가 아닙니다.') from exc
 
     file_size = _file_size_at_revision(repo_dir, target_revision, normalized_file_path)
-    max_file_size = _setting_int('GITHUB_REPO_MAX_SINGLE_FILE_BYTES', 300_000)
-    if file_size > max_file_size:
+    max_file_size = _setting_int('GITHUB_REPO_MAX_SINGLE_FILE_BYTES', 0)
+    if max_file_size > 0 and file_size > max_file_size:
         raise RepoIngestionError(
             'too_large',
             '분석 대상 파일이 허용 크기를 초과했습니다.',
