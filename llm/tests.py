@@ -21,7 +21,9 @@ from llm.issue_harness import (
     stream_issue_harness,
 )
 from llm.services import (
+    _FinishAnswerStreamer,
     _build_context,
+    _decode_partial_answer,
     _generate_answer,
     _question_tokens,
     _rank_files,
@@ -277,6 +279,69 @@ class SelectiveQuestionAnsweringTests(TestCase):
         self.assertEqual(events[4]['data'], {'text': 'harness answer'})
         self.assertEqual(events[5]['data']['answer'], 'harness answer')
         stream_generate_answer.assert_not_called()
+
+    @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
+    @patch('llm.services._stream_generate_answer')
+    @patch('llm.services.stream_issue_harness')
+    def test_stream_answer_question_streams_finish_answer_tokens_live(self, stream_harness, stream_generate_answer):
+        analysis = {
+            'revision': 'abc123',
+            'file_contents': {'pkg/app.py': 'def main():\n    return "ok"\n'},
+            'nodes': [{'id': 'pkg/app.py::main', 'kind': 'function', 'label': 'main', 'path': 'pkg/app.py', 'start_line': 1, 'end_line': 2}],
+            'edges': [],
+        }
+        answer = 'main 함수는 pkg/app.py에 있습니다.\n진입점입니다.'
+        args_json = json.dumps({'answer': answer, 'citations': ['pkg/app.py']}, ensure_ascii=False)
+        # Stream the finish-tool arguments as small raw JSON fragments, like the Pi agent does.
+        fragments = [args_json[i:i + 4] for i in range(0, len(args_json), 4)]
+
+        def delta_event(delta):
+            return {'kind': 'progress', 'event': {'type': 'message_update', 'assistantMessageEvent': {'type': 'toolcall_delta', 'contentIndex': 1, 'delta': delta}}}
+
+        result = IssueHarnessResult(
+            output={'answer': answer, 'citations': ['pkg/app.py'], 'selected_nodes': [], 'context_files': ['pkg/app.py'], 'warnings': []},
+            tool_calls=[{'name': 'finish_repo_qa_transcript', 'arguments': {'answer': answer}}],
+            metadata={'variant_id': 'runtime-pi-qa-harness'},
+        )
+        stream_harness.return_value = iter([
+            {'kind': 'progress', 'event': {'type': 'message_update', 'assistantMessageEvent': {'type': 'toolcall_start', 'contentIndex': 1}}},
+            *[delta_event(fragment) for fragment in fragments],
+            {'kind': 'result', 'result': result},
+        ])
+
+        events = list(stream_answer_question('owner/repo', analysis, 'main은 어디인가요?'))
+
+        event_types = [event['event'] for event in events]
+        self.assertEqual(event_types[0], 'harness_start')
+        self.assertEqual(event_types[-1], 'final')
+        token_texts = [event['data']['text'] for event in events if event['event'] == 'token']
+        meta_index = event_types.index('meta')
+        last_token_index = max(index for index, name in enumerate(event_types) if name == 'token')
+        # Answer tokens must stream live, i.e. before the trailing meta/final, not chunked after.
+        self.assertLess(last_token_index, meta_index)
+        self.assertGreater(len(token_texts), 1)
+        self.assertEqual(''.join(token_texts), answer)
+        self.assertEqual(events[-1]['data']['answer'], answer)
+        stream_generate_answer.assert_not_called()
+
+    def test_decode_partial_answer_and_finish_streamer(self):
+        # Partial JSON before the answer string is unparseable yet.
+        self.assertEqual(_decode_partial_answer('{"ans'), (None, False))
+        # Open answer string, not yet closed.
+        self.assertEqual(_decode_partial_answer('{"answer":"hel'), ('hel', False))
+        # Trailing incomplete escape is held back.
+        self.assertEqual(_decode_partial_answer('{"answer":"line\\'), ('line', False))
+        # Completed escape decodes (\\n -> newline) and closing quote marks it done.
+        self.assertEqual(_decode_partial_answer('{"answer":"a\\nb"'), ('a\nb', True))
+
+        streamer = _FinishAnswerStreamer()
+        answer = '두 줄\n답변'
+        args_json = json.dumps({'answer': answer}, ensure_ascii=False)
+        collected = []
+        streamer.feed({'assistantMessageEvent': {'type': 'toolcall_start', 'contentIndex': 0}})
+        for i in range(0, len(args_json), 3):
+            collected.extend(streamer.feed({'assistantMessageEvent': {'type': 'toolcall_delta', 'contentIndex': 0, 'delta': args_json[i:i + 3]}}))
+        self.assertEqual(''.join(collected), answer)
 
     @override_settings(QA_HARNESS_ENABLED=True, ISSUE_HARNESS_TIMEOUT_SECONDS=5)
     @patch('llm.services.stream_issue_harness', side_effect=IssueHarnessUnavailable('harness_timeout', 'Issue harness exceeded 5 seconds.'))
