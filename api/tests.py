@@ -1653,7 +1653,7 @@ class AnalysisArtifactServiceTests(TestCase):
         first = get_repo_analysis('owner/repo')
         second = get_repo_analysis('owner/repo')
 
-        artifact_path = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'graph.json'
+        artifact_path = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'multi-lang-js-ts-v1' / 'graph.json'
         self.assertTrue(artifact_path.is_file())
         self.assertEqual(first, second)
         parse_repo_mock.assert_called_once()
@@ -1786,8 +1786,8 @@ class AnalysisArtifactServiceTests(TestCase):
         first = get_repo_analysis('owner/repo')
         second = get_repo_analysis('owner/repo')
 
-        first_artifact = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'graph.json'
-        second_artifact = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@def456' / 'graph.json'
+        first_artifact = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'multi-lang-js-ts-v1' / 'graph.json'
+        second_artifact = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@def456' / 'multi-lang-js-ts-v1' / 'graph.json'
         self.assertTrue(first_artifact.is_file())
         self.assertTrue(second_artifact.is_file())
         self.assertIsNotNone(first)
@@ -1815,7 +1815,7 @@ class AnalysisArtifactServiceTests(TestCase):
         self.assertIsNotNone(analysis)
         analysis_payload = cast(dict[str, object], analysis)
         self.assertEqual(analysis_payload['revision'], 'abc123')
-        get_repo_snapshot_mock.assert_called_once_with('owner/repo', enabled_languages=('python',))
+        get_repo_snapshot_mock.assert_called_once_with('owner/repo', enabled_languages=('python', 'javascript', 'typescript'))
 
     @override_settings(GITHUB_REPO_MAX_JS_TS_FILES=1)
     def test_snapshot_limits_apply_js_ts_cap_when_enabled_by_profile(self):
@@ -1835,7 +1835,7 @@ class AnalysisArtifactServiceTests(TestCase):
 
     @patch('api.services.get_repo_snapshot')
     def test_get_repo_analysis_can_load_cached_revision_without_snapshot(self, get_repo_snapshot_mock):
-        artifact_path = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'graph.json'
+        artifact_path = settings.TEMP_DIR / 'analysis' / 'owner' / 'repo@abc123' / 'multi-lang-js-ts-v1' / 'graph.json'
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text(json.dumps({'repo': 'owner/repo', 'revision': 'abc123', 'file_contents': {}, 'tree': [], 'nodes': [], 'edges': []}), encoding='utf-8')
 
